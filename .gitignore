@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest & mypy & test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Prime control-plane
+.prime/
+
+# Build and packaging
+build/
+dist/
+*.spec.bak
+*.egg-info/
+
+# Release folder (build outputs)
+release/
+
+# User data and model caches
+appdata/
+*.log
+models/
+*.tmp
