@@ -16,6 +16,21 @@ if _tk_dir.is_dir() and "TK_LIBRARY" not in os.environ:
     os.environ["TK_LIBRARY"] = str(_tk_dir)
 
 
+@pytest.fixture(scope="session")
+def tk_root():
+    import tkinter as tk
+    import gc
+    root = tk.Tk()
+    root.withdraw()
+    yield root
+    gc.collect()
+    try:
+        root.update()
+        root.destroy()
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def dummy_video(tmp_path: Path) -> Path:
     """Create a minimal real MP4 video file using ffmpeg for testing."""

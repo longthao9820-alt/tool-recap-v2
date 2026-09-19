@@ -154,7 +154,7 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.2.0)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
@@ -168,32 +168,38 @@ def build_portable_package() -> int:
              theo đúng thứ tự tập (ep1, ep2, ep10).
    - Bước 2: Chọn giọng đọc tiếng Anh mong muốn ở ô bên phải.
              Có thể nhấn "Nghe thử giọng" để kiểm tra âm thanh mẫu.
-   - Bước 3: Nhấn nút to màu xanh "▶ Bắt đầu tự động".
+   - Bước 3: Cấu hình AI Gateway (⚙ Cài đặt):
+             Mặc định ứng dụng kết nối tới AI Gateway tại http://127.0.0.1:20128/v1.
+             + Scanner model: sub (thinking: max)
+             + Finalizer model: prime (thinking: high)
+             + Song song (parallelism): 2, Độ dài đoạn: 300s.
+             Nhấn "Test Scanner" và "Test Finalizer" trong Cài đặt để kiểm tra kết nối.
+             (Nếu muốn chạy offline hoàn toàn không cần gateway, bỏ chọn "Kích hoạt AI Gateway").
+   - Bước 4: Nhấn nút to màu xanh "▶ Bắt đầu tự động".
              Ứng dụng sẽ tự động:
                + Phân tích nội dung thoại thực tế (phụ đề / faster-whisper).
+               + Phân tích kịch bản 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway.
                + Đọc lời dẫn thuyết minh chân thực bằng AI (Piper TTS).
                + Cắt cảnh khớp thời lượng, ghép giọng và tạo phụ đề SRT.
                + Xuất video recap hoàn chỉnh với tăng tốc phần cứng GPU.
-   - Bước 4: Nhấn "📂 Mở thư mục kết quả" để xem video đã hoàn thành.
+   - Bước 5: Nhấn "📂 Mở thư mục kết quả" để xem video đã hoàn thành.
 
 3. DỪNG AN TOÀN (CANCELLATION):
    - Bất kỳ lúc nào đang xử lý, bạn có thể nhấn "⏹ Dừng xử lý".
-   - Ứng dụng sẽ lập tức đóng các tiến trình FFmpeg đang chạy và mở khóa lại giao diện.
+   - Ứng dụng sẽ lập tức dừng các phân đoạn, đóng các tiến trình FFmpeg và mở khóa lại giao diện.
 
-4. NƠI LƯU TRỮ DỮ LIỆU:
+4. NƠI LƯU TRỮ DỮ LIỆU & BỘ NHỚ ĐỆM (CACHE):
    - Cài đặt, lịch sử và mô hình AI được lưu tại: %LOCALAPPDATA%\ToolRecapV2
-   - Dữ liệu được bảo toàn khi cập nhật ứng dụng.
-   - API key (nếu dùng) nằm dạng văn bản trong settings.json cục bộ, không mã hóa.
-     Không chia sẻ tệp này cho người khác.
+   - Kết quả phân tích AI Gateway được lưu đệm tự động tại:
+     %LOCALAPPDATA%\ToolRecapV2\cache\gateway_analysis
+     giúp các lần chạy lại không tốn API call khi nội dung và cấu hình không đổi.
+   - API key nằm dạng văn bản trong settings.json cục bộ, không mã hóa.
+     Không chia sẻ tệp này cho người khác. Không lưu API key vào cache.
 
-5. GIỚI HẠN HIỆN TẠI:
-   - Kịch bản dùng cách tóm tắt trích xuất từ phụ đề hoặc lời thoại nhận dạng;
-     chưa thay thế biên tập ngữ nghĩa chuyên sâu của con người.
-   - VoiceStudio v0.5.3 đã được kiểm tra tương thích, nhưng bản phát hành chính
-     thức hiện chưa có adapter V2. Giọng Piper vẫn hoạt động đầy đủ.
-
-6. NẾU CÓ LỖI XẢY RA:
+5. NẾU CÓ LỖI XẢY RA:
    - Kiểm tra file log tại: %LOCALAPPDATA%\ToolRecapV2\logs
+   - Nếu gateway chưa bật hoặc cổng 20128 chưa mở, ứng dụng sẽ báo lỗi rõ ràng.
+     Vào Cài đặt để kiểm tra kết nối bằng nút Test hoặc tắt gateway nếu chạy offline.
    - Đảm bảo ổ đĩa còn đủ dung lượng trống để chứa video đầu ra.
 ========================================================================
 """

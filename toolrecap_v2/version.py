@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 GITHUB_REPO = "longthao9820-alt/tool-recap-v2"
 
 

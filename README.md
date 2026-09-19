@@ -1,6 +1,6 @@
-# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows)
+# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.2.0)
 
-ToolRecap V2 là ứng dụng máy tính dành riêng cho Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim/truyền hình) tiếng Anh chỉ với một cú nhấp chuột: quét tập phim, phân tích nội dung thoại thực tế (qua phụ đề companion SRT hoặc nhận diện giọng nói faster-whisper / API), đọc lời dẫn chân thực bằng AI (Piper TTS), cắt cảnh theo nhịp kịch bản, nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
+ToolRecap V2 là ứng dụng máy tính dành riêng cho Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim/truyền hình) tiếng Anh chỉ với một cú nhấp chuột: quét tập phim, phân tích nội dung thoại thực tế (qua phụ đề companion SRT hoặc nhận diện giọng nói faster-whisper / API), phân tích kịch bản 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, đọc lời dẫn chân thực bằng AI (Piper TTS), cắt cảnh theo nhịp kịch bản, nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
 
 ---
 
@@ -13,7 +13,7 @@ ToolRecap V2 là ứng dụng máy tính dành riêng cho Windows giúp tự đ�
 
 ---
 
-## 2. Hướng Dẫn Sử Dụng (4 Bước Đơn Giản)
+## 2. Hướng Dẫn Sử Dụng (5 Bước Đơn Giản)
 
 1. **Chọn nguồn video**:
    - Nhấn nút **"📁 Chọn 1 file video..."** để xử lý 1 tập lẻ.
@@ -21,23 +21,31 @@ ToolRecap V2 là ứng dụng máy tính dành riêng cho Windows giúp tự đ�
 2. **Chọn giọng đọc thuyết minh**:
    - Ở khung bên phải, chọn giọng đọc tiếng Anh mong muốn từ danh sách (Lessac, Ryan, Alba, Alan).
    - Nhấn **"🔊 Nghe thử giọng"** để nghe âm thanh mẫu. Mô hình giọng đọc sẽ được tải tự động (lazy download) ở lần nghe đầu tiên và lưu vào bộ nhớ đệm.
-3. **Bắt đầu sản xuất tự động**:
+3. **Cấu hình AI Gateway (⚙ Cài đặt)**:
+   - ToolRecap V2 kết nối mặc định tới AI Gateway tại `http://127.0.0.1:20128/v1`.
+   - **Scanner model**: `sub` (thinking: `max`) — quét phân đoạn transcript với mốc thời gian tuyệt đối.
+   - **Finalizer model**: `prime` (thinking: `high`) — tổng hợp chứng cứ thành kịch bản phân đoạn chặt chẽ.
+   - **Song song (parallelism)**: 2 (tùy chỉnh 1-4), **Độ dài đoạn**: 300s (tùy chỉnh 60-900s).
+   - Nhấn nút **"Test Scanner"** và **"Test Finalizer"** để kiểm tra kết nối nền.
+   - Nếu muốn chạy offline không cần gateway: bỏ chọn "Kích hoạt AI Gateway" để dùng bộ tạo kịch bản extractive nội bộ.
+4. **Bắt đầu sản xuất tự động**:
    - Nhấn nút lớn màu xanh **"▶ Bắt đầu tự động"**.
    - Ứng dụng chạy tuần tự từng video qua các giai đoạn:
-     - **Phân tích nội dung thoại thực tế**: Đọc phụ đề đi kèm (`.srt`) hoặc dùng mô hình `faster-whisper` nội bộ / API OpenAI Whisper để trích xuất hội thoại thực tế (không dùng kịch bản ngẫu nhiên hay generic placeholder).
-     - **Tổng hợp giọng đọc AI (TTS)**: Đọc lời dẫn thuyết minh bằng Piper TTS thật (không dùng âm mẫu giả).
+     - **Phân tích nội dung thoại thực tế**: Đọc phụ đề đi kèm (`.srt`) hoặc dùng mô hình `faster-whisper` nội bộ / API OpenAI Whisper để trích xuất hội thoại thực tế.
+     - **Phân tích kịch bản qua AI Gateway**: Scanner phân tích song song các đoạn transcript, Finalizer tổng hợp kịch bản recap hoàn chỉnh.
+     - **Tổng hợp giọng đọc AI (TTS)**: Đọc lời dẫn thuyết minh bằng Piper TTS thật.
      - **Cắt cảnh & Ghép âm thanh**: Cắt các phân đoạn phim tương ứng thời lượng kịch bản, ghép giọng dẫn và tạo phụ đề SRT.
      - **Render video**: Mã hóa video đầu ra bằng quy trình tăng tốc Hybrid GPU hoặc CPU.
-4. **Xem kết quả**:
+5. **Xem kết quả**:
    - Nhấn nút **"📂 Mở thư mục kết quả"** để mở thư mục chứa video recap và tệp phụ đề đã hoàn thành.
 
 ---
 
-## 3. Tăng Tốc Phần Cứng Hybrid GPU & Bounded Fallback
+## 3. Kiến Trúc AI Gateway & Bộ Nhớ Đệm Thông Minh (Cache)
 
-ToolRecap V2 hỗ trợ cơ chế tăng tốc phần cứng thông minh:
-- **Quy trình Hybrid**: Tự động kết hợp giải mã phần cứng Intel QSV (hoặc CPU) và mã hóa phần cứng rời NVIDIA NVENC (hoặc AMD AMF / Intel QSV) để tối ưu hóa hiệu suất và chất lượng hình ảnh.
-- **Dự phòng có giới hạn (Bounded Fallback)**: Nếu giải mã hoặc mã hóa phần cứng gặp sự cố (thiếu driver, định dạng không hỗ trợ), ứng dụng tự động chuyển đổi sang phương án dự phòng tiếp theo và cuối cùng là mã hóa phần mềm CPU `libx264`, đảm bảo tiến trình render không bao giờ bị gián đoạn hay treo cứng.
+- **Chuẩn OpenAI-compatible**: Kết nối tới gateway (mặc định Tool-REcap gateway tại `http://127.0.0.1:20128/v1`). Client tự động xử lý loose JSON, bóc tách code fence markdown, thử lại linh hoạt khi gặp tham số không tương thích (loại bỏ `response_format`, `reasoning_effort`).
+- **An toàn bảo mật**: API Key không bao giờ bị rò rỉ trong log hoặc thông báo lỗi (tự động thay bằng `***`). Key được lưu dạng văn bản trong `settings.json` cục bộ người dùng.
+- **Bộ nhớ đệm nguyên tử (Cache)**: Kết quả phân tích được lưu tại `%LOCALAPPDATA%\ToolRecapV2\cache\gateway_analysis` theo mã băm video + cấu hình model + prompt. Khi chạy lại cùng video và cấu hình, ứng dụng tái sử dụng kết quả ngay lập tức mà không gọi lại API. Không lưu API key vào cache.
 
 ---
 
@@ -79,8 +87,8 @@ Bao gồm:
 
 ## 7. Giới Hạn Của Hệ Thống
 
-- **Chất lượng kịch bản thuyết minh (Extractive Recap)**: Kịch bản thuyết minh được trích xuất và tổng hợp dựa trên lời thoại thực tế từ phụ đề SRT đi kèm hoặc nhận diện âm thanh (faster-whisper / API), đảm bảo bám sát nội dung. Tuy nhiên, đây là phương pháp tóm tắt trích đoạn (extractive recap) dựa trên phân đoạn và năng lượng thoại thực tế, không phải là mô hình LLM suy luận phức tạp.
-- **Phân tích nội dung thoại**: Nếu video không có tiếng nói và không có tệp phụ đề SRT đi kèm, ứng dụng sẽ phân đoạn cảnh theo dòng thời gian video tự nhiên.
+- **Phạm vi phân tích AI**: Khi bật AI Gateway, Scanner và Finalizer dùng mô hình được cấu hình để suy luận trên transcript có mốc thời gian. AI chưa xem trực tiếp toàn bộ hình ảnh video, nên chất lượng phụ thuộc phụ đề hoặc lời thoại nhận dạng. Khi tắt Gateway, ứng dụng dùng chế độ tóm tắt trích xuất nội bộ đơn giản hơn.
+- **Video ít hoặc không có lời thoại**: Nếu không có tiếng nói và không có phụ đề SRT, AI chỉ nhận được bằng chứng dòng thời gian hạn chế; ứng dụng yêu cầu model không tự bịa sự kiện.
 - **Tải mô hình ban đầu**: Lần đầu tiên sử dụng một giọng đọc hoặc mô hình STT nội bộ, ứng dụng cần kết nối Internet để tải mô hình về máy (tiến trình tải được hiển thị trực tiếp trên giao diện).
 - **Tăng tốc GPU**: Yêu cầu máy tính có card đồ họa tương thích và đã cài đặt driver chính thức (NVIDIA, AMD hoặc Intel).
 
@@ -106,7 +114,7 @@ Bao gồm:
    - Sao chép `ffmpeg.exe`, `ffprobe.exe`, `LICENSE`, `THIRD_PARTY_LICENSES.md`, và tệp hướng dẫn sử dụng.
    - Kiểm tra khả năng mã hóa NVENC/AMF/QSV của binary FFmpeg.
    - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp `.exe`.
-   - Tạo gói nén `release\ToolRecapV2-v0.1.0-windows-portable.zip` và tệp mã băm companion `ToolRecapV2-v0.1.0-windows-portable.zip.sha256.txt`.
+   - Tạo gói nén `release\ToolRecapV2-v0.2.0-windows-portable.zip` và tệp mã băm companion `ToolRecapV2-v0.2.0-windows-portable.zip.sha256.txt`.
 
 ---
 

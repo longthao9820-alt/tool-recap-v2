@@ -6,6 +6,7 @@ and scene timeline. Handles speech presence vs absence clearly and deterministic
 from __future__ import annotations
 
 import array
+import hashlib
 import json
 import math
 import os
@@ -15,13 +16,15 @@ import subprocess
 import sys
 import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .api_client import APIError, OpenAICompatibleClient
 from .gpu import bundled_binary
 from .media import probe_media
-from .paths import get_stt_model_cache_dir
+from .paths import default_data_directory, get_stt_model_cache_dir
 from .settings import AppSettings, SettingsStore
 
 
@@ -30,6 +33,287 @@ LogCallback = Callable[[str], None]
 
 class NarrationError(RuntimeError):
     pass
+
+
+SCANNER_SYSTEM = """
+You are the evidence scanner for a video recap pipeline. Review the timestamped transcript excerpt for this specific chunk.
+Identify story events, character interactions, reveals, emotional shifts, key actions, and note likely exclusions.
+Do not invent dialogue, characters, or timecodes not present in the excerpt.
+If no speech is detected, record the timeline event without inventing spoken lines.
+Return JSON only:
+{
+  "range_start_ms": 0,
+  "range_end_ms": 0,
+  "events": [
+    {
+      "start_ms": 0,
+      "end_ms": 0,
+      "summary": "neutral source-grounded event",
+      "characters": ["character or speaker if known"],
+      "importance": 0.8,
+      "dialogue_evidence": ["exact or closely paraphrased dialogue line"],
+      "exclude": false
+    }
+  ]
+}
+All timestamps must stay inside the supplied absolute range.
+""".strip()
+
+
+FINALIZER_SYSTEM = """
+You are the lead editor and writer for a video recap pipeline.
+Analyze the aggregated chunk evidence and timestamped dialogue for the entire episode.
+Create a coherent, natural recap with causal continuity and clear pacing.
+Narration must be in the requested language, engaging, and grounded in the source facts without fabricating events or quotes.
+Every segment must define start_ms and end_ms (in milliseconds on the source timeline), narration_text (non-empty), and audio_policy ("mute").
+Return JSON only:
+{
+  "recap_title": "Episode title or summary",
+  "segments": [
+    {
+      "segment_id": "scene_01",
+      "start_ms": 0,
+      "end_ms": 15000,
+      "narration_text": "Engaging narration describing this sequence...",
+      "audio_policy": "mute",
+      "original_dialogue_text": ""
+    }
+  ]
+}
+Timestamps must stay within the source duration. Do not return Markdown commentary or code blocks outside the JSON object.
+""".strip()
+
+
+def _format_time(seconds: float) -> str:
+    millis = max(0, round(seconds * 1000))
+    hours, remainder = divmod(millis, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, ms = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+def _chunk_ranges(duration_sec: float, chunk_seconds: int) -> list[tuple[float, float]]:
+    chunk_sec = max(60, min(900, chunk_seconds))
+    if duration_sec <= chunk_sec:
+        return [(0.0, max(1.0, duration_sec))]
+    ranges = []
+    start = 0.0
+    while start < duration_sec:
+        end = min(duration_sec, start + chunk_sec)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def _video_fingerprint(video_path: Path) -> str:
+    stat = video_path.stat()
+    val = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    return hashlib.sha256(val.encode("utf-8", "replace")).hexdigest()[:20]
+
+
+def _compute_gateway_cache_key(
+    video_path: Path,
+    settings: AppSettings,
+    duration_sec: float,
+    has_speech: bool,
+    language: str,
+    mode: str,
+) -> str:
+    fp = _video_fingerprint(video_path)
+    content = (
+        f"{fp}|{settings.api_endpoint}|{settings.scanner_model}|{settings.scanner_thinking}|"
+        f"{settings.finalizer_model}|{settings.finalizer_thinking}|{settings.api_chunk_seconds}|"
+        f"{settings.recap_prompt}|{duration_sec:.2f}|{has_speech}|{language}|{mode}"
+    )
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:24]
+
+
+def _load_gateway_cache(cache_key: str, duration_sec: float) -> RecapManifest | None:
+    cache_file = default_data_directory() / "cache" / "gateway_analysis" / f"{cache_key}.json"
+    if not cache_file.is_file():
+        return None
+    try:
+        raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        manifest = RecapManifest.from_dict(raw)
+        validate_manifest(manifest, duration_sec)
+        return manifest
+    except Exception:
+        return None
+
+
+def _save_gateway_cache(cache_key: str, manifest: RecapManifest) -> None:
+    cache_dir = default_data_directory() / "cache" / "gateway_analysis"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{cache_key}.json"
+    tmp_file = cache_file.with_suffix(".tmp")
+    data = manifest.to_dict()
+    tmp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_file, cache_file)
+
+
+def _scan_transcript_chunk(
+    client: OpenAICompatibleClient,
+    settings: AppSettings,
+    video_path: Path,
+    start_sec: float,
+    end_sec: float,
+    dialogue: list[tuple[float, float, str]],
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    if cancel_event and cancel_event.is_set():
+        raise NarrationError("Phân tích AI Gateway đã bị dừng.")
+
+    matching_lines = [
+        f"[{_format_time(s)} - {_format_time(e)}] {text}"
+        for s, e, text in dialogue
+        if (s <= end_sec and e >= start_sec)
+    ]
+    if matching_lines:
+        chunk_transcript = "\n".join(matching_lines)
+    else:
+        chunk_transcript = f"[Không có lời thoại nào trong khoảng thời gian {start_sec:.1f}s đến {end_sec:.1f}s]"
+
+    start_ms = round(start_sec * 1000)
+    end_ms = round(end_sec * 1000)
+    user_text = (
+        f"Episode: {video_path.stem}\n"
+        f"Source file: {video_path.name}\n"
+        f"Absolute range: {start_ms} to {end_ms} ms ({_format_time(start_sec)} - {_format_time(end_sec)})\n"
+        f"Recap instructions:\n{settings.recap_prompt or 'Standard video recap'}\n\n"
+        f"Timestamped transcript excerpt:\n{chunk_transcript}\n"
+    )
+
+    try:
+        raw_result = client.chat_json(
+            model=settings.scanner_model,
+            thinking=settings.scanner_thinking,
+            system=SCANNER_SYSTEM,
+            user_text=user_text,
+            cancel_event=cancel_event,
+        )
+        raw_events = raw_result.get("events")
+        if not isinstance(raw_events, list):
+            raw_events = []
+        sanitized_events: list[dict[str, Any]] = []
+        for ev in raw_events[:50]:
+            if not isinstance(ev, dict):
+                continue
+            ev_start = max(start_ms, min(end_ms, int(ev.get("start_ms", start_ms))))
+            ev_end = max(ev_start, min(end_ms, int(ev.get("end_ms", end_ms))))
+            sanitized_events.append({
+                "start_ms": ev_start,
+                "end_ms": ev_end,
+                "summary": str(ev.get("summary", "")).strip()[:300],
+                "dialogue_evidence": [str(d)[:200] for d in ev.get("dialogue_evidence", [])[:5] if isinstance(d, str)],
+                "exclude": bool(ev.get("exclude", False)),
+            })
+        return {
+            "range_start_ms": start_ms,
+            "range_end_ms": end_ms,
+            "events": sanitized_events,
+        }
+    except APIError as exc:
+        raise NarrationError(
+            f"Không thể kết nối đến AI Gateway ({settings.api_endpoint}): Scanner ({settings.scanner_model}) lỗi tại đoạn {_format_time(start_sec)} - {_format_time(end_sec)}: {exc}"
+        ) from exc
+
+
+def _finalize_gateway_recap(
+    client: OpenAICompatibleClient,
+    settings: AppSettings,
+    video_path: Path,
+    duration_sec: float,
+    scans: list[dict[str, Any]],
+    dialogue: list[tuple[float, float, str]],
+    has_speech: bool,
+    language: str,
+    mode: str,
+    cancel_event: threading.Event | None = None,
+) -> list[RecapSegment]:
+    if cancel_event and cancel_event.is_set():
+        raise NarrationError("Phân tích AI Gateway đã bị dừng.")
+
+    total_ms = max(1000, round(duration_sec * 1000))
+    context = {
+        "episode_id": video_path.stem,
+        "source_file": video_path.name,
+        "duration_ms": total_ms,
+        "recap_mode": mode,
+        "recap_language": language,
+        "has_speech": has_speech,
+        "chunk_evidence": scans,
+        "timestamped_transcript": [
+            {"start_ms": round(s * 1000), "end_ms": round(e * 1000), "text": t}
+            for s, e, t in dialogue
+        ],
+    }
+
+    user_text = "Generate the finalized recap segments JSON from the provided evidence:\n" + json.dumps(
+        context, ensure_ascii=False, indent=2
+    )
+
+    system_prompt = settings.recap_prompt.strip() or FINALIZER_SYSTEM
+    if FINALIZER_SYSTEM not in system_prompt:
+        system_prompt = system_prompt + "\n\n" + FINALIZER_SYSTEM
+
+    try:
+        result = client.chat_json(
+            model=settings.finalizer_model,
+            thinking=settings.finalizer_thinking,
+            system=system_prompt,
+            user_text=user_text,
+            cancel_event=cancel_event,
+        )
+    except APIError as exc:
+        raise NarrationError(
+            f"Không thể kết nối đến AI Gateway ({settings.api_endpoint}): Finalizer ({settings.finalizer_model}) gặp lỗi: {exc}"
+        ) from exc
+
+    raw_segments = result.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        if isinstance(result.get("outputs"), list) and result["outputs"]:
+            raw_segments = result["outputs"][0].get("segments", [])
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise NarrationError(f"Finalizer không trả về danh sách phân đoạn (segments) hợp lệ: {result}")
+
+    segments: list[RecapSegment] = []
+    for i, s in enumerate(raw_segments[:50], start=1):
+        if not isinstance(s, dict):
+            continue
+        s_ms = max(0, min(total_ms, int(s.get("start_ms", 0))))
+        e_ms = max(s_ms + 100, min(total_ms, int(s.get("end_ms", s_ms + 1000))))
+        if e_ms <= s_ms:
+            if s_ms < total_ms:
+                e_ms = min(total_ms, s_ms + 1000)
+            else:
+                s_ms = max(0, total_ms - 1000)
+                e_ms = total_ms
+
+        text = str(s.get("narration_text", "")).strip()
+        if not text:
+            raise NarrationError(f"Phân đoạn scene_{i:02d} từ Finalizer thiếu nội dung narration_text.")
+
+        audio_policy = str(s.get("audio_policy", "mute")).strip().lower()
+        if audio_policy not in {"mute", "preserve"}:
+            raise NarrationError(
+                f"Phân đoạn scene_{i:02d} có audio_policy không được hỗ trợ: '{audio_policy}'. Chỉ chấp nhận 'mute' hoặc 'preserve'."
+            )
+
+        segments.append(
+            RecapSegment(
+                segment_id=str(s.get("segment_id", f"scene_{i:02d}")),
+                start_ms=s_ms,
+                end_ms=e_ms,
+                narration_text=text,
+                audio_policy=audio_policy,
+                original_dialogue_text=str(s.get("original_dialogue_text", "")),
+            )
+        )
+
+    if not segments:
+        raise NarrationError("Finalizer không tạo được phân đoạn hợp lệ nào.")
+
+    return segments
 
 
 @dataclass
@@ -381,7 +665,8 @@ def transcribe_via_api(
     log: LogCallback | None = None,
 ) -> list[tuple[float, float, str]]:
     """Call external configured API (e.g. OpenAI / Gemini) with clear credential validation."""
-    if not settings.api_key.strip():
+    stt_key = (settings.transcription_api_key or settings.api_key).strip()
+    if not stt_key:
         raise NarrationError(
             "Cấu hình API được chọn nhưng thiếu API key. Vui lòng nhập API key hợp lệ trong cài đặt."
         )
@@ -394,13 +679,14 @@ def transcribe_via_api(
         try:
             import urllib.request
             # Validate basic key format
-            if not settings.api_key.startswith("sk-"):
+            if not stt_key.startswith("sk-"):
                 raise NarrationError("OpenAI API key không hợp lệ (phải bắt đầu bằng 'sk-').")
 
             # Multipart upload to OpenAI Audio Transcriptions
             # If network fails or key is invalid, raise NarrationError clearly
             boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-            url = (settings.api_base_url.rstrip("/") or "https://api.openai.com/v1") + "/audio/transcriptions"
+            base_url = (settings.transcription_base_url or settings.api_base_url).rstrip("/") or "https://api.openai.com/v1"
+            url = base_url + "/audio/transcriptions"
             data = bytearray()
             # File
             data.extend(f"--{boundary}\r\n".encode())
@@ -420,7 +706,7 @@ def transcribe_via_api(
                 url,
                 data=data,
                 headers={
-                    "Authorization": f"Bearer {settings.api_key.strip()}",
+                    "Authorization": f"Bearer {stt_key}",
                     "Content-Type": f"multipart/form-data; boundary={boundary}",
                 },
             )
@@ -656,26 +942,131 @@ def prepare_narration_for_video(
     if cancel_event and cancel_event.is_set():
         raise NarrationError("Chuẩn bị narration đã bị dừng.")
 
-    # 4. Generate structured segments based on real content
-    if has_speech and dialogue:
-        if log:
-            log("Tạo kịch bản recap dựa trên lời thoại thực tế của tập...")
-        segments = _build_segments_from_dialogue(video_path.stem, duration_sec, dialogue, language=language)
-    else:
-        if log:
-            log("Không phát hiện lời thoại trong tập; tạo tóm tắt diễn biến hình ảnh theo dòng thời gian.")
-        segments = _build_segments_for_no_speech(video_path.stem, duration_sec, language=language)
-
-    manifest = RecapManifest(
-        project_id=video_path.stem,
-        source_video=str(video_path),
-        recap_mode=mode if has_speech else "SCENE_ANALYSIS_NO_SPEECH",
-        recap_language=language,
-        segments=segments,
-        total_source_duration_sec=duration_sec,
-        speech_detected=has_speech,
+    # 4. Check gateway cache
+    cache_key = _compute_gateway_cache_key(
+        video_path,
+        app_settings,
+        duration_sec,
+        has_speech,
+        language,
+        mode,
     )
-    validate_manifest(manifest, duration_sec)
+    cached_manifest = _load_gateway_cache(cache_key, duration_sec)
+    if cached_manifest is not None:
+        if log:
+            log(f"Sử dụng kết quả AI Gateway đã lưu trong bộ nhớ đệm ({len(cached_manifest.segments)} phân đoạn).")
+        manifest_path = output_dir / f"{video_path.stem}_manifest.json"
+        manifest_path.write_text(json.dumps(cached_manifest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return cached_manifest
+
+    is_gateway_enabled = (
+        app_settings.gateway_enabled
+        and bool(app_settings.api_endpoint.strip())
+        and app_settings.api_endpoint.strip().lower() != "offline"
+    )
+
+    if is_gateway_enabled:
+        if log:
+            log(f"Bắt đầu phân tích AI Gateway 2 giai đoạn ({app_settings.scanner_model} -> {app_settings.finalizer_model})...")
+
+        client = OpenAICompatibleClient(
+            endpoint=app_settings.api_endpoint,
+            api_key=app_settings.api_key,
+            timeout=120,
+        )
+
+        ranges = _chunk_ranges(duration_sec, app_settings.api_chunk_seconds)
+        scans: list[dict[str, Any] | None] = [None] * len(ranges)
+        parallelism = max(1, min(4, app_settings.scanner_parallelism))
+
+        if log:
+            log(f"Scanner {app_settings.scanner_model}: Phân tích {len(ranges)} đoạn (song song: {parallelism})...")
+
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = {
+                executor.submit(
+                    _scan_transcript_chunk,
+                    client=client,
+                    settings=app_settings,
+                    video_path=video_path,
+                    start_sec=s_sec,
+                    end_sec=e_sec,
+                    dialogue=dialogue,
+                    cancel_event=cancel_event,
+                ): idx
+                for idx, (s_sec, e_sec) in enumerate(ranges)
+            }
+            for future in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise NarrationError("Chuẩn bị narration đã bị dừng.")
+                idx = futures[future]
+                try:
+                    scans[idx] = future.result()
+                except Exception as exc:
+                    if cancel_event and cancel_event.is_set():
+                        for f in futures:
+                            f.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise NarrationError("Chuẩn bị narration đã bị dừng.") from exc
+                    raise
+
+        valid_scans = [s for s in scans if s is not None]
+        if log:
+            log(f"Finalizer {app_settings.finalizer_model}: Đang tổng hợp kịch bản recap hoàn chỉnh...")
+
+        segments = _finalize_gateway_recap(
+            client=client,
+            settings=app_settings,
+            video_path=video_path,
+            duration_sec=duration_sec,
+            scans=valid_scans,
+            dialogue=dialogue,
+            has_speech=has_speech,
+            language=language,
+            mode=mode,
+            cancel_event=cancel_event,
+        )
+
+        manifest = RecapManifest(
+            project_id=video_path.stem,
+            source_video=str(video_path),
+            recap_mode=mode if has_speech else "SCENE_ANALYSIS_NO_SPEECH",
+            recap_language=language,
+            segments=segments,
+            total_source_duration_sec=duration_sec,
+            speech_detected=has_speech,
+        )
+        validate_manifest(manifest, duration_sec)
+
+        # Cache valid gateway result
+        try:
+            _save_gateway_cache(cache_key, manifest)
+        except Exception:
+            pass
+    else:
+        # Offline / disabled fallback
+        if has_speech and dialogue:
+            if log:
+                log("Chế độ ngoại tuyến: Tạo kịch bản recap dựa trên lời thoại thực tế của tập...")
+            segments = _build_segments_from_dialogue(video_path.stem, duration_sec, dialogue, language=language)
+        else:
+            if log:
+                log("Chế độ ngoại tuyến: Không phát hiện lời thoại trong tập; tạo tóm tắt diễn biến hình ảnh theo dòng thời gian.")
+            segments = _build_segments_for_no_speech(video_path.stem, duration_sec, language=language)
+
+        manifest = RecapManifest(
+            project_id=video_path.stem,
+            source_video=str(video_path),
+            recap_mode=mode if has_speech else "SCENE_ANALYSIS_NO_SPEECH",
+            recap_language=language,
+            segments=segments,
+            total_source_duration_sec=duration_sec,
+            speech_detected=has_speech,
+        )
+        validate_manifest(manifest, duration_sec)
 
     # Save manifest for full inspectability and reproducibility
     manifest_path = output_dir / f"{video_path.stem}_manifest.json"
@@ -683,6 +1074,6 @@ def prepare_narration_for_video(
 
     if log:
         speech_status = "có lời thoại" if has_speech else "không có lời thoại"
-        log(f"Đã lưu kịch bản recap ({len(segments)} phân đoạn, {speech_status}) tại: {manifest_path.name}")
+        log(f"Đã lưu kịch bản recap ({len(manifest.segments)} phân đoạn, {speech_status}) tại: {manifest_path.name}")
 
     return manifest

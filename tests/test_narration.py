@@ -175,7 +175,9 @@ def test_prepare_narration_with_companion_srt(tmp_path: Path, dummy_video: Path)
     )
 
     out_dir = tmp_path / "output_srt"
-    manifest = prepare_narration_for_video(dummy_video, out_dir)
+    # Offline mode test for extractive dialogue recap
+    settings = AppSettings(gateway_enabled=False)
+    manifest = prepare_narration_for_video(dummy_video, out_dir, settings=settings)
 
     assert manifest.speech_detected is True
     assert len(manifest.segments) >= 2
@@ -185,11 +187,12 @@ def test_prepare_narration_with_companion_srt(tmp_path: Path, dummy_video: Path)
 
 
 def test_prepare_narration_no_speech_video(tmp_path: Path, dummy_video: Path) -> None:
-    """A silent dummy video has no dialogue; verify explicit no-speech handling."""
+    """A silent dummy video has no dialogue; verify explicit no-speech handling in offline mode."""
     out_dir = tmp_path / "output_no_speech"
     logs: list[str] = []
 
-    manifest = prepare_narration_for_video(dummy_video, out_dir, log=logs.append)
+    settings = AppSettings(gateway_enabled=False)
+    manifest = prepare_narration_for_video(dummy_video, out_dir, log=logs.append, settings=settings)
 
     assert manifest.speech_detected is False
     assert manifest.recap_mode == "SCENE_ANALYSIS_NO_SPEECH"

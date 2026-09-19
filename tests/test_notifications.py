@@ -12,17 +12,6 @@ from toolrecap_v2.notifications import (
 )
 
 
-@pytest.fixture(scope="module")
-def tk_root() -> tk.Tk:
-    root = tk.Tk()
-    root.withdraw()
-    yield root
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
-
 def test_notification_banner_lifecycle(tk_root: tk.Tk) -> None:
     dismissed = False
 
@@ -97,13 +86,13 @@ def test_desktop_notification_lifecycle(tk_root: tk.Tk) -> None:
     assert dismissed is True
 
 
-def test_ui_apply_batch_completed_notification_integration(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ui_apply_batch_completed_notification_integration(tk_root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure UI _apply_batch_completed calls real show_desktop_notification for both success and partial failure."""
     from toolrecap_v2.ui import ToolRecapV2App
 
-    class MockApp(tk.Tk):
-        def __init__(self) -> None:
-            super().__init__()
+    class MockApp(tk.Toplevel):
+        def __init__(self, master: tk.Tk) -> None:
+            super().__init__(master)
             self.withdraw()
             self.progress_var = tk.DoubleVar(value=0.0)
             self.status_var = tk.StringVar(value="")
@@ -113,7 +102,7 @@ def test_ui_apply_batch_completed_notification_integration(monkeypatch: pytest.M
         def _apply_batch_completed(self, completed: int, total: int) -> None:
             ToolRecapV2App._apply_batch_completed(self, completed, total)
 
-    app = MockApp()
+    app = MockApp(tk_root)
     try:
         # 1. Test success path (completed == total)
         app._apply_batch_completed(3, 3)

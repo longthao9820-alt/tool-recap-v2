@@ -9,6 +9,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .api_client import OpenAICompatibleClient
 from .gpu import EncoderStatus, detect_gpu_encoder, get_acceleration_plan
 from .notifications import DesktopNotification, NotificationBanner, show_desktop_notification
 from .paths import default_data_directory, set_window_icon
@@ -675,101 +676,12 @@ class ToolRecapV2App(tk.Tk):
     # -------------------------------------------------------------------------
 
     def _open_settings_dialog(self) -> None:
-        dlg = tk.Toplevel(self)
-        dlg.title("Cài đặt ToolRecap V2")
-        dlg.geometry("520x460")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
-        set_window_icon(dlg)
-
-        frame = ttk.Frame(dlg, padding=16)
-        frame.pack(fill="both", expand=True)
-
-        # Video & Render Section
-        vid_group = ttk.LabelFrame(frame, text="Cấu hình Video & Render", padding=10)
-        vid_group.pack(fill="x", pady=(0, 10))
-
-        # Quality
-        ttk.Label(vid_group, text="Chất lượng video xuất:").grid(row=0, column=0, sticky="w", pady=4)
-        quality_var = tk.StringVar(value=self.settings.quality)
-        q_cbo = ttk.Combobox(vid_group, textvariable=quality_var, values=["standard", "high", "source"], state="readonly", width=18)
-        q_cbo.grid(row=0, column=1, sticky="w", pady=4)
-
-        # GPU acceleration
-        gpu_var = tk.BooleanVar(value=self.settings.use_gpu)
-        chk_gpu = ttk.Checkbutton(vid_group, text="Bật tăng tốc phần cứng GPU (NVENC/AMF/QSV)", variable=gpu_var)
-        chk_gpu.grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
-
-        # Burn subtitles
-        sub_var = tk.BooleanVar(value=self.settings.burn_subtitles)
-        chk_sub = ttk.Checkbutton(vid_group, text="Nhúng thẳng phụ đề vào video (Burn subtitles)", variable=sub_var)
-        chk_sub.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
-
-        # Output folder
-        ttk.Label(vid_group, text="Thư mục xuất video:").grid(row=3, column=0, sticky="w", pady=4)
-        out_var = tk.StringVar(value=self.settings.output_dir)
-        e_out = ttk.Entry(vid_group, textvariable=out_var, width=32)
-        e_out.grid(row=3, column=1, sticky="ew", pady=4)
-
-        def _choose_out() -> None:
-            f = filedialog.askdirectory(parent=dlg, title="Chọn thư mục xuất video")
-            if f:
-                out_var.set(f)
-
-        btn_browse = ttk.Button(vid_group, text="Duyệt...", command=_choose_out)
-        btn_browse.grid(row=3, column=2, padx=(6, 0), pady=4)
-
-        # Transcription / STT Section
-        stt_group = ttk.LabelFrame(frame, text="Nhận diện giọng nói & Thoại (STT)", padding=10)
-        stt_group.pack(fill="x", pady=(0, 12))
-
-        provider_map = {
-            "local": "Nội bộ (faster-whisper, tải mô hình khi cần)",
-            "openai": "API OpenAI Whisper (yêu cầu API Key)",
-        }
-        rev_provider_map = {v: k for k, v in provider_map.items()}
-        current_prov_display = provider_map.get(self.settings.transcription_provider, provider_map["local"])
-
-        ttk.Label(stt_group, text="Bộ nhận diện (STT):").grid(row=0, column=0, sticky="w", pady=4)
-        prov_var = tk.StringVar(value=current_prov_display)
-        cbo_prov = ttk.Combobox(stt_group, textvariable=prov_var, values=list(provider_map.values()), state="readonly", width=38)
-        cbo_prov.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
-
-        ttk.Label(stt_group, text="API Key (OpenAI):").grid(row=1, column=0, sticky="w", pady=4)
-        api_key_var = tk.StringVar(value=self.settings.api_key)
-        e_api_key = ttk.Entry(stt_group, textvariable=api_key_var, show="*", width=38)
-        e_api_key.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
-
-        ttk.Label(stt_group, text="API Base URL (tùy chọn):").grid(row=2, column=0, sticky="w", pady=4)
-        api_base_var = tk.StringVar(value=self.settings.api_base_url)
-        e_api_base = ttk.Entry(stt_group, textvariable=api_base_var, width=38)
-        e_api_base.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
-
-        lbl_note = ttk.Label(
-            stt_group,
-            text="* Chế độ nội bộ chạy hoàn toàn offline trên máy. Cấu hình bảo mật được lưu ngoài ứng dụng.",
-            font=("Segoe UI", 8),
-            foreground="#6b7280",
-        )
-        lbl_note.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # Save button
-        def _save() -> None:
-            self.settings.quality = quality_var.get()
-            self.settings.use_gpu = gpu_var.get()
-            self.settings.burn_subtitles = sub_var.get()
-            self.settings.output_dir = out_var.get().strip()
-            self.settings.transcription_provider = rev_provider_map.get(prov_var.get(), "local")
-            self.settings.api_key = api_key_var.get().strip()
-            self.settings.api_base_url = api_base_var.get().strip()
-            self.settings_store.save(self.settings)
-            self.queue.settings = self.settings
-            dlg.destroy()
+        def _on_saved(new_settings: AppSettings) -> None:
+            self.settings = new_settings
+            self.queue.settings = new_settings
             self.banner.show("Đã lưu cài đặt thành công!", level="success")
 
-        btn_save = ttk.Button(frame, text="Lưu thay đổi", style="Primary.TButton", command=_save)
-        btn_save.pack(anchor="center")
+        SettingsDialog(self, self.settings, self.settings_store, on_save=_on_saved)
 
     def _on_banner_dismissed(self) -> None:
         pass
@@ -784,6 +696,363 @@ class ToolRecapV2App(tk.Tk):
                 return
             self.queue.cancel()
         self.preview_player.stop()
+        self.destroy()
+
+
+class SettingsDialog(tk.Toplevel):
+    """Central settings window matching V1 AI Gateway pane quality."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        settings: AppSettings,
+        store: SettingsStore,
+        *,
+        on_save: Callable[[AppSettings], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.store = store
+        self.on_save = on_save or (lambda s: None)
+        self._panes: dict[str, ttk.Frame] = {}
+        self._nav_buttons: dict[str, ttk.Button] = {}
+
+        self.title("Cài đặt — ToolRecap V2")
+        self.geometry("860x640")
+        self.minsize(780, 560)
+        self.transient(parent)
+        set_window_icon(self)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self._make_variables()
+        self._build()
+        self._show_pane("AI Gateway")
+        self.grab_set()
+
+    def _make_variables(self) -> None:
+        val = self.settings
+        # AI Gateway vars
+        self.gateway_enabled_var = tk.BooleanVar(value=val.gateway_enabled)
+        self.endpoint_var = tk.StringVar(value=val.api_endpoint)
+        self.key_var = tk.StringVar(value=val.api_key)
+        self.show_key_var = tk.BooleanVar(value=False)
+        self.scanner_model_var = tk.StringVar(value=val.scanner_model)
+        self.scanner_thinking_var = tk.StringVar(value=val.scanner_thinking)
+        self.finalizer_model_var = tk.StringVar(value=val.finalizer_model)
+        self.finalizer_thinking_var = tk.StringVar(value=val.finalizer_thinking)
+        self.parallel_var = tk.IntVar(value=val.scanner_parallelism)
+        self.chunk_var = tk.IntVar(value=val.api_chunk_seconds)
+        self.ai_status_var = tk.StringVar(value="Scanner và Finalizer chưa được kiểm tra.")
+
+        # Render vars
+        self.quality_var = tk.StringVar(value=val.quality)
+        self.gpu_var = tk.BooleanVar(value=val.use_gpu)
+        self.burn_var = tk.BooleanVar(value=val.burn_subtitles)
+        self.output_var = tk.StringVar(value=val.output_dir)
+
+        # STT vars
+        provider_map = {
+            "local": "Nội bộ (faster-whisper, offline)",
+            "openai": "API OpenAI Whisper (yêu cầu API Key)",
+        }
+        self.rev_provider_map = {v: k for k, v in provider_map.items()}
+        current_display = provider_map.get(val.transcription_provider, provider_map["local"])
+        self.stt_provider_var = tk.StringVar(value=current_display)
+        self.stt_key_var = tk.StringVar(value=val.transcription_api_key or val.api_key)
+        self.stt_base_var = tk.StringVar(value=val.transcription_base_url or val.api_base_url)
+
+    def _build(self) -> None:
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        sidebar = ttk.Frame(root, padding=(0, 4, 12, 4))
+        sidebar.grid(row=0, column=0, sticky="ns")
+        for name in ("AI Gateway", "Render và đầu ra", "Nhận diện giọng nói (STT)"):
+            btn = ttk.Button(sidebar, text=name, width=22, command=lambda target=name: self._show_pane(target))
+            btn.pack(fill="x", pady=3)
+            self._nav_buttons[name] = btn
+
+        host = ttk.Frame(root, padding=(16, 8))
+        host.grid(row=0, column=1, sticky="nsew")
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+
+        self._panes["AI Gateway"] = self._build_ai(host)
+        self._panes["Render và đầu ra"] = self._build_render(host)
+        self._panes["Nhận diện giọng nói (STT)"] = self._build_stt(host)
+
+        for pane in self._panes.values():
+            pane.grid(row=0, column=0, sticky="nsew")
+
+        bottom = ttk.Frame(root)
+        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(bottom, text="Hủy", command=self.destroy).pack(side="right")
+        ttk.Button(bottom, text="Lưu cài đặt", style="Primary.TButton", command=self._save).pack(side="right", padx=(0, 8))
+
+    def _show_pane(self, name: str) -> None:
+        self._panes[name].tkraise()
+        for key, button in self._nav_buttons.items():
+            button.state(["disabled"] if key == name else ["!disabled"])
+
+    def _build_ai(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Cấu hình AI Gateway", font=("Segoe UI Semibold", 14)).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 16)
+        )
+
+        chk_gw = ttk.Checkbutton(
+            frame,
+            text="Kích hoạt phân tích kịch bản bằng AI Gateway (Scanner + Finalizer)",
+            variable=self.gateway_enabled_var,
+        )
+        chk_gw.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(frame, text="API endpoint:").grid(row=2, column=0, sticky="w", pady=5)
+        self.endpoint_entry = ttk.Entry(frame, textvariable=self.endpoint_var)
+        self.endpoint_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="API key:").grid(row=3, column=0, sticky="w", pady=5)
+        self.key_entry = ttk.Entry(frame, textvariable=self.key_var, show="●")
+        self.key_entry.grid(row=3, column=1, sticky="ew", padx=(10, 6), pady=5)
+        self.show_key_check = ttk.Checkbutton(frame, text="Hiện", variable=self.show_key_var, command=self._toggle_key)
+        self.show_key_check.grid(row=3, column=2, sticky="w")
+
+        ttk.Label(frame, text="Scanner model:").grid(row=4, column=0, sticky="w", pady=5)
+        self.scanner_model_entry = ttk.Entry(frame, textvariable=self.scanner_model_var)
+        self.scanner_model_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="Scanner thinking:").grid(row=5, column=0, sticky="w", pady=5)
+        self.scanner_thinking_combo = ttk.Combobox(
+            frame,
+            textvariable=self.scanner_thinking_var,
+            values=["auto", "low", "medium", "high", "xhigh", "max"],
+            state="readonly",
+        )
+        self.scanner_thinking_combo.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="Finalizer model:").grid(row=6, column=0, sticky="w", pady=5)
+        self.finalizer_model_entry = ttk.Entry(frame, textvariable=self.finalizer_model_var)
+        self.finalizer_model_entry.grid(row=6, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="Finalizer thinking:").grid(row=7, column=0, sticky="w", pady=5)
+        self.finalizer_thinking_combo = ttk.Combobox(
+            frame,
+            textvariable=self.finalizer_thinking_var,
+            values=["auto", "low", "medium", "high", "xhigh", "max"],
+            state="readonly",
+        )
+        self.finalizer_thinking_combo.grid(row=7, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="Scanner parallelism:").grid(row=8, column=0, sticky="w", pady=5)
+        self.parallel_spin = ttk.Spinbox(frame, from_=1, to=4, textvariable=self.parallel_var, width=8)
+        self.parallel_spin.grid(row=8, column=1, sticky="w", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="Độ dài đoạn:").grid(row=9, column=0, sticky="w", pady=5)
+        chunk_box = ttk.Frame(frame)
+        chunk_box.grid(row=9, column=1, sticky="w", padx=(10, 0), pady=5)
+        self.chunk_spin = ttk.Spinbox(chunk_box, from_=60, to=900, increment=30, textvariable=self.chunk_var, width=8)
+        self.chunk_spin.pack(side="left")
+        ttk.Label(chunk_box, text="giây").pack(side="left", padx=(6, 0))
+
+        test_box = ttk.Frame(frame)
+        test_box.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(14, 6))
+        test_box.columnconfigure((0, 1), weight=1)
+        self.test_scanner_btn = ttk.Button(test_box, text="Test Scanner", command=lambda: self._test_api("scanner"))
+        self.test_scanner_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.test_finalizer_btn = ttk.Button(test_box, text="Test Finalizer", command=lambda: self._test_api("finalizer"))
+        self.test_finalizer_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self.ai_status_lbl = ttk.Label(
+            frame,
+            textvariable=self.ai_status_var,
+            foreground="#075fc9",
+            wraplength=520,
+            font=("Segoe UI", 9),
+        )
+        self.ai_status_lbl.grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+        note = ttk.Label(
+            frame,
+            text="* Lưu ý: API key được lưu cục bộ dưới dạng văn bản trong %LOCALAPPDATA%\\ToolRecapV2\\settings.json.",
+            font=("Segoe UI", 8),
+            foreground="#6b7280",
+            wraplength=520,
+        )
+        note.grid(row=12, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        return frame
+
+    def _build_render(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Cấu hình Video & Render", font=("Segoe UI Semibold", 14)).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 16)
+        )
+
+        ttk.Label(frame, text="Chất lượng video:").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Combobox(
+            frame,
+            textvariable=self.quality_var,
+            values=["standard", "high", "source"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Checkbutton(
+            frame,
+            text="Bật tăng tốc phần cứng GPU (NVENC/AMF/QSV)",
+            variable=self.gpu_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=5)
+
+        ttk.Checkbutton(
+            frame,
+            text="Nhúng thẳng phụ đề vào video (Burn subtitles)",
+            variable=self.burn_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=5)
+
+        ttk.Label(frame, text="Thư mục xuất video:").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.output_var).grid(row=4, column=1, sticky="ew", padx=(10, 6), pady=5)
+
+        def _choose_dir() -> None:
+            folder = filedialog.askdirectory(parent=self, title="Chọn thư mục xuất video")
+            if folder:
+                self.output_var.set(folder)
+
+        ttk.Button(frame, text="Duyệt...", command=_choose_dir).grid(row=4, column=2, sticky="w", pady=5)
+
+        return frame
+
+    def _build_stt(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Nhận diện giọng nói & Thoại (STT)", font=("Segoe UI Semibold", 14)).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 16)
+        )
+
+        provider_map = {
+            "local": "Nội bộ (faster-whisper, offline)",
+            "openai": "API OpenAI Whisper (yêu cầu API Key)",
+        }
+
+        ttk.Label(frame, text="Bộ nhận diện (STT):").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Combobox(
+            frame,
+            textvariable=self.stt_provider_var,
+            values=list(provider_map.values()),
+            state="readonly",
+        ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+
+        ttk.Label(frame, text="API Key (STT):").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.stt_key_var, show="●").grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5
+        )
+
+        ttk.Label(frame, text="API Base URL (STT):").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.stt_base_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5
+        )
+
+        note = ttk.Label(
+            frame,
+            text="* Chế độ nội bộ chạy hoàn toàn offline trên máy. Cấu hình STT tách biệt độc lập với AI Gateway.",
+            font=("Segoe UI", 8),
+            foreground="#6b7280",
+            wraplength=520,
+        )
+        note.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        return frame
+
+    def _toggle_key(self) -> None:
+        if hasattr(self, "key_entry") and self.key_entry is not None:
+            self.key_entry.configure(show="" if self.show_key_var.get() else "●")
+
+    def _test_api(self, stage: str) -> None:
+        endpoint = self.endpoint_var.get().strip()
+        key = self.key_var.get().strip()
+        if stage == "scanner":
+            model = self.scanner_model_var.get().strip()
+            thinking = self.scanner_thinking_var.get().strip()
+            label = "Scanner"
+        else:
+            model = self.finalizer_model_var.get().strip()
+            thinking = self.finalizer_thinking_var.get().strip()
+            label = "Finalizer"
+
+        if not endpoint or not model:
+            messagebox.showwarning("AI Gateway", "Endpoint và model không được để trống.", parent=self)
+            return
+
+        self.ai_status_var.set(f"Đang kiểm tra {label} — {model}…")
+
+        import queue
+        result_queue: queue.Queue[str] = queue.Queue()
+
+        def _work() -> None:
+            import time
+            started = time.monotonic()
+            try:
+                result = OpenAICompatibleClient(endpoint, key, timeout=30).test(model, thinking)
+                elapsed = time.monotonic() - started
+                result_queue.put(f"{label} hoạt động — {model} / {thinking} — {elapsed:.1f}s — {result}")
+            except Exception as exc:
+                result_queue.put(f"{label} lỗi — {model}: {exc}")
+
+        def _poll() -> None:
+            try:
+                msg = result_queue.get_nowait()
+                self.ai_status_var.set(msg)
+            except queue.Empty:
+                if self.winfo_exists():
+                    self.after(25, _poll)
+
+        threading.Thread(target=_work, daemon=True).start()
+        self.after(25, _poll)
+
+    def _save(self) -> None:
+        try:
+            parallel = max(1, min(4, int(self.parallel_var.get())))
+            chunk = max(60, min(900, int(self.chunk_var.get())))
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Cài đặt", "Scanner parallelism hoặc Độ dài đoạn không hợp lệ.", parent=self)
+            return
+
+        endpoint = self.endpoint_var.get().strip()
+        scanner = self.scanner_model_var.get().strip()
+        finalizer = self.finalizer_model_var.get().strip()
+        gateway_enabled = self.gateway_enabled_var.get()
+
+        if gateway_enabled and (not endpoint or not scanner or not finalizer):
+            messagebox.showerror("Cài đặt", "Khi bật AI Gateway, Endpoint và hai model không được để trống.", parent=self)
+            return
+
+        self.settings.api_endpoint = endpoint
+        self.settings.api_key = self.key_var.get().strip()
+        self.settings.scanner_model = scanner
+        self.settings.scanner_thinking = self.scanner_thinking_var.get().strip()
+        self.settings.finalizer_model = finalizer
+        self.settings.finalizer_thinking = self.finalizer_thinking_var.get().strip()
+        self.settings.scanner_parallelism = parallel
+        self.settings.api_chunk_seconds = chunk
+        self.settings.gateway_enabled = gateway_enabled
+
+        self.settings.quality = self.quality_var.get()
+        self.settings.use_gpu = self.gpu_var.get()
+        self.settings.burn_subtitles = self.burn_var.get()
+        self.settings.output_dir = self.output_var.get().strip()
+
+        stt_code = self.rev_provider_map.get(self.stt_provider_var.get(), "local")
+        self.settings.transcription_provider = stt_code
+        self.settings.transcription_api_key = self.stt_key_var.get().strip()
+        self.settings.transcription_base_url = self.stt_base_var.get().strip()
+
+        self.store.save(self.settings)
+        self.on_save(self.settings)
         self.destroy()
 
 

@@ -13,14 +13,32 @@ from .voice.catalog import DEFAULT_VOICE_ID
 
 @dataclass
 class AppSettings:
+    # Voice and video render settings
     voice_id: str = DEFAULT_VOICE_ID
     quality: str = "high"
     use_gpu: bool = True
     generate_srt: bool = True
     burn_subtitles: bool = True
     output_dir: str = ""
-    transcription_provider: str = "local"  # "local" (faster-whisper/subtitles) or "openai" / "gemini"
+
+    # AI Gateway settings (V1 parity)
+    api_endpoint: str = "http://127.0.0.1:20128/v1"
     api_key: str = ""
+    scanner_model: str = "sub"
+    scanner_thinking: str = "max"
+    finalizer_model: str = "prime"
+    finalizer_thinking: str = "high"
+    scanner_parallelism: int = 2
+    api_chunk_seconds: int = 300
+    gateway_enabled: bool = True
+    recap_prompt: str = ""
+
+    # Speech-to-text / Transcription settings (distinct from gateway)
+    transcription_provider: str = "local"  # "local" (faster-whisper/subtitles) or "openai"
+    transcription_api_key: str = ""
+    transcription_base_url: str = ""
+
+    # Legacy fields / aliases kept for compatibility
     api_base_url: str = ""
 
 
@@ -35,9 +53,43 @@ class SettingsStore:
                 return AppSettings()
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    return AppSettings()
+
+                # Migration of legacy STT vs Gateway fields:
+                has_api_endpoint = "api_endpoint" in raw
+                transcription_provider = str(raw.get("transcription_provider", "local")).lower()
+
+                if "transcription_api_key" not in raw and "api_key" in raw:
+                    old_key = str(raw.get("api_key", "")).strip()
+                    if not has_api_endpoint:
+                        # Old V2 format without api_endpoint: api_key belonged to STT
+                        if transcription_provider != "local" or old_key.startswith("sk-") or old_key:
+                            raw["transcription_api_key"] = old_key
+                            raw["api_key"] = ""
+                    else:
+                        # Has api_endpoint: V1/modern format, api_key belongs to gateway
+                        if transcription_provider != "local" and old_key.startswith("sk-") and not raw.get("transcription_api_key"):
+                            raw["transcription_api_key"] = old_key
+
+                if "transcription_base_url" not in raw and "api_base_url" in raw:
+                    raw["transcription_base_url"] = raw.get("api_base_url", "")
+
+                if "api_endpoint" not in raw:
+                    raw["api_endpoint"] = "http://127.0.0.1:20128/v1"
+
+                if not raw.get("api_base_url") and raw.get("transcription_base_url"):
+                    raw["api_base_url"] = raw["transcription_base_url"]
+
                 fields = AppSettings.__dataclass_fields__
                 valid_data = {k: v for k, v in raw.items() if k in fields}
-                return AppSettings(**valid_data)
+                settings = AppSettings(**valid_data)
+
+                # Clamp bounded numerical fields
+                settings.scanner_parallelism = max(1, min(4, int(settings.scanner_parallelism)))
+                settings.api_chunk_seconds = max(60, min(900, int(settings.api_chunk_seconds)))
+
+                return settings
             except Exception:
                 return AppSettings()
 

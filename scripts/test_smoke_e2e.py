@@ -94,7 +94,7 @@ He uncovers an unexpected secret that changes everything.
     out_dir.mkdir(parents=True, exist_ok=True)
 
     store = ProjectStore(test_dir / "projects.json")
-    settings = AppSettings(quality="standard", use_gpu=False, burn_subtitles=True)
+    settings = AppSettings(quality="standard", use_gpu=False, burn_subtitles=True, gateway_enabled=False)
 
     record = ProjectRecord.from_video_path(sample_video, out_dir)
     finished = False
