@@ -1,127 +1,193 @@
-# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.2.0)
+# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.0)
 
-ToolRecap V2 là ứng dụng máy tính dành riêng cho Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim/truyền hình) tiếng Anh chỉ với một cú nhấp chuột: quét tập phim, phân tích nội dung thoại thực tế (qua phụ đề companion SRT hoặc nhận diện giọng nói faster-whisper / API), phân tích kịch bản 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, đọc lời dẫn chân thực bằng AI (Piper TTS), cắt cảnh theo nhịp kịch bản, nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
+ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim, truyền hình, tài liệu) tiếng Anh chất lượng cao chỉ với một cú nhấp chuột: quét nguồn video, phân tích và trích xuất hội thoại thực tế (qua phụ đề companion SRT/VTT/ASS, phụ đề đồ họa bitmap PGS/VobSub qua RapidOCR/AI Vision, hoặc nhận diện giọng nói STT faster-whisper), suy luận kịch bản phân đoạn 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, tổng hợp giọng dẫn thuyết minh chân thực với 12 giọng thiết kế chuẩn, phối trộn âm thanh tự động (Real Audio Mix with Auto-Ducking), nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
 
 ---
 
 ## 1. Cách Mở Ứng Dụng
 
-Ứng dụng chạy dưới dạng **bản Portable độc lập** (không cần cài đặt Python, không cần cài đặt FFmpeg hay cấu hình môi trường máy tính phức tạp):
+Ứng dụng chạy dưới dạng **bản Portable độc lập** (không cần cài đặt Python, không cần cài đặt FFmpeg hay thiết lập biến môi trường hệ thống):
 
-- **Cách 1 (Khuyên dùng)**: Nhấp đúp chuột vào tệp `release\ToolRecapV2\ToolRecapV2.exe` hoặc tệp `Chay-ToolRecapV2.cmd`.
-- **Cách 2 (Môi trường phát triển)**: Chạy lệnh `python auto_main.py` từ thư mục dự án.
-
----
-
-## 2. Hướng Dẫn Sử Dụng (5 Bước Đơn Giản)
-
-1. **Chọn nguồn video**:
-   - Nhấn nút **"📁 Chọn 1 file video..."** để xử lý 1 tập lẻ.
-   - Hoặc nhấn **"📂 Chọn thư mục chứa video..."** để xử lý cả mùa. Ứng dụng quét trực tiếp (không quét đệ quy các thư mục con), chỉ lấy các định dạng video được hỗ trợ (`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.m4v`, `.ts`), và tự động sắp xếp theo thứ tự tập tự nhiên (`ep1, ep2, ep10`).
-2. **Chọn giọng đọc thuyết minh**:
-   - Ở khung bên phải, chọn giọng đọc tiếng Anh mong muốn từ danh sách (Lessac, Ryan, Alba, Alan).
-   - Nhấn **"🔊 Nghe thử giọng"** để nghe âm thanh mẫu. Mô hình giọng đọc sẽ được tải tự động (lazy download) ở lần nghe đầu tiên và lưu vào bộ nhớ đệm.
-3. **Cấu hình AI Gateway (⚙ Cài đặt)**:
-   - ToolRecap V2 kết nối mặc định tới AI Gateway tại `http://127.0.0.1:20128/v1`.
-   - **Scanner model**: `sub` (thinking: `max`) — quét phân đoạn transcript với mốc thời gian tuyệt đối.
-   - **Finalizer model**: `prime` (thinking: `high`) — tổng hợp chứng cứ thành kịch bản phân đoạn chặt chẽ.
-   - **Song song (parallelism)**: 2 (tùy chỉnh 1-4), **Độ dài đoạn**: 300s (tùy chỉnh 60-900s).
-   - Nhấn nút **"Test Scanner"** và **"Test Finalizer"** để kiểm tra kết nối nền.
-   - Nếu muốn chạy offline không cần gateway: bỏ chọn "Kích hoạt AI Gateway" để dùng bộ tạo kịch bản extractive nội bộ.
-4. **Bắt đầu sản xuất tự động**:
-   - Nhấn nút lớn màu xanh **"▶ Bắt đầu tự động"**.
-   - Ứng dụng chạy tuần tự từng video qua các giai đoạn:
-     - **Phân tích nội dung thoại thực tế**: Đọc phụ đề đi kèm (`.srt`) hoặc dùng mô hình `faster-whisper` nội bộ / API OpenAI Whisper để trích xuất hội thoại thực tế.
-     - **Phân tích kịch bản qua AI Gateway**: Scanner phân tích song song các đoạn transcript, Finalizer tổng hợp kịch bản recap hoàn chỉnh.
-     - **Tổng hợp giọng đọc AI (TTS)**: Đọc lời dẫn thuyết minh bằng Piper TTS thật.
-     - **Cắt cảnh & Ghép âm thanh**: Cắt các phân đoạn phim tương ứng thời lượng kịch bản, ghép giọng dẫn và tạo phụ đề SRT.
-     - **Render video**: Mã hóa video đầu ra bằng quy trình tăng tốc Hybrid GPU hoặc CPU.
-5. **Xem kết quả**:
-   - Nhấn nút **"📂 Mở thư mục kết quả"** để mở thư mục chứa video recap và tệp phụ đề đã hoàn thành.
+- **Cách 1 (Khuyên dùng)**: Nhấp đúp chuột vào tệp `ToolRecapV2.exe` (hoặc tệp `Chay-ToolRecapV2.cmd`) trong thư mục bản dựng.
+- **Cách 2 (Môi trường phát triển)**: Chạy lệnh `python auto_main.py` từ thư mục gốc của dự án.
 
 ---
 
-## 3. Kiến Trúc AI Gateway & Bộ Nhớ Đệm Thông Minh (Cache)
+## 2. Quy Trình Sử Dụng: Single vs Season
 
-- **Chuẩn OpenAI-compatible**: Kết nối tới gateway (mặc định Tool-REcap gateway tại `http://127.0.0.1:20128/v1`). Client tự động xử lý loose JSON, bóc tách code fence markdown, thử lại linh hoạt khi gặp tham số không tương thích (loại bỏ `response_format`, `reasoning_effort`).
-- **An toàn bảo mật**: API Key không bao giờ bị rò rỉ trong log hoặc thông báo lỗi (tự động thay bằng `***`). Key được lưu dạng văn bản trong `settings.json` cục bộ người dùng.
-- **Bộ nhớ đệm nguyên tử (Cache)**: Kết quả phân tích được lưu tại `%LOCALAPPDATA%\ToolRecapV2\cache\gateway_analysis` theo mã băm video + cấu hình model + prompt. Khi chạy lại cùng video và cấu hình, ứng dụng tái sử dụng kết quả ngay lập tức mà không gọi lại API. Không lưu API key vào cache.
+Ứng dụng hỗ trợ hai phương thức chọn nguồn video:
 
----
-
-## 4. Dừng An Toàn (Safe Cancellation)
-
-- Trong khi render, nút **"⏹ Dừng xử lý"** sẽ sáng lên.
-- Khi nhấn dừng:
-  - Ứng dụng gửi tín hiệu dừng ngay lập tức.
-  - Tự động đóng cây tiến trình con FFmpeg (`taskkill /F /T /PID`).
-  - Mở khóa lại toàn bộ nút bấm trên giao diện (`▶ Bắt đầu tự động`, chọn file/thư mục).
-  - Cập nhật trạng thái các tập chưa chạy thành `CANCELLED`.
-
----
-
-## 5. Nơi Lưu Trữ Dữ Liệu
-
-Tất cả dữ liệu người dùng được lưu trữ hoàn toàn tách biệt ngoài thư mục ứng dụng tại:
-```
-%LOCALAPPDATA%\ToolRecapV2
-```
-Bao gồm:
-- `settings.json`: Cấu hình chất lượng video, GPU, nhúng phụ đề, cấu hình STT. Lưu ý: API Key được lưu dưới dạng văn bản thuần (plain text) trong tệp cấu hình cục bộ theo người dùng (%LOCALAPPDATA%), không được mã hóa mật mã (encryption). Không chia sẻ tệp này hoặc dùng khóa có quyền hạn cao trên máy dùng chung.
-- `projects.json`: Lịch sử và trạng thái hàng đợi các tập phim (lưu trữ nguyên tử, tự động phục hồi nếu mất điện/đóng đột ngột).
-- `models\voices\`: Bộ nhớ đệm các mô hình giọng đọc Piper ONNX tải về (bảo tồn nguyên vẹn khi nâng cấp ứng dụng).
-- `models\stt\`: Bộ nhớ đệm mô hình nhận diện giọng nói faster-whisper (tải tự động lần đầu, tái sử dụng không cần tải lại).
-- `logs\`: Nhật ký hoạt động và thông tin lỗi.
+1. **Xử lý tập đơn lẻ (Single Episode)**:
+   - Nhấn nút **"📁 Select File"** để chọn 1 tệp video duy nhất.
+   - Phù hợp khi bạn muốn recap nhanh một tập phim hoặc video ngắn độc lập.
+2. **Xử lý trọn bộ mùa phim (Season Multi-Episode)**:
+   - Nhấn nút **"📂 Select Folder"** để chọn thư mục chứa tất cả các tập của mùa phim.
+   - Hệ thống sẽ kích hoạt quy trình phân tích mùa (Season Analysis), liên kết sự kiện giữa các tập và khai phá các ứng viên kịch bản xuyên suốt mùa (Season Arc, Storylines).
+3. **Quét trực tiếp không đệ quy (Source Direct-Only)**:
+   - Ứng dụng quét trực tiếp các tệp nằm ngay trong thư mục được chọn, **tuyệt đối không quét đệ quy vào các thư mục con**.
+   - Chỉ lọc và nhận diện các định dạng video được hỗ trợ: `.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.m4v`, `.ts`.
+   - Tự động sắp xếp video theo thứ tự tập tự nhiên (natural sort: `ep1, ep2, ep10`), tránh sai lệch thứ tự tập phim.
+4. **Bắt đầu sản xuất**:
+   - Nhấn nút lớn màu xanh **"▶ Start Creating Recap Videos"**.
+   - Theo dõi tiến trình thời gian thực trên bảng hàng đợi (Episode, Source Video, Stage, Progress, Status).
+5. **Xem sản phẩm hoàn thành**:
+   - Nhấn nút **"📂 Open Output Folder"** để mở thư mục kết quả.
 
 ---
 
-## 6. Cập Nhật Ứng Dụng & Phân Biệt VoiceStudio Subsystem
+## 3. Các Giai Đoạn Xử Lý (Phases)
 
-- **Cập nhật ToolRecap V2**: Tự động kiểm tra GitHub Releases chính thức từ `longthao9820-alt/tool-recap-v2`. Hộp thoại hiển thị rõ ràng cả phiên bản hiện tại và phiên bản mới nhất. Bản cập nhật bắt buộc phải có mã băm SHA256 hợp lệ, áp dụng qua kịch bản hoán đổi có rollback và bảo toàn dữ liệu người dùng.
-- **Phân biệt VoiceStudio Subsystem**:
-  - Bản phát hành chính thức `debpalash/VoiceStudio v0.5.3` đã được kiểm tra trực tiếp: hiện tại tác giả chỉ cung cấp bản dựng desktop độc lập (AGPL), chưa có gói adapter V2 tương thích.
-  - Hiện tại, hệ thống giọng đọc **Piper TTS hoạt động đầy đủ, sẵn sàng sử dụng ngay**.
-  - Cơ chế cập nhật VoiceStudio trong ToolRecap V2 đã sẵn sàng: khi có gói adapter tương thích chính thức với chữ ký / mã băm SHA256 (hoặc GitHub digest) hợp lệ và `voice_manifest.json` chuẩn, hệ thống sẽ tự động xác thực và cài đặt an toàn. Tuyệt đối không tự ý sao chép ứng dụng desktop hoặc giả định adapter đã được cài đặt khi chưa có gói hợp lệ.
+Mỗi tập phim và mùa phim được xử lý tuần tự qua các giai đoạn nghiêm ngặt:
 
----
-
-## 7. Giới Hạn Của Hệ Thống
-
-- **Phạm vi phân tích AI**: Khi bật AI Gateway, Scanner và Finalizer dùng mô hình được cấu hình để suy luận trên transcript có mốc thời gian. AI chưa xem trực tiếp toàn bộ hình ảnh video, nên chất lượng phụ thuộc phụ đề hoặc lời thoại nhận dạng. Khi tắt Gateway, ứng dụng dùng chế độ tóm tắt trích xuất nội bộ đơn giản hơn.
-- **Video ít hoặc không có lời thoại**: Nếu không có tiếng nói và không có phụ đề SRT, AI chỉ nhận được bằng chứng dòng thời gian hạn chế; ứng dụng yêu cầu model không tự bịa sự kiện.
-- **Tải mô hình ban đầu**: Lần đầu tiên sử dụng một giọng đọc hoặc mô hình STT nội bộ, ứng dụng cần kết nối Internet để tải mô hình về máy (tiến trình tải được hiển thị trực tiếp trên giao diện).
-- **Tăng tốc GPU**: Yêu cầu máy tính có card đồ họa tương thích và đã cài đặt driver chính thức (NVIDIA, AMD hoặc Intel).
-
----
-
-## 8. Xử Lý Các Lỗi Thường Gặp
-
-| Hiện tượng | Nguyên nhân | Cách khắc phục |
-| :--- | :--- | :--- |
-| **Không tìm thấy video trong thư mục** | Video nằm trong các thư mục con sâu hơn. | Đưa video ra thư mục chính, vì ứng dụng quét trực tiếp (non-recursive) để đảm bảo chính xác thứ tự tập. |
-| **Render chậm hoặc CPU cao** | Máy tính chưa cài driver GPU phù hợp. | Vào **⚙ Cài đặt**, kiểm tra mục GPU. Nếu không có card rời, ứng dụng tự động dùng CPU `libx264` rất ổn định. |
-| **Lỗi dung lượng ổ đĩa** | Ổ đĩa chứa thư mục xuất video bị đầy. | Nhấn **⚙ Cài đặt** và đổi thư mục xuất sang ổ đĩa còn nhiều dung lượng trống. |
-| **Lỗi khởi động ứng dụng** | Thiếu file thư viện hoặc FFmpeg. | Chạy lệnh `python auto_main.py --self-check` để xem báo cáo kiểm tra chi tiết. |
+1. **`media_probe`**: Thăm dò và phân tích thông số kỹ thuật video (độ phân giải, thời lượng, luồng hình ảnh, luồng âm thanh) bằng FFprobe nhúng.
+2. **`subtitles`**: Khám phá và trích xuất phụ đề (ưu tiên tiếng Anh, xử lý tệp phụ đề ngoài hoặc luồng phụ đề nhúng trong container).
+3. **`scanner`**: Quét từng phân đoạn transcript/video qua Scanner AI để trích xuất bằng chứng câu chuyện (narrative evidence) gắn mốc thời gian tuyệt đối.
+4. **`season_barrier`** (Chế độ Season): Điểm đồng bộ hóa bắt buộc — toàn bộ các tập trong mùa phải hoàn thành giai đoạn Scanner trước khi bước vào kết nối mùa.
+5. **`season_connecting`** (Chế độ Season): Phân tích mạng lưới liên kết sự kiện, xung đột và nhân vật xuyên suốt toàn bộ các tập của mùa.
+6. **`season_mining`** (Chế độ Season): Khai phá và tuyển chọn các ứng viên kịch bản hoàn chỉnh (Candidate Mining).
+7. **`output_plan_ready`**: Hoàn thiện kế hoạch phân đoạn và kịch bản recap.
+8. **Giai đoạn Kết xuất (Rendering)**:
+   - Tổng hợp lời dẫn thuyết minh (Timeline narration) bằng mô hình giọng đọc AI.
+   - Phối trộn âm thanh thông minh (Real Audio Mix).
+   - Tạo tệp phụ đề SRT đồng bộ chính xác đến từng mili-giây.
+   - Mã hóa video đầu ra hoàn chỉnh bằng bộ tăng tốc Hybrid GPU hoặc CPU.
 
 ---
 
-## 9. Đóng Gói Bản Phát Hành (Release)
+## 4. Cấu Hình Cài Đặt (Chính Xác 4 Tab)
 
-Để đóng gói ra bản Portable hoàn chỉnh:
-1. Nhấp đúp vào tệp `Dong-Goi-ToolRecapV2.cmd` (hoặc chạy lệnh `python build_exe.py`).
-2. Script sẽ tự động:
-   - Dựng bản portable mới vào `release\ToolRecapV2\`.
-   - Sao chép `ffmpeg.exe`, `ffprobe.exe`, `LICENSE`, `THIRD_PARTY_LICENSES.md`, và tệp hướng dẫn sử dụng.
-   - Kiểm tra khả năng mã hóa NVENC/AMF/QSV của binary FFmpeg.
-   - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp `.exe`.
-   - Tạo gói nén `release\ToolRecapV2-v0.2.0-windows-portable.zip` và tệp mã băm companion `ToolRecapV2-v0.2.0-windows-portable.zip.sha256.txt`.
+Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa sổ cấu hình trung tâm với đúng 4 tab:
+
+### Tab 1: Recap (Kịch bản & Phim)
+- **Recap language**: Ngôn ngữ kịch bản (`en-US`, `en-GB`).
+- **Recap mode**: Chế độ recap (`MAIN_STORIES` — tập trung tuyến truyện chính, hoặc `FULL_EPISODE` — tóm tắt toàn diện tập).
+- **Content type**: Phân loại nội dung (`US_TV_SHOW`, `DE_GERMAN_SOAP`, `BODYCAM`, `FEATURE_FILM`, `OTHER`).
+- **Footage rights**: Trạng thái bản quyền tư liệu (`UNVERIFIED`, `OWNED`, `LICENSED`, `FIRST_PUBLICATION_RIGHTS`, `FAIR_USE`).
+- **Recap Prompt**: Khung soạn thảo prompt chỉ dẫn cho AI tạo kịch bản, kèm nút **"Reload Default Prompt"** để khôi phục chỉ dẫn chuẩn của từng thể loại phim.
+
+### Tab 2: AI Gateway (Kết Nối Mô Hình AI)
+- **Kích hoạt AI Gateway**: Bật/tắt phân tích kịch bản qua API OpenAI-compatible (khi tắt, hệ thống sử dụng thuật toán tóm tắt trích xuất offline nội bộ).
+- **API endpoint**: Địa chỉ cổng Gateway (mặc định: `http://127.0.0.1:20128/v1`).
+- **API key**: Khóa truy cập API (được lưu an toàn cục bộ trong `settings.json`, có nút Hiện/Ẩn, không bao giờ lộ ra nhật ký hoạt động).
+- **Scanner model**: Mô hình quét bằng chứng (mặc định: `sub`, thinking: `max`).
+- **Scanner model supports image/Vision input**: Checkbox rõ ràng cho phép gửi hình ảnh phụ đề/khung cảnh lên mô hình Vision khi cần thiết.
+- **Finalizer model**: Mô hình tổng hợp kịch bản (mặc định: `prime`, thinking: `high`).
+- **Song song (parallelism)**: Số luồng phân tích Scanner đồng thời (1 đến 4 luồng, mặc định 2).
+- **Độ dài đoạn (chunk seconds)**: Thời lượng mỗi phân đoạn transcript (60s đến 900s, mặc định 300s).
+- **Nút Test**: Kiểm tra kết nối độc lập cho Scanner và Finalizer ngay trong bảng cài đặt.
+
+### Tab 3: Voice (Giọng Đọc & Phối Trộn Âm Thanh)
+- **Language & Voice selection**: Lựa chọn từ 12 giọng đọc thiết kế chuẩn tiếng Anh (Neighbor, Companion, v.v., phân loại theo vùng `en-US` và `en-GB`, nam/nữ).
+- **Voice style**: Chọn phong cách biểu cảm (`film_recap`, `storytelling`, `documentary`, `crime_thriller`, `drama`, `soap_emotional`, `energetic`, `neutral`).
+- **🔊 Nghe thử giọng**: Nghe trước giọng đọc mẫu kèm thanh hiển thị tiến trình tải mô hình và nút dừng nghe tức thì.
+- **🎙 Cập nhật VoiceStudio**: Mở hộp thoại kiểm tra và cấu hình môi trường giọng đọc mở rộng.
+- **Phối trộn âm thanh (Audio Mix)**:
+  - *Original audio*: Mức tăng/giảm âm lượng âm thanh phim gốc (-60.0 dB đến +24.0 dB).
+  - *Commentary voice*: Mức tăng/giảm âm lượng giọng thuyết minh (-60.0 dB đến +24.0 dB).
+  - *Auto-duck original audio during commentary*: Tự động hạ âm lượng phim gốc khi có giọng thuyết minh cất lên.
+  - *Ducking amount*: Mức độ giảm âm nền khi ducking (mặc định -12.0 dB).
+  - *Target loudness*: Chuẩn hóa độ ồn tổng thể theo chuẩn phát thanh (mặc định -14.0 LUFS).
+  - *True peak*: Mức trần âm thanh tối đa chống vỡ tiếng (mặc định -1.0 dBTP).
+
+### Tab 4: Render and Output (Xuất Bản & Hệ Thống)
+- **Chất lượng video**: `standard` (tiết kiệm dung lượng), `high` (chất lượng cao), `source` (giữ nguyên độ phân giải nguồn).
+- **Bật tăng tốc phần cứng GPU**: Tận dụng NVIDIA NVENC, AMD AMF hoặc Intel QSV để mã hóa video siêu tốc.
+- **Nhúng thẳng phụ đề vào video (Burn subtitles)**: Bật để ghi trực tiếp chữ phụ đề lên hình ảnh video đầu ra.
+- **Thư mục xuất video**: Chọn vị trí lưu trữ thành phẩm recap.
+- **Hệ thống phụ & Cập nhật**: Kiểm tra phiên bản và môi trường phụ trợ VoiceStudio.
+
+*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong).*
 
 ---
 
-## 10. Giấy Phép & Nguồn Gốc Thành Phần
+## 5. Trích Xuất Hội Thoại & Phụ Đề: PGS / VobSub / RapidOCR / AI Vision / STT
 
-- **ToolRecap V2 Core**: Bản quyền mã nguồn mở MIT.
-- **FFmpeg / FFprobe**: Bản dựng LGPL / GPL từ gyan.dev.
-- **Piper TTS**: Bản quyền mã nguồn mở MIT / Apache-2.0 từ Rhasspy.
-- **faster-whisper**: Bản quyền mã nguồn mở MIT từ Systran.
-- **Biểu tượng (Icon)**: Thiết kế vector tạo bằng Pillow, thuộc sở hữu dự án.
+Ứng dụng sở hữu cơ chế bóc tách hội thoại đa tầng hiện đại:
+
+1. **Ưu tiên phụ đề tiếng Anh**: Tự động dò tìm luồng phụ đề tiếng Anh trong tệp đa phương tiện hoặc các tệp phụ đề sidecar cùng tên (`.srt`, `.vtt`, `.ass`).
+2. **Phụ đề bitmap PGS / VobSub**: Đối với các nguồn phim Blu-ray (PGS `.sup`) hoặc DVD (VobSub `.sub`/`.idx`):
+   - Hệ thống giải mã đồ họa trực tiếp và nhận dạng chữ qua thư viện **RapidOCR ONNX** nội bộ mà không cần cài đặt thêm phần mềm ngoài.
+   - **AI Vision Fallback**: CHỈ KHI người dùng đánh dấu chọn checkbox *"Scanner model supports image/Vision input"* trong cài đặt AI Gateway, các dòng phụ đề mờ khó đọc mới được gửi lên mô hình Vision để hỗ trợ giải mã.
+3. **STT Dự phòng nội bộ (Internal STT)**:
+   - Nếu video không có phụ đề hoặc quá trình OCR không tìm thấy nội dung thoại, hệ thống tự động kích hoạt bộ nhận diện giọng nói **faster-whisper** nội bộ (chạy tối ưu hóa trên CPU) hoặc API Whisper để bóc băng trực tiếp từ âm thanh của phim.
+
+---
+
+## 6. 12 Giọng Thiết Kế Chuẩn & Cơ Chế Tải Runtime/Model Lần Đầu
+
+- **Danh mục 12 giọng chính thức**: Kế thừa kiến trúc VoiceStudio / OmniVoice với 12 nhân vật giọng đọc chuyên biệt (6 giọng `en-US` và 6 giọng `en-GB`, nam/nữ, phù hợp cho tóm tắt phim, kịch tính, tài liệu).
+- **Tải lần đầu (First-use download)**:
+  - Ở lần đầu sử dụng một giọng đọc hoặc tính năng nâng cao, ứng dụng sẽ tải môi trường Python độc lập và trọng số mô hình OmniVoice (dung lượng lớn khoảng vài GB).
+  - Tiến trình tải được hiển thị rõ ràng từng phần trăm và dung lượng byte trên giao diện, hỗ trợ hủy an toàn.
+  - Toàn bộ runtime và mô hình sau khi tải được lưu vào thư mục bộ nhớ đệm tại `%LOCALAPPDATA%\ToolRecapV2\voice_subsystem` và cache mô hình của máy. Các lần chạy tiếp theo sẽ hoạt động tức thì, hoàn toàn offline.
+- **Tương thích nội bộ (Built-in Fallback)**: Ứng dụng luôn tích hợp sẵn runtime giọng nói Piper TTS nội bộ, sẵn sàng hoạt động ngay cả khi chưa tải gói OmniVoice lớn.
+
+---
+
+## 7. Sản Phẩm Xuất Bản: Đúng 3 Tệp Thành Phẩm (Outputs Exact Three)
+
+Mỗi phân đoạn video recap được xuất bản vào một thư mục riêng biệt sạch sẽ, chỉ chứa **ĐÚNG BA TỆP THÀNH PHẨM**:
+
+1. **`{safe_title}.mp4`**: Video recap hoàn chỉnh (hình ảnh khớp nhịp kịch bản, âm thanh hòa trộn giọng dẫn và âm nền, phụ đề nhúng tùy chọn).
+2. **`{safe_title}.original.srt`**: Tệp phụ đề các câu thoại gốc của phim được trích dẫn trong bản recap.
+3. **`{safe_title}.narration.srt`**: Tệp phụ đề toàn bộ lời dẫn thuyết minh của AI với mốc thời gian chuẩn xác.
+
+Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không chứa bất kỳ tệp tạm, tệp nhật ký hay thư mục con nào.
+
+---
+
+## 8. Dừng An Toàn (Stop / Safe Cancellation)
+
+- Trong quá trình phân tích hoặc kết xuất, nút **"⏹ Stop"** luôn sẵn sàng.
+- Khi nhấn nút dừng:
+  - Ứng dụng lập tức phát cờ hủy tiến trình an toàn (`cancel_event`).
+  - Đóng sạch sẽ cây tiến trình con FFmpeg bằng lệnh hệ thống (`taskkill /F /T /PID`).
+  - Xóa bỏ các tệp tạm thời chưa hoàn thiện.
+  - Mở khóa lại toàn bộ các nút bấm trên giao diện và đánh dấu trạng thái của các tập chưa hoàn thành là `CANCELLED`.
+  - Tuyệt đối không để xảy ra hiện tượng treo tiến trình nền (orphan process).
+
+---
+
+## 9. Cập Nhật & Lưu Trữ Dữ Liệu
+
+- **Cập nhật ứng dụng ToolRecap V2**: Tự động kiểm tra GitHub Releases chính thức từ `longthao9820-alt/tool-recap-v2`. Bản cập nhật được xác thực mã băm SHA256 trước khi hoán đổi an toàn có cơ chế khôi phục (rollback).
+- **Cập nhật VoiceStudio Subsystem**: Kiểm tra và áp dụng gói cập nhật adapter tách biệt, xác thực mã băm SHA256 và manifest hợp lệ.
+- **Nơi lưu trữ dữ liệu người dùng**: Toàn bộ cài đặt, lịch sử hàng đợi và bộ nhớ đệm được lưu tại:
+  ```
+  %LOCALAPPDATA%\ToolRecapV2
+  ```
+  - `settings.json`: Cấu hình ứng dụng và API Key (lưu văn bản thuần cục bộ).
+  - `projects.json`: Lịch sử và hàng đợi dự án (lưu nguyên tử, chống hỏng hóc khi mất điện).
+  - `cache\gateway_analysis\`: Bộ nhớ đệm phân tích AI Gateway theo mã băm video, giúp chạy lại không tốn API call.
+  - `cache\subtitles\`: Bộ nhớ đệm phụ đề và kết quả OCR.
+  - `voice_subsystem\`: Môi trường runtime Python độc lập cho giọng đọc nâng cao.
+  - `models\`: Bộ nhớ đệm trọng số mô hình AI (OCR, STT, TTS).
+  - `logs\`: Nhật ký hoạt động và thông báo lỗi.
+
+---
+
+## 10. Giới Hạn Của Hệ Thống (Limitations)
+
+- **Mạng Internet lần đầu**: Cần kết nối Internet ổn định ở lần sử dụng đầu tiên để tải các gói runtime và mô hình AI nặng.
+- **Yêu cầu phần cứng**: Để đạt tốc độ mã hóa video cao nhất, khuyến nghị máy tính có card đồ họa hỗ trợ NVIDIA NVENC, AMD AMF hoặc Intel QSV. Nếu không có card rời, ứng dụng tự động dùng CPU với bộ mã hóa `libx264` chất lượng cao nhưng thời gian kết xuất sẽ lâu hơn.
+- **Độ phụ thuộc vào nguồn thoại**: AI Gateway suy luận và tạo kịch bản dựa trên phụ đề và lời thoại nhận dạng được. Đối với video không có bất kỳ lời thoại hay phụ đề nào, kịch bản recap sẽ chỉ dựa trên thông tin dòng thời gian tổng quát.
+
+---
+
+## 11. Đóng Gói Bản Phát Hành Portable
+
+Để tạo bản phân phối Portable độc lập:
+1. Nhấp đúp vào `Dong-Goi-ToolRecapV2.cmd` (hoặc chạy lệnh `python build_exe.py`).
+2. Kịch bản sẽ tự động:
+   - Dựng ứng dụng bằng PyInstaller với tệp cấu hình `ToolRecapV2.spec`.
+   - Nhúng FFmpeg, FFprobe, giấy phép và tệp hướng dẫn sử dụng vào `release\ToolRecapV2\`.
+   - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp thực thi đã dựng.
+   - Nén toàn bộ thành `release\ToolRecapV2-v0.3.0-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.0-windows-portable.zip.sha256.txt`.
+
+---
+
+## 12. Giấy Phép Bản Quyền (Licenses)
+
+- Mã nguồn chính của ToolRecap V2 được phát hành theo giấy phép **MIT License**.
+- Các thành phần bên thứ ba (FFmpeg, Piper, RapidOCR, OmniVoice, faster-whisper, PyTorch, OpenCV, Shapely) tuân theo giấy phép mã nguồn mở tương ứng. Xem chi tiết tại tệp `THIRD_PARTY_LICENSES.md`.
+- Người dùng tự chịu trách nhiệm về bản quyền của video nguồn và việc sử dụng các mô hình AI theo điều khoản của nhà cung cấp.

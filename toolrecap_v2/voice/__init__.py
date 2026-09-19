@@ -1,11 +1,94 @@
 """Voice subsystem for ToolRecap V2."""
-from .catalog import BUILTIN_VOICES, VoiceSpec, get_voice_spec
-from .manager import VoiceModelManager, get_voice_manager
+from .audio_mix import (
+    AudioMixError,
+    AudioMixPlan,
+    AudioMixSettings,
+    AudioValidationError,
+    build_audio_mix_command,
+    build_audio_mix_filter_graph,
+    execute_audio_mix,
+    plan_audio_mix,
+    validate_mixed_audio,
+)
+from .catalog import (
+    BUILTIN_VOICES,
+    DEFAULT_VOICE_BY_LANGUAGE,
+    DEFAULT_VOICE_ID,
+    DEFAULT_VOICE_ID_GB,
+    DEFAULT_VOICE_ID_US,
+    PIPER_COMPATIBILITY_VOICES,
+    STYLE_INSTRUCTIONS,
+    STYLE_NAMES,
+    SUPPORTED_VOICE_STYLES,
+    VoiceSpec,
+    clear_official_runtime_cache,
+    detect_official_voicestudio_runtime,
+    get_available_voices,
+    get_isolated_runtime_python,
+    get_voice_spec,
+    get_voice_status,
+    is_voice_selectable,
+    is_voicestudio_ready,
+    migrate_voice_setting,
+)
+from .bootstrap import (
+    BootstrapCancelled,
+    BootstrapError,
+    BootstrapSecurityError,
+    BootstrapValidationError,
+    VoiceRuntimeBootstrap,
+    VoiceRuntimeBootstrapManifest,
+)
+from .manager import (
+    DownloadCancelled,
+    VoiceError,
+    VoiceModelManager,
+    get_voice_manager,
+    validate_wav_audio,
+)
 
 __all__ = [
+    # Catalog
     "BUILTIN_VOICES",
+    "PIPER_COMPATIBILITY_VOICES",
+    "DEFAULT_VOICE_ID",
+    "DEFAULT_VOICE_ID_US",
+    "DEFAULT_VOICE_ID_GB",
+    "DEFAULT_VOICE_BY_LANGUAGE",
+    "SUPPORTED_VOICE_STYLES",
+    "STYLE_NAMES",
+    "STYLE_INSTRUCTIONS",
     "VoiceSpec",
     "get_voice_spec",
+    "get_available_voices",
+    "is_voicestudio_ready",
+    "is_voice_selectable",
+    "get_voice_status",
+    "migrate_voice_setting",
+    "detect_official_voicestudio_runtime",
+    "clear_official_runtime_cache",
+    "get_isolated_runtime_python",
+    # Bootstrap
+    "VoiceRuntimeBootstrap",
+    "VoiceRuntimeBootstrapManifest",
+    "BootstrapError",
+    "BootstrapCancelled",
+    "BootstrapValidationError",
+    "BootstrapSecurityError",
+    # Manager
     "VoiceModelManager",
     "get_voice_manager",
+    "VoiceError",
+    "DownloadCancelled",
+    "validate_wav_audio",
+    # Audio mix
+    "AudioMixSettings",
+    "AudioMixPlan",
+    "AudioMixError",
+    "AudioValidationError",
+    "build_audio_mix_filter_graph",
+    "plan_audio_mix",
+    "build_audio_mix_command",
+    "execute_audio_mix",
+    "validate_mixed_audio",
 ]

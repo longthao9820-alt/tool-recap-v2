@@ -46,13 +46,13 @@ def _run_self_check() -> int:
 
     errors: list[str] = []
 
-    # 1. Check icon
+    # 1. Check icon (mandatory)
     icon = get_asset_path("icon.ico")
     icon_ok = icon is not None and icon.is_file()
     if not icon_ok:
         errors.append("Thiếu icon ứng dụng (icon.ico).")
 
-    # 2. Check FFmpeg
+    # 2. Check FFmpeg (mandatory)
     ffmpeg = bundled_binary("ffmpeg")
     ffmpeg_ok = False
     if ffmpeg:
@@ -64,7 +64,7 @@ def _run_self_check() -> int:
     else:
         errors.append("Không tìm thấy FFmpeg trong runtime hoặc PATH.")
 
-    # 3. Check voice synthesis runtime
+    # 3. Check voice synthesis runtime (Piper builtin - mandatory)
     voice_ok = False
     try:
         import piper
@@ -74,7 +74,7 @@ def _run_self_check() -> int:
         voice_ok = False
         errors.append(f"Không thể tải runtime giọng nói Piper ({exc}).")
 
-    # 4. Check GUI module
+    # 4. Check GUI module (mandatory)
     gui_ok = False
     try:
         import tkinter
@@ -82,7 +82,77 @@ def _run_self_check() -> int:
     except Exception as exc:
         errors.append(f"Không thể tải giao diện đồ họa Tkinter: {exc}")
 
-    # 5. Check hardware acceleration (decode and encode plan)
+    # 5. Check OCR runtime package (mandatory package)
+    ocr_pkg_ok = False
+    ocr_pkg_name = "None"
+    ocr_pkg_ver = ""
+    try:
+        import rapidocr_onnxruntime
+        ocr_pkg_ok = True
+        ocr_pkg_name = "rapidocr_onnxruntime"
+        try:
+            import importlib.metadata
+            ocr_pkg_ver = importlib.metadata.version("rapidocr_onnxruntime")
+        except Exception:
+            ocr_pkg_ver = getattr(rapidocr_onnxruntime, "__version__", "")
+    except ImportError:
+        try:
+            import rapidocr
+            ocr_pkg_ok = True
+            ocr_pkg_name = "rapidocr"
+            try:
+                import importlib.metadata
+                ocr_pkg_ver = importlib.metadata.version("rapidocr")
+            except Exception:
+                ocr_pkg_ver = getattr(rapidocr, "__version__", "")
+        except ImportError as exc:
+            errors.append(f"Không tìm thấy gói runtime OCR (rapidocr_onnxruntime/rapidocr): {exc}")
+
+    # 6. Check Lazy Models downloaded: yes/no (no is completely valid)
+    ocr_models_downloaded = False
+    try:
+        from toolrecap_v2.subtitles.ocr import OcrModelManager
+        ocr_models_downloaded = OcrModelManager().are_models_available()
+    except Exception:
+        ocr_models_downloaded = False
+
+    voice_models_downloaded = False
+    try:
+        from toolrecap_v2.voice.manager import get_voice_manager
+        vm = get_voice_manager()
+        voice_models_downloaded = vm._is_omnivoice_model_cached() or any(
+            vm.is_voice_installed(vid) for vid in ("piper.en_US-lessac-medium", "voicestudio.en.neighbor")
+        )
+    except Exception:
+        voice_models_downloaded = False
+
+    stt_models_downloaded = False
+    try:
+        stt_cache = default_data_directory() / "models" / "stt"
+        stt_models_downloaded = stt_cache.is_dir() and any(stt_cache.iterdir())
+    except Exception:
+        stt_models_downloaded = False
+
+    # 7. Check Voice backend runtime: official / isolated / install-on-first-use
+    voice_backend_mode = "install-on-first-use"
+    voice_backend_path = None
+    try:
+        from toolrecap_v2.voice.catalog import detect_official_voicestudio_runtime, get_isolated_runtime_python
+        official = detect_official_voicestudio_runtime()
+        if official is not None and official.is_file():
+            voice_backend_mode = "official"
+            voice_backend_path = str(official)
+        else:
+            isolated = get_isolated_runtime_python()
+            if isolated is not None and isolated.is_file():
+                voice_backend_mode = "isolated"
+                voice_backend_path = str(isolated)
+            else:
+                voice_backend_mode = "install-on-first-use"
+    except Exception as exc:
+        voice_backend_mode = f"install-on-first-use (probe error: {exc})"
+
+    # 8. Check hardware acceleration and FFmpeg capabilities
     accel_summary = "Không khả dụng"
     hybrid_report = ""
     if ffmpeg_ok and ffmpeg:
@@ -94,7 +164,7 @@ def _run_self_check() -> int:
             hybrid_report = (
                 f"  - Kế hoạch tăng tốc: {hybrid_type}\n"
                 f"  - Phần cứng: {accel_summary}\n"
-                f"  - Khả năng GPU: QSV_decode={caps.qsv_decode}, NVENC={caps.nvenc_encode}, AMF={caps.amf_encode}, QSV_encode={caps.qsv_encode}\n"
+                f"  - Khả năng FFmpeg/GPU: QSV_decode={caps.qsv_decode}, NVENC={caps.nvenc_encode}, AMF={caps.amf_encode}, QSV_encode={caps.qsv_encode}\n"
                 f"  - GPU phát hiện: {', '.join(caps.gpu_names) if caps.gpu_names else 'None'}"
             )
         except Exception as exc:
@@ -102,6 +172,9 @@ def _run_self_check() -> int:
 
     if not errors:
         print(f"ToolRecap V2 v{__version__} self-check PASSED (ffmpeg={ffmpeg_ok}, voice={voice_ok}, icon={icon_ok}, gui={gui_ok})")
+        print(f"  - OCR runtime package: {ocr_pkg_name} {ocr_pkg_ver} (available={ocr_pkg_ok})")
+        print(f"  - Models downloaded: OCR={'yes' if ocr_models_downloaded else 'no'}, Voice={'yes' if voice_models_downloaded else 'no'}, STT={'yes' if stt_models_downloaded else 'no'} (lazy assets, 'no' is valid)")
+        print(f"  - Voice backend runtime: {voice_backend_mode} ({voice_backend_path or 'install-on-first-use'})")
         if hybrid_report:
             print(hybrid_report)
         return 0

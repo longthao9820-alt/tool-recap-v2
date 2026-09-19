@@ -455,26 +455,41 @@ def extract_companion_subtitles(video_path: Path) -> list[tuple[float, float, st
     return []
 
 
-def extract_audio_from_video(video_path: Path, output_wav: Path) -> bool:
-    """Extract audio track as 16kHz mono PCM16 WAV for transcription/analysis."""
+def extract_audio_from_video(
+    video_path: Path,
+    output_wav: Path,
+    audio_stream_index: int | None = None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """Extract selected program audio as 16 kHz mono PCM16 WAV for internal STT."""
+    from .media import RenderCancelled, run_command
+
     ffmpeg = bundled_binary("ffmpeg")
     if not ffmpeg:
         return False
+    if cancel_event and cancel_event.is_set():
+        raise NarrationError("Trích xuất âm thanh STT đã bị dừng.")
 
     output_wav.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(ffmpeg),
-        "-y",
-        "-i", str(video_path),
+    cmd = [str(ffmpeg), "-y", "-i", str(video_path)]
+    if audio_stream_index is not None:
+        cmd.extend(["-map", f"0:a:{audio_stream_index}"])
+    cmd.extend([
         "-vn",
         "-ac", "1",
         "-ar", "16000",
         "-c:a", "pcm_s16le",
         str(output_wav),
-    ]
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    res = subprocess.run(cmd, capture_output=True, creationflags=flags)
-    return res.returncode == 0 and output_wav.is_file() and output_wav.stat().st_size > 44
+    ])
+    try:
+        run_command(cmd, cancel_event=cancel_event)
+    except RenderCancelled as exc:
+        output_wav.unlink(missing_ok=True)
+        raise NarrationError("Trích xuất âm thanh STT đã bị dừng.") from exc
+    except Exception:
+        output_wav.unlink(missing_ok=True)
+        return False
+    return output_wav.is_file() and output_wav.stat().st_size > 44
 
 
 def check_audio_speech_energy(wav_path: Path) -> tuple[bool, float]:
@@ -642,7 +657,7 @@ def transcribe_local_whisper(
         if cancel_event and cancel_event.is_set():
             raise NarrationError("Chuẩn bị narration đã bị dừng.")
 
-        segments_iter, info = model.transcribe(str(audio_path), beam_size=1, language="en")
+        segments_iter, info = model.transcribe(str(audio_path), beam_size=1, language=language)
         results: list[tuple[float, float, str]] = []
         for seg in segments_iter:
             if cancel_event and cancel_event.is_set():

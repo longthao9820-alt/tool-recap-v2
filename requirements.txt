@@ -4,6 +4,11 @@ piper-tts==1.8.0
 onnxruntime==1.28.0
 soundfile==0.14.0
 faster-whisper==1.2.1
+rapidocr-onnxruntime==1.4.4
+pyclipper==1.4.0
+opencv-python==5.0.0.93
+Shapely==2.1.2
+six==1.17.0
 
 # Development and Packaging Dependencies
 pytest==9.1.1

@@ -50,8 +50,9 @@ def _sanitize_error(message: str, secret: str) -> str:
 class OpenAICompatibleClient:
     """Dedicated client for OpenAI-compatible AI Gateways (e.g. Tool-REcap gateway at localhost)."""
 
-    def __init__(self, endpoint: str, api_key: str = "", timeout: int = 120) -> None:
-        self.endpoint = endpoint.strip().rstrip("/")
+    def __init__(self, endpoint: str = "", api_key: str = "", timeout: int = 120, base_url: str = "") -> None:
+        raw_endpoint = endpoint or base_url
+        self.endpoint = raw_endpoint.strip().rstrip("/")
         self.api_key = api_key.strip()
         self.timeout = timeout
 

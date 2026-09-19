@@ -31,7 +31,23 @@ class AppSettings:
     scanner_parallelism: int = 2
     api_chunk_seconds: int = 300
     gateway_enabled: bool = True
+    scanner_supports_vision: bool = False
     recap_prompt: str = ""
+
+    # Multi-episode analysis & recap settings (V1 parity)
+    recap_language: str = "en-US"
+    recap_mode: str = "MAIN_STORIES"
+    content_type: str = "US_TV_SHOW"
+    source_rights_status: str = "UNVERIFIED"
+    voice_style: str = "film_recap"
+
+    # Audio mix settings
+    original_audio_gain_db: float = 0.0
+    commentary_gain_db: float = 0.0
+    auto_duck: bool = False
+    ducking_amount_db: float = -12.0
+    target_loudness_lufs: float = -14.0
+    true_peak_dbtp: float = -1.0
 
     # Speech-to-text / Transcription settings (distinct from gateway)
     transcription_provider: str = "local"  # "local" (faster-whisper/subtitles) or "openai"
@@ -88,6 +104,12 @@ class SettingsStore:
                 # Clamp bounded numerical fields
                 settings.scanner_parallelism = max(1, min(4, int(settings.scanner_parallelism)))
                 settings.api_chunk_seconds = max(60, min(900, int(settings.api_chunk_seconds)))
+                settings.original_audio_gain_db = max(-60.0, min(24.0, float(settings.original_audio_gain_db)))
+                settings.commentary_gain_db = max(-60.0, min(24.0, float(settings.commentary_gain_db)))
+                settings.auto_duck = bool(settings.auto_duck)
+                settings.ducking_amount_db = max(-60.0, min(0.0, float(settings.ducking_amount_db)))
+                settings.target_loudness_lufs = max(-70.0, min(-5.0, float(settings.target_loudness_lufs)))
+                settings.true_peak_dbtp = max(-9.0, min(0.0, float(settings.true_peak_dbtp)))
 
                 return settings
             except Exception:

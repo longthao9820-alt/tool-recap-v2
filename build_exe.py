@@ -68,7 +68,7 @@ def create_portable_zip(app_dir: Path, zip_dest: Path) -> Path:
             parts = [p.lower() for p in file_path.parts]
             if any(p in parts for p in (".prime", ".git", ".pytest_cache", "__pycache__", "tests")):
                 continue
-            if file_path.name.lower().endswith((".pyc", ".pyo", ".tmp")):
+            if file_path.name.lower().endswith((".pyc", ".pyo", ".tmp", ".onnx", ".bin", ".pt", ".safetensors", ".model", ".tflite")):
                 continue
             rel_archive_path = file_path.relative_to(parent_dir)
             zf.write(file_path, str(rel_archive_path))
@@ -121,6 +121,12 @@ def build_portable_package() -> int:
         print(f"Lỗi: Không tìm thấy file {exe_path}")
         return 1
 
+    # Remove any model weights and test cache that might have leaked into app_dir
+    model_exts = (".onnx", ".bin", ".pt", ".safetensors", ".model", ".tflite")
+    for f in app_dir.rglob("*"):
+        if f.is_file() and f.name.lower().endswith(model_exts):
+            f.unlink()
+
     # 2. Bundle FFmpeg and FFprobe
     print("[2/6] Đóng gói FFmpeg và FFprobe vào runtime ứng dụng...")
     ffmpeg_bin, ffprobe_bin = find_system_ffmpeg()
@@ -154,53 +160,83 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.2.0)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.0)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
    - Nhấp đúp chuột vào tệp: ToolRecapV2.exe (hoặc Chay-ToolRecapV2.cmd).
-   - Ứng dụng chạy hoàn toàn độc lập (Portable), không cần cài đặt Python,
-     không cần cài đặt FFmpeg hay bất kỳ phần mềm nào khác.
+   - Ứng dụng chạy hoàn toàn độc lập (Portable), đã tích hợp sẵn runtime FFmpeg
+     và bộ thư viện cần thiết, không cần cài đặt Python hay môi trường ngoài.
 
-2. CÁC BƯỚC SỬ DỤNG:
-   - Bước 1: Nhấn "Chọn 1 file video..." hoặc "Chọn thư mục chứa video...".
-             Ứng dụng tự động lọc video (.mp4, .mkv, .mov, v.v.) và sắp xếp
-             theo đúng thứ tự tập (ep1, ep2, ep10).
-   - Bước 2: Chọn giọng đọc tiếng Anh mong muốn ở ô bên phải.
-             Có thể nhấn "Nghe thử giọng" để kiểm tra âm thanh mẫu.
-   - Bước 3: Cấu hình AI Gateway (⚙ Cài đặt):
-             Mặc định ứng dụng kết nối tới AI Gateway tại http://127.0.0.1:20128/v1.
-             + Scanner model: sub (thinking: max)
-             + Finalizer model: prime (thinking: high)
-             + Song song (parallelism): 2, Độ dài đoạn: 300s.
-             Nhấn "Test Scanner" và "Test Finalizer" trong Cài đặt để kiểm tra kết nối.
-             (Nếu muốn chạy offline hoàn toàn không cần gateway, bỏ chọn "Kích hoạt AI Gateway").
-   - Bước 4: Nhấn nút to màu xanh "▶ Bắt đầu tự động".
-             Ứng dụng sẽ tự động:
-               + Phân tích nội dung thoại thực tế (phụ đề / faster-whisper).
-               + Phân tích kịch bản 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway.
-               + Đọc lời dẫn thuyết minh chân thực bằng AI (Piper TTS).
-               + Cắt cảnh khớp thời lượng, ghép giọng và tạo phụ đề SRT.
-               + Xuất video recap hoàn chỉnh với tăng tốc phần cứng GPU.
-   - Bước 5: Nhấn "📂 Mở thư mục kết quả" để xem video đã hoàn thành.
+2. NGUỒN VIDEO (SINGLE VS SEASON & DIRECT-ONLY):
+   - Xử lý 1 tập đơn lẻ: Nhấn "📁 Select File" để chọn 1 tệp video duy nhất.
+   - Xử lý trọn bộ mùa phim: Nhấn "📂 Select Folder" để chọn thư mục mùa.
+   - Quét trực tiếp (Direct-only): Ứng dụng chỉ quét các video nằm ngay trong
+     thư mục được chọn, KHÔNG quét đệ quy thư mục con. Tự động nhận diện
+     các định dạng video (.mp4, .mkv, .mov, .avi, .webm, .m4v, .ts) và sắp xếp
+     theo thứ tự tập tự nhiên (ep1, ep2, ep10).
 
-3. DỪNG AN TOÀN (CANCELLATION):
-   - Bất kỳ lúc nào đang xử lý, bạn có thể nhấn "⏹ Dừng xử lý".
-   - Ứng dụng sẽ lập tức dừng các phân đoạn, đóng các tiến trình FFmpeg và mở khóa lại giao diện.
+3. CÁC GIAI ĐOẠN XỬ LÝ (PHASES):
+   - media_probe: Thăm dò thông số video, âm thanh bằng FFprobe.
+   - subtitles: Tìm và bóc tách phụ đề (ưu tiên tiếng Anh, hỗ trợ SRT/VTT/ASS/PGS/VobSub).
+   - scanner: Quét phân đoạn transcript qua Scanner AI để trích xuất bằng chứng.
+   - season_barrier: Đồng bộ toàn bộ các tập trong mùa trước khi kết nối.
+   - season_connecting: Phân tích liên kết cốt truyện xuyên suốt các tập mùa phim.
+   - season_mining: Khai phá và chọn lọc các ứng viên kịch bản recap toàn mùa.
+   - output_plan_ready: Chốt kế hoạch và phân đoạn xuất bản.
+   - Kết xuất (Rendering): Tạo thuyết minh (timeline), trộn âm thanh (Audio Mix),
+     tạo phụ đề SRT và mã hóa video hoàn chỉnh bằng GPU/CPU.
 
-4. NƠI LƯU TRỮ DỮ LIỆU & BỘ NHỚ ĐỆM (CACHE):
-   - Cài đặt, lịch sử và mô hình AI được lưu tại: %LOCALAPPDATA%\ToolRecapV2
-   - Kết quả phân tích AI Gateway được lưu đệm tự động tại:
-     %LOCALAPPDATA%\ToolRecapV2\cache\gateway_analysis
-     giúp các lần chạy lại không tốn API call khi nội dung và cấu hình không đổi.
-   - API key nằm dạng văn bản trong settings.json cục bộ, không mã hóa.
-     Không chia sẻ tệp này cho người khác. Không lưu API key vào cache.
+4. BẢNG CÀI ĐẶT (CHÍNH XÁC 4 TAB):
+   Nhấn "⚙ Settings" trên thanh công cụ để mở cửa sổ cấu hình gồm đúng 4 tab:
+   - Tab 1 - Recap: Ngôn ngữ kịch bản (en-US, en-GB), chế độ recap (MAIN_STORIES,
+     FULL_EPISODE), thể loại (US_TV_SHOW, DE_GERMAN_SOAP, BODYCAM, FEATURE_FILM, OTHER),
+     bản quyền tư liệu và khung nhập Recap Prompt (kèm nút Reload Default Prompt).
+   - Tab 2 - AI Gateway: Kích hoạt AI Gateway, API endpoint (mặc định
+     http://127.0.0.1:20128/v1), API key (lưu an toàn cục bộ), Scanner model
+     (sub - thinking max), checkbox rõ ràng "Scanner model supports image/Vision input",
+     Finalizer model (prime - thinking high), số luồng song song (1-4) và độ dài đoạn (60-900s).
+   - Tab 3 - Voice: Lựa chọn 12 giọng thiết kế chuẩn (Neighbor, Companion...), phong cách
+     giọng đọc, nút "🔊 Nghe thử giọng", nút "🎙 Cập nhật VoiceStudio", và khu vực
+     Audio Mix chuyên nghiệp (âm lượng gốc dB, âm lượng thuyết minh dB, Auto-ducking,
+     Target loudness -14 LUFS, True peak -1 dBTP).
+   - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU
+     (NVENC/AMF/QSV), nhúng phụ đề (Burn subtitles), thư mục xuất và kiểm tra subsystem.
+   * Chú ý: Không có tab STT riêng biệt; STT hoạt động ngầm (internal) hoàn toàn tự động.
 
-5. NẾU CÓ LỖI XẢY RA:
-   - Kiểm tra file log tại: %LOCALAPPDATA%\ToolRecapV2\logs
-   - Nếu gateway chưa bật hoặc cổng 20128 chưa mở, ứng dụng sẽ báo lỗi rõ ràng.
-     Vào Cài đặt để kiểm tra kết nối bằng nút Test hoặc tắt gateway nếu chạy offline.
-   - Đảm bảo ổ đĩa còn đủ dung lượng trống để chứa video đầu ra.
+5. PHỤ ĐỀ PGS / VOBSUB / RAPIDOCR / AI VISION & INTERNAL STT:
+   - Ưu tiên chọn luồng âm thanh và phụ đề tiếng Anh trong video hoặc sidecar ngoài.
+   - Phụ đề đồ họa Blu-ray (PGS) và DVD (VobSub) được nhận dạng chữ tự động qua RapidOCR ONNX.
+   - Chỉ khi bật checkbox "Scanner model supports image/Vision input" trong Cài đặt,
+     hệ thống mới gửi hình ảnh khó đọc lên AI Vision Gateway để giải mã.
+   - Nếu không có phụ đề hoặc nhận dạng lỗi, hệ thống tự động fallback sang STT nội bộ
+     (faster-whisper CPU) hoặc OpenAI Whisper API.
+
+6. 12 GIỌNG THIẾT KẾ & TẢI MÔ HÌNH LẦN ĐẦU:
+   - Danh mục 12 giọng đọc tiếng Anh chính thức từ VoiceStudio/OmniVoice (6 en-US, 6 en-GB).
+   - Lần đầu sử dụng cần kết nối Internet để tải môi trường runtime Python độc lập và
+     mô hình OmniVoice dung lượng lớn (~vài GB) vào bộ nhớ đệm %LOCALAPPDATA%\ToolRecapV2.
+   - Sau khi tải, hệ thống hoạt động hoàn toàn offline. Luôn có Piper TTS nội bộ sẵn sàng.
+
+7. ĐẦU RA CHÍNH XÁC 3 TỆP (OUTPUTS EXACT THREE):
+   Mỗi phân đoạn video recap được xuất vào thư mục riêng với ĐÚNG 3 tệp thành phẩm:
+   1. {safe_title}.mp4: Video recap hoàn chỉnh chất lượng cao.
+   2. {safe_title}.original.srt: Phụ đề các đoạn thoại gốc giữ lại trong video.
+   3. {safe_title}.narration.srt: Phụ đề lời dẫn thuyết minh AI chuẩn xác.
+   Tuyệt đối sạch sẽ, không có tệp tạm hay tệp rác.
+
+8. DỪNG AN TOÀN (STOP / CANCELLATION):
+   - Nhấn "⏹ Stop" bất kỳ lúc nào để dừng xử lý ngay lập tức.
+   - Hệ thống đóng sạch cây tiến trình con FFmpeg, mở khóa lại giao diện và đánh dấu CANCELLED.
+
+9. CẬP NHẬT & DỮ LIỆU:
+   - Tự động kiểm tra GitHub Releases chính thức từ longthao9820-alt/tool-recap-v2 kèm SHA256.
+   - Dữ liệu lưu ngoài thư mục ứng dụng tại %LOCALAPPDATA%\ToolRecapV2.
+
+10. GIỚI HẠN:
+    - Cần Internet khi tải mô hình/runtime lớn lần đầu.
+    - Cần card đồ họa tương thích để tăng tốc GPU (nếu không có sẽ dùng CPU libx264).
+    - Chất lượng kịch bản phụ thuộc vào nội dung thoại thực tế của video.
 ========================================================================
 """
     (app_dir / "HUONG_DAN_SU_DUNG.txt").write_text(guide_content, encoding="utf-8")

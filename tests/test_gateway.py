@@ -515,6 +515,7 @@ def test_unreachable_gateway_causes_episode_error_and_ui_restored(tmp_path: Path
         raise APIError("<urlopen error [Errno 111] Connection refused>")
 
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_unreachable)
+    monkeypatch.setattr("toolrecap_v2.projects.transcribe_local_whisper", lambda *a, **kw: [(0.0, 1.0, "dummy dialog")])
 
     out_dir = tmp_path / "out_queue"
     settings = AppSettings(
@@ -541,7 +542,7 @@ def test_unreachable_gateway_causes_episode_error_and_ui_restored(tmp_path: Path
 
     queue.start()
     assert queue._thread is not None
-    queue._thread.join(timeout=10)
+    queue._thread.join(timeout=25)
 
     # Record must be marked ERROR
     assert record.status == "ERROR"
@@ -624,7 +625,49 @@ def test_sequential_batch_unaffected(tmp_path: Path, dummy_video: Path, monkeypa
     settings = AppSettings(gateway_enabled=True)
     queue = ProjectQueue(records, store=store, settings=settings)
 
+    def mock_chat_json(self, *, model, **kwargs):
+        if model == "sub":
+            return {"range_start_ms": 0, "range_end_ms": 2000, "events": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}]}
+        return {
+            "outputs": [
+                {
+                    "output_id": "out_01",
+                    "title": "Batch Output",
+                    "segments": [
+                        {
+                            "segment_id": "s1",
+                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.0}],
+                            "narration": "Narration text",
+                            "audio_policy": "duck",
+                        }
+                    ],
+                }
+            ]
+        }
+    monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_json)
+
+    from toolrecap_v2.renderer import PublicationRenderer
+    from toolrecap_v2.domain.models import CommentaryOutput
+
+    monkeypatch.setattr(
+        PublicationRenderer,
+        "render_manifest",
+        lambda self, manifest, *a, **kw: [
+            CommentaryOutput(
+                output_id=o.output_id,
+                title=o.title,
+                publication_video_path=str(out_dir / f"{o.output_id}.mp4"),
+                publication_original_srt_path=str(out_dir / f"{o.output_id}.original.srt"),
+                publication_narration_srt_path=str(out_dir / f"{o.output_id}.narration.srt"),
+                status="COMPLETED",
+            )
+            for o in manifest.outputs
+        ],
+    )
+
     # Fast-mock synthesize and render steps to test queue logic cleanly
+    monkeypatch.setattr("toolrecap_v2.projects.extract_audio_from_video", lambda *a, **kw: True)
+    monkeypatch.setattr("toolrecap_v2.projects.transcribe_local_whisper", lambda *a, **kw: [(0.0, 1.0, "dummy dialog")])
     monkeypatch.setattr("toolrecap_v2.projects.cut_clip", lambda *args, **kwargs: None)
     monkeypatch.setattr("toolrecap_v2.projects.run_command", lambda *args, **kwargs: None)
     monkeypatch.setattr("toolrecap_v2.projects.render_final_video", lambda *args, **kwargs: None)

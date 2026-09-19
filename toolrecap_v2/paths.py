@@ -63,6 +63,36 @@ def get_asset_path(filename: str) -> Path | None:
     return None
 
 
+# Robust lifecycle handling for Tk Image and Variable deletion
+_orig_image_del = tk.Image.__del__
+
+
+def _robust_image_del(self: tk.Image) -> None:
+    if not getattr(self, "name", None):
+        return
+    try:
+        _orig_image_del(self)
+    except (tk.TclError, RuntimeError):
+        pass
+
+
+if tk.Image.__del__ is not _robust_image_del:
+    tk.Image.__del__ = _robust_image_del
+
+_orig_var_del = tk.Variable.__del__
+
+
+def _robust_var_del(self: tk.Variable) -> None:
+    try:
+        _orig_var_del(self)
+    except (tk.TclError, RuntimeError):
+        pass
+
+
+if tk.Variable.__del__ is not _robust_var_del:
+    tk.Variable.__del__ = _robust_var_del
+
+
 def set_window_icon(window: tk.Tk | tk.Toplevel) -> None:
     """Set window icon and configure Windows Taskbar AppUserModelID."""
     if sys.platform == "win32":
@@ -85,8 +115,25 @@ def set_window_icon(window: tk.Tk | tk.Toplevel) -> None:
     png_path = get_asset_path("icon-256.png") or get_asset_path("icon.png")
     if png_path and png_path.is_file():
         try:
-            img = tk.PhotoImage(file=str(png_path))
+            img = tk.PhotoImage(master=window, file=str(png_path))
             window.iconphoto(True, img)
             window._icon_photo_ref = img  # type: ignore[attr-defined]
+
+            def _cleanup_icon(event: object = None) -> None:
+                if getattr(event, "widget", None) is window or event is None:
+                    ref = getattr(window, "_icon_photo_ref", None)
+                    if ref is not None:
+                        try:
+                            if ref.name and getattr(window, "tk", None) is not None:
+                                window.tk.call("image", "delete", ref.name)
+                        except Exception:
+                            pass
+                        ref.name = None
+                        try:
+                            delattr(window, "_icon_photo_ref")
+                        except AttributeError:
+                            pass
+
+            window.bind("<Destroy>", _cleanup_icon, add="+")
         except Exception:
             pass

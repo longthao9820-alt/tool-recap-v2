@@ -85,15 +85,24 @@ class NotificationBanner(ttk.Frame):
     def dismiss(self) -> None:
         """Hide notification via grid_remove and invoke dismiss callback."""
         if self._auto_dismiss_job:
-            self.after_cancel(self._auto_dismiss_job)
+            try:
+                self.after_cancel(self._auto_dismiss_job)
+            except Exception:
+                pass
             self._auto_dismiss_job = None
 
         if self._visible:
-            self.grid_remove()
+            try:
+                self.grid_remove()
+            except Exception:
+                pass
             self._visible = False
 
         if self.on_dismiss:
-            self.on_dismiss()
+            try:
+                self.on_dismiss()
+            except Exception:
+                pass
 
 
 class DesktopNotification(tk.Toplevel):
