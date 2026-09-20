@@ -40,9 +40,25 @@ RECOVERABLE_HTTP_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 FATAL_HTTP_STATUSES: frozenset[int] = frozenset({401, 403, 404})
 VARIANT_FALLBACK_HTTP_STATUSES: frozenset[int] = frozenset({400, 422})
 
+# Process-wide request control shared by every client/project. Scanner-level
+# parallelism can use these slots, while independent projects cannot create an
+# unbounded request storm. ProjectQueue is sequential; this guard also protects
+# library callers that create multiple queues or clients.
+GLOBAL_GATEWAY_CONCURRENCY: int = 4
+_GLOBAL_GATEWAY_SLOTS = threading.BoundedSemaphore(GLOBAL_GATEWAY_CONCURRENCY)
+
 
 class APIError(RuntimeError):
     """Raised when an AI Gateway request fails or returns an invalid payload."""
+
+
+def _acquire_global_gateway_slot(cancel_event: Any = None) -> None:
+    """Acquire a process-wide Gateway slot with cancellation-aware waiting."""
+    while True:
+        if _is_cancelled(cancel_event):
+            raise APIError("Yêu cầu API đã bị dừng khi chờ bộ lập lịch Gateway.")
+        if _GLOBAL_GATEWAY_SLOTS.acquire(timeout=0.1):
+            return
     pass
 
 
@@ -466,8 +482,12 @@ class OpenAICompatibleClient:
 
                 t0 = time.monotonic()
                 try:
-                    with request.urlopen(api_request, timeout=resolved_timeout) as response:
-                        raw_text = response.read().decode("utf-8", "replace")
+                    _acquire_global_gateway_slot(cancel_event)
+                    try:
+                        with request.urlopen(api_request, timeout=resolved_timeout) as response:
+                            raw_text = response.read().decode("utf-8", "replace")
+                    finally:
+                        _GLOBAL_GATEWAY_SLOTS.release()
                     elapsed = time.monotonic() - t0
                     if log:
                         log(

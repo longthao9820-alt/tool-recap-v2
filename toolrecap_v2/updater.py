@@ -317,6 +317,7 @@ def generate_apply_script(
     staged = Path(staged_payload_dir).resolve()
     target = Path(target_app_dir).resolve()
     script_path = default_data_directory() / "apply_update.cmd"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
     backup_dir = default_data_directory() / "backups" / "previous_version"
 
     content = f"""@echo off
@@ -341,6 +342,10 @@ echo [ToolRecap V2] Tạo bản sao lưu phiên bản hiện tại...
 if exist "%BACKUP%" rmdir /s /q "%BACKUP%"
 mkdir "%BACKUP%" 2>nul
 xcopy "%TARGET%\\*" "%BACKUP%\\" /e /i /h /y >nul
+if errorlevel 1 goto backup_failed
+if not exist "%BACKUP%\\%EXE_NAME%" goto backup_failed
+
+echo [ToolRecap V2] Xác minh bản sao lưu thành công.
 
 echo [ToolRecap V2] Làm sạch thư mục ứng dụng (loại bỏ tệp cũ thừa)...
 for /d %%p in ("%TARGET%\\*") do rmdir /s /q "%%p" 2>nul
@@ -348,13 +353,10 @@ for %%f in ("%TARGET%\\*") do del /f /q "%%f" 2>nul
 
 echo [ToolRecap V2] Áp dụng dữ liệu phiên bản mới...
 xcopy "%STAGED%\\*" "%TARGET%\\" /e /i /h /y >nul
-if errorlevel 1 (
-    echo [ToolRecap V2] Lỗi sao chép! Đang hoàn tác (rollback) lại phiên bản cũ...
-    xcopy "%BACKUP%\\*" "%TARGET%\\" /e /i /h /y >nul
-    echo Hoàn tác hoàn tất.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto apply_failed
+if not exist "%TARGET%\\%EXE_NAME%" goto apply_failed
+
+echo [ToolRecap V2] Xác minh bản cài đặt mới thành công.
 
 echo [ToolRecap V2] Dọn dẹp tệp tải về tạm thời...
 rmdir /s /q "%STAGED%" 2>nul
@@ -362,6 +364,27 @@ rmdir /s /q "%STAGED%" 2>nul
 echo [ToolRecap V2] Khởi động lại ToolRecap V2...
 start "" "%TARGET%\\%EXE_NAME%"
 exit 0
+
+:backup_failed
+echo [ToolRecap V2] Sao lưu không thành công. Bản cài đặt hiện tại chưa bị thay đổi.
+pause
+exit /b 2
+
+:apply_failed
+echo [ToolRecap V2] Áp dụng thất bại. Đang hoàn tác về bản sao lưu đã xác minh...
+for /d %%p in ("%TARGET%\\*") do rmdir /s /q "%%p" 2>nul
+for %%f in ("%TARGET%\\*") do del /f /q "%%f" 2>nul
+xcopy "%BACKUP%\\*" "%TARGET%\\" /e /i /h /y >nul
+if errorlevel 1 goto rollback_failed
+if not exist "%TARGET%\\%EXE_NAME%" goto rollback_failed
+echo [ToolRecap V2] Hoàn tác thành công. Khởi động lại phiên bản trước...
+start "" "%TARGET%\\%EXE_NAME%"
+exit /b 1
+
+:rollback_failed
+echo [ToolRecap V2] LỖI NGHIÊM TRỌNG: Không thể hoàn tác tự động. Bản sao lưu vẫn ở "%BACKUP%".
+pause
+exit /b 3
 """
     script_path.write_text(content, encoding="utf-8")
     return script_path

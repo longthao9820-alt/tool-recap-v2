@@ -33,6 +33,7 @@ class AppSettings:
     gateway_enabled: bool = True
     scanner_supports_vision: bool = False
     recap_prompt: str = ""
+    final_json_repair_attempts: int = 2
 
     # Multi-episode analysis & recap settings (V1 parity)
     recap_language: str = "en-US"
@@ -104,6 +105,7 @@ class SettingsStore:
                 # Clamp bounded numerical fields
                 settings.scanner_parallelism = max(1, min(4, int(settings.scanner_parallelism)))
                 settings.api_chunk_seconds = max(60, min(900, int(settings.api_chunk_seconds)))
+                settings.final_json_repair_attempts = max(0, min(3, int(settings.final_json_repair_attempts)))
                 settings.original_audio_gain_db = max(-60.0, min(24.0, float(settings.original_audio_gain_db)))
                 settings.commentary_gain_db = max(-60.0, min(24.0, float(settings.commentary_gain_db)))
                 settings.auto_duck = bool(settings.auto_duck)

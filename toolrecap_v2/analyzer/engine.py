@@ -1,4 +1,4 @@
-"""Canonical Analysis Engine orchestrating episode evidence, season connection, and final candidate plans."""
+"""Canonical Source -> Scanner -> Finalizer -> Final JSON analysis engine."""
 from __future__ import annotations
 
 import hashlib
@@ -32,6 +32,7 @@ from .connection import HIERARCHY_ALGO_VERSION, SeasonConnectionResult, SeasonCo
 from .errors import AnalysisCancelledError, AnalysisError, CoverageIncompleteError
 from .evidence import EvidenceScanner
 from .finalizer import CandidateFinalizer
+from .final_json import CanonicalProjectFinalizer
 from .phases import AnalysisPhase, PhaseCallback
 
 
@@ -52,10 +53,11 @@ def compute_final_plan_cache_key(
     policy_hash: str | None = None,
     output_directive_hash: str | None = None,
 ) -> str:
-    """Compute deterministic cache key for final CommentaryOutput plans.
+    """Compute the Final JSON cache key from its actual upstream dependencies.
 
-    Keyed by hashes of all episode evidence payloads + finalizer config + connection identity + policy/output directive hashes.
-    Excludes all API credentials or secrets.
+    Source/Scanner evidence, Finalizer role configuration, the raw Recap Prompt, and
+    renderer contract metadata invalidate this layer. Voice and render settings do not.
+    Legacy parameters remain accepted so existing callers and cache migrations are safe.
     """
     sorted_items = sorted(evidence_map.items(), key=lambda x: x[0])
     ev_hashes: list[str] = []
@@ -84,13 +86,13 @@ def compute_final_plan_cache_key(
         eff_output_hash = pol.output_directive.directive_hash or pol.output_directive.compute_hash()
 
     payload = {
-        "analysis_plan_version": "v5",
-        "hierarchy_algo_version": HIERARCHY_ALGO_VERSION,
-        "discovery_algo_version": DISCOVERY_ALGO_VERSION,
-        "consolidation_algo_version": CONSOLIDATION_ALGO_VERSION,
-        "verifier_algo_version": VERIFIER_ALGO_VERSION,
+        "analysis_plan_version": "final-json-v1",
         "scope": scope,
         "evidence_hashes": ev_hashes,
+        "scanner_model": settings.scanner_model,
+        "scanner_thinking": settings.scanner_thinking,
+        "scanner_vision": bool(settings.scanner_supports_vision),
+        "scanner_chunk_seconds": int(settings.api_chunk_seconds),
         "finalizer_model": settings.finalizer_model,
         "finalizer_thinking": settings.finalizer_thinking,
         "recap_prompt": effective_prompt,
@@ -98,10 +100,11 @@ def compute_final_plan_cache_key(
         "recap_mode": mode or getattr(settings, "recap_mode", "MAIN_STORIES"),
         "content_type": content_type or getattr(settings, "content_type", "US_TV_SHOW"),
         "rights": rights or getattr(settings, "source_rights_status", "UNVERIFIED"),
-        "legacy_wrapper": legacy_wrapper,
-        "connection_key": connection_key or "",
-        "policy_hash": str(eff_policy_hash),
-        "output_directive_hash": str(eff_output_hash),
+        "final_json_schema": "1.0",
+        # Compatibility for callers that explicitly pass a pre-parsed policy;
+        # the canonical UI path keys directly on the raw Recap Prompt above.
+        "explicit_policy_hash": str(eff_policy_hash) if policy is not None or policy_hash else "",
+        "explicit_output_directive_hash": str(eff_output_hash) if policy is not None or output_directive_hash else "",
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -142,8 +145,14 @@ class AnalysisEngine:
             client=self.client,
             cache_manager=self.cache_manager,
             subtitle_pipeline=self.subtitle_pipeline,
-            policy=self.policy,
+            # Scanner performs broad source observation only. The raw Recap Prompt
+            # belongs to the Finalizer and must not become an application-side
+            # editorial filter at this stage.
+            policy=EditorialPolicy.from_prompt(""),
         )
+        # Retain the caller-supplied policy as diagnostic metadata without applying
+        # its editorial directives to Scanner requests.
+        self.scanner.policy = self.policy
         self.connector = SeasonConnector(
             settings=self.settings,
             client=self.client,
@@ -164,6 +173,9 @@ class AnalysisEngine:
             client=self.client,
             hierarchy_cache=self.hierarchy_cache,
             policy=self.policy,
+        )
+        self.project_finalizer = (
+            CanonicalProjectFinalizer(self.settings, self.client) if self.client is not None else None
         )
 
     def analyze(
@@ -198,7 +210,6 @@ class AnalysisEngine:
         if policy is not None and policy is not self.policy:
             self.policy = policy
             self.scanner.policy = policy
-            self.scanner.directive = policy.scanner_directive
             self.connector.policy = policy
             self.connector.connection_directive = policy.connection_directive
             self.discoverer.policy = policy
@@ -242,8 +253,6 @@ class AnalysisEngine:
         plan_cache_key = ""
         if use_final_plan_cache and evidence_map:
             conn_key = None
-            if scope_str in (AnalysisScope.SEASON.value, AnalysisScope.SINGLE_EPISODE.value):
-                conn_key = self.connector.compute_connection_key(episodes, evidence_map)
             plan_cache_key = compute_final_plan_cache_key(
                 evidence_map,
                 self.settings,
@@ -265,7 +274,9 @@ class AnalysisEngine:
                     on_phase(AnalysisPhase.OUTPUT_PLAN_READY, project_id, {"cached": True, "count": len(cached_manifest.outputs)})
                 return cached_manifest
 
-        # 3. Editorial pipeline: topology -> discovery -> consolidation -> verification -> finalizer.
+        # 3. Canonical editorial boundary: Scanner observations -> configured Finalizer
+        # -> one technically validated Final JSON. Legacy editorial helpers remain
+        # import-compatible but are intentionally absent from this production path.
         if scope_str not in (AnalysisScope.SINGLE_EPISODE.value, AnalysisScope.SEASON.value):
             raise AnalysisError(f"Phạm vi phân tích không được hỗ trợ: {scope_str}")
         if on_phase and scope_str == AnalysisScope.SEASON.value:
@@ -341,108 +352,22 @@ class AnalysisEngine:
                 on_phase(AnalysisPhase.OUTPUT_PLAN_READY, project_id, {"output_count": len(outputs)})
             return manifest
 
-        connection_result = self.connector.connect_season(
+        if self.project_finalizer is None:
+            raise AnalysisError("AI Gateway Finalizer client is not configured.")
+        manifest = self.project_finalizer.finalize(
+            project_id=project_id,
             episodes=episodes,
             evidence_map=evidence_map,
-            allow_incomplete=allow_incomplete,
+            scope=scope_str,
             cancel_event=cancel_event,
             on_phase=on_phase,
             log=log,
+            # ProjectQueue verifies files before analysis. Direct unit/API callers may
+            # provide synthetic source identities, so require disk existence whenever
+            # this is a real prepared project rather than a synthetic contract test.
+            require_source_files=all(Path(ep.source_video).is_file() for ep in episodes),
         )
-        topology = SeasonConnectionResult(
-            cross_episode_links=list(connection_result.cross_episode_links),
-            candidate_proposals=[],
-            supporting_character_arcs=list(connection_result.supporting_character_arcs),
-            rejected_or_merged=list(connection_result.rejected_or_merged),
-            is_complete=connection_result.is_complete,
-            missing_episodes=list(connection_result.missing_episodes),
-        )
-        summaries = [
-            build_compact_summary(ep, evidence_map[ep.episode_id], coverage_ledger=evidence_map[ep.episode_id].coverage)
-            for ep in episodes if ep.episode_id in evidence_map
-        ]
-        coverage_ledgers = {ep_id: ev.coverage for ep_id, ev in evidence_map.items()}
-        if scope_str == AnalysisScope.SINGLE_EPISODE.value:
-            discovered = self.discoverer.discover_single(
-                summaries[0], topology, coverage_ledgers, episode=episodes[0],
-                phase_callback=on_phase, cancellation_token=cancel_event,
-            )
-        else:
-            discovered = self.discoverer.discover_season(
-                summaries, topology, coverage_ledgers, episodes=episodes,
-                phase_callback=on_phase, cancellation_token=cancel_event,
-            )
-        consolidated = self.consolidator.consolidate(
-            discovered, phase_callback=on_phase, cancellation_token=cancel_event
-        )
-        health = PipelineHealth(
-            coverage_ledgers=coverage_ledgers,
-            discovery_completed=True,
-            discovered_count=len(discovered),
-            consolidation_completed=True,
-            consolidation_decisions=consolidated.decisions,
-            consolidated_candidates=consolidated.candidates,
-            total_evidence_count=sum(
-                len(items) for ev in evidence_map.values() for items in ev.data.values() if isinstance(items, list)
-            ),
-        )
-        verification = self.verifier.verify(
-            scope_id=project_id,
-            health=health,
-            candidates=consolidated.candidates,
-            allowed_episode_ids={ep.episode_id for ep in episodes},
-            existing_evidence_refs={
-                str(item.get("evidence_ref", item.get("id", "")))
-                for ev in evidence_map.values() for items in ev.data.values() if isinstance(items, list)
-                for item in items if isinstance(item, dict) and item.get("evidence_ref", item.get("id"))
-            },
-            episode_durations={ep.episode_id: ep.duration_seconds for ep in episodes},
-            cancellation_token=cancel_event,
-            phase_callback=on_phase,
-        )
-        if verification.recovered_candidates:
-            consolidated = self.consolidator.consolidate(
-                list(consolidated.candidates) + list(verification.recovered_candidates),
-                phase_callback=on_phase, cancellation_token=cancel_event,
-            )
-        candidates = list(consolidated.candidates)
-        if not candidates:
-            if not (verification.completed and verification.is_valid_zero):
-                reason = verification.reason.value if hasattr(verification.reason, "value") else str(verification.reason)
-                raise AnalysisError(f"Không thể xác nhận kết quả 0 output: {reason}")
-            outputs: list[CommentaryOutput] = []
-            finalization = None
-        else:
-            finalization = self.finalizer.finalize_candidates(
-                candidates, episodes, scope_str, topology=topology,
-                cancel_event=cancel_event, on_phase=on_phase, log=log,
-                legacy_wrapper=legacy_wrapper,
-            )
-            outputs = list(finalization.outputs)
-            if not outputs:
-                raise AnalysisError(
-                    "Finalizer không tạo được output hợp lệ từ các ứng viên đã xác minh; "
-                    "các ứng viên bị loại ở bước validation."
-                )
-
-        # 4. Construct & Validate AnalysisManifest
-        manifest = AnalysisManifest(
-            project_id=project_id,
-            analysis_scope=scope_str,
-            source_episodes=episodes,
-            outputs=outputs,
-            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            recap_language=self.settings.recap_language,
-            recap_mode=self.settings.recap_mode,
-            content_type=self.settings.content_type,
-            source_rights_status=self.settings.source_rights_status,
-            zero_output_reason=(
-                verification.reason.value if not outputs and hasattr(verification.reason, "value")
-                else (str(verification.reason) if not outputs else None)
-            ),
-            zero_output_status=("VERIFIED_GENUINE_ZERO" if not outputs else None),
-            verification=verification.to_dict(),
-        )
+        manifest.created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         manifest.validate()
 
         # 5. Save Plan Cache
@@ -474,6 +399,12 @@ class AnalysisEngine:
             return None
         try:
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or "outputs" not in raw or not isinstance(raw.get("outputs"), list):
+                return None
+            if not raw["outputs"] and raw.get("zero_output_status") != "VALID_EMPTY_OUTPUT":
+                # Never let a legacy parser failure or incomplete cache masquerade
+                # as an explicit editorial zero-output result.
+                return None
             raw["project_id"] = project_id
             return AnalysisManifest.from_dict(raw, validate=True)
         except Exception:

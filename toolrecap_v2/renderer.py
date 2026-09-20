@@ -86,6 +86,7 @@ class PublicationRenderer:
         cancel_event: threading.Event | None = None,
         voice_style: str | None = None,
         allow_mock_synth: bool = False,
+        resume_completed: bool = False,
     ) -> list[CommentaryOutput]:
         """Loop through all outputs sequentially and produce clean publication folders.
 
@@ -119,6 +120,42 @@ class PublicationRenderer:
             out.sanitized_title = safe_title
             pub_dir = out_root / safe_title
             pub_dir.mkdir(parents=True, exist_ok=True)
+
+            # Resume is strictly render-layer state. A previously completed output
+            # is reused only when the caller confirmed the render dependency
+            # signature and the exact publication folder still validates.
+            if resume_completed and out.status == OutputStatus.COMPLETED.value:
+                try:
+                    has_commentary = any(
+                        seg.audio_policy != AudioPolicy.ORIGINAL_ONLY.value
+                        and bool(seg.narration.strip())
+                        for seg in out.segments
+                    )
+                    validated = validate_publication_folder(
+                        pub_dir=pub_dir,
+                        safe_title=safe_title,
+                        check_original_srt=True,
+                        check_narration_srt=has_commentary,
+                        require_audio=True,
+                    )
+                    out.publication_video_path = validated["video_path"]
+                    out.publication_original_srt_path = validated["original_srt_path"]
+                    out.publication_narration_srt_path = validated["narration_srt_path"]
+                    out.progress = 100
+                    rendered_outputs.append(out)
+                    _dispatch_callback(
+                        callbacks,
+                        out_idx,
+                        total_outputs,
+                        out,
+                        100,
+                        "Đã xác minh output hoàn tất; tiếp tục từ điểm render kế tiếp.",
+                    )
+                    continue
+                except Exception:
+                    out.status = OutputStatus.WAITING.value
+                    out.progress = 0
+                    out.error = None
 
             # Temp folder outside publication directory
             temp_dir = out_root / ".temp_render" / f"{safe_title}_{uuid.uuid4().hex[:8]}"

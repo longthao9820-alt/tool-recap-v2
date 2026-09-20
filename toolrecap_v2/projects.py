@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -17,7 +18,7 @@ from .analyzer.engine import AnalysisEngine
 from .analyzer.errors import AnalysisCancelledError
 from .analyzer.phases import AnalysisPhase
 from .api_client import OpenAICompatibleClient
-from .domain import CommentaryOutput, MediaSelection, SourceEpisode
+from .domain import AnalysisManifest, CommentaryOutput, MediaSelection, SourceEpisode
 from .domain.cache import EvidenceCacheManager
 from .gpu import video_encode_args
 from .media import (
@@ -43,6 +44,7 @@ from .paths import default_data_directory
 from .renderer import PublicationRenderer
 from .settings import AppSettings
 from .subtitles.cache import SubtitleCacheManager
+from .subtitles.discovery import discover_sidecars
 from .subtitles.models import SubtitleCue
 from .subtitles.pipeline import SubtitlePipeline
 from .voice.catalog import DEFAULT_VOICE_ID
@@ -83,6 +85,8 @@ class ProjectRecord:
     zero_output_reason: str | None = None
     zero_output_status: str | None = None
     verification: dict[str, Any] | None = None
+    analysis_signature: str = ""
+    render_signature: str = ""
 
     def __post_init__(self) -> None:
         if self.verification is not None and hasattr(self.verification, "to_dict"):
@@ -229,6 +233,7 @@ class ProjectRecord:
 
 
 ZERO_OUTPUT_MESSAGES: dict[str, str] = {
+    "VALID_EMPTY_OUTPUT": "Finalizer đã trả về một Final JSON hợp lệ với 0 output.",
     "NO_ELIGIBLE_CANDIDATES": "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs).",
     "INSUFFICIENT_EVIDENCE": "Hoàn thành phân tích: Không đủ dữ liệu bằng chứng để tạo recap.",
     "CANDIDATE_DISCOVERY_FAILED": "Hoàn thành phân tích: Khám phá ứng viên không thành công.",
@@ -239,6 +244,83 @@ ZERO_OUTPUT_MESSAGES: dict[str, str] = {
     "COVERAGE_INCOMPLETE": "Hoàn thành phân tích: Phạm vi bằng chứng chưa đầy đủ.",
     "LOW_COVERAGE_SUSPECT": "Hoàn thành phân tích: Độ bao phủ thấp đáng ngờ.",
 }
+
+
+def compute_project_analysis_signature(record: ProjectRecord, settings: AppSettings) -> str:
+    """Hash only dependencies that can change Scanner evidence or Final JSON."""
+    sources: list[dict[str, Any]] = []
+    for ep in record.source_episodes:
+        path = Path(ep.source_video)
+        try:
+            stat = path.stat()
+            identity = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        except OSError:
+            identity = {"size": None, "mtime_ns": None}
+        sidecars: list[dict[str, Any]] = []
+        if path.is_file():
+            for track in discover_sidecars(path, ep.episode_id):
+                if not track.source_file:
+                    continue
+                sidecar_path = Path(track.source_file)
+                related = [sidecar_path]
+                if sidecar_path.suffix.casefold() == ".idx":
+                    related.append(sidecar_path.with_suffix(".sub"))
+                for related_path in related:
+                    try:
+                        sidecar_stat = related_path.stat()
+                        sidecars.append(
+                            {
+                                "path": str(related_path.resolve()),
+                                "size": sidecar_stat.st_size,
+                                "mtime_ns": sidecar_stat.st_mtime_ns,
+                            }
+                        )
+                    except OSError:
+                        sidecars.append({"path": str(related_path.resolve()), "size": None, "mtime_ns": None})
+        sources.append({"episode_id": ep.episode_id, "path": str(path.resolve()), **identity, "sidecars": sidecars})
+    payload = {
+        "version": "final-json-v1",
+        "scope": record.analysis_scope,
+        "sources": sources,
+        "scanner": {
+            "model": settings.scanner_model,
+            "thinking": settings.scanner_thinking,
+            "vision": settings.scanner_supports_vision,
+            "chunk_seconds": settings.api_chunk_seconds,
+        },
+        "finalizer": {"model": settings.finalizer_model, "thinking": settings.finalizer_thinking},
+        "recap_prompt": settings.recap_prompt,
+        "recap_language": settings.recap_language,
+        "recap_mode": settings.recap_mode,
+        "content_type": settings.content_type,
+        "source_rights_status": settings.source_rights_status,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def compute_project_render_signature(
+    analysis_signature: str,
+    record: ProjectRecord,
+    settings: AppSettings,
+) -> str:
+    """Hash render-only dependencies; changing these never invalidates AI work."""
+    payload = {
+        "version": "render-v1",
+        "analysis_signature": analysis_signature,
+        "voice_id": record.voice_id,
+        "voice_style": settings.voice_style,
+        "quality": settings.quality,
+        "use_gpu": settings.use_gpu,
+        "generate_srt": settings.generate_srt,
+        "burn_subtitles": settings.burn_subtitles,
+        "original_audio_gain_db": settings.original_audio_gain_db,
+        "commentary_gain_db": settings.commentary_gain_db,
+        "auto_duck": settings.auto_duck,
+        "ducking_amount_db": settings.ducking_amount_db,
+        "target_loudness_lufs": settings.target_loudness_lufs,
+        "true_peak_dbtp": settings.true_peak_dbtp,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _phase_update(
@@ -320,6 +402,28 @@ def _phase_update(
         if not is_retry and st not in {"coverage_check", "second_pass"}:
             record.current_message = f"Phân tích [scanner]: {target_id} ({completed_eps}/{num_eps})"
 
+    # Canonical Finalizer and technical Final JSON boundary (55-85).
+    elif phase in {AnalysisPhase.FINALIZER, "finalizer"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Finalizer"
+        _update_prog(70)
+        if not is_retry:
+            record.current_message = "Finalizer đang tạo Final JSON..."
+    elif phase in {AnalysisPhase.JSON_VALIDATION, "json_validation"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Technical JSON Validation"
+        _update_prog(80)
+        if not is_retry:
+            record.current_message = "Đang kiểm tra kỹ thuật Final JSON..."
+    elif phase in {AnalysisPhase.JSON_REPAIR, "json_repair"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Final JSON Repair"
+        _update_prog(80)
+        attempt = int(data.get("attempt") or 1)
+        if not is_retry:
+            record.current_message = f"Finalizer đang sửa lỗi kỹ thuật JSON (lần {attempt})..."
+
+    # Legacy-only stage mappings retained for persisted projects and diagnostics.
     # 4b. EPISODE_SUMMARIZING / BATCH_SUMMARIZING (55-60)
     elif phase_val in {"episode_summarizing", "batch_summarizing"} or phase in {
         AnalysisPhase.EPISODE_SUMMARIZING,
@@ -394,7 +498,7 @@ def _phase_update(
             record.current_message = "Xác minh kết quả 0 output"
 
     # 4h. SEASON_MINING / finalizer (80-85)
-    elif phase in {AnalysisPhase.SEASON_MINING, "season_mining", "finalizer"}:
+    elif phase in {AnalysisPhase.SEASON_MINING, "season_mining"}:
         record.season_status = "RUNNING"
         record.season_stage = "Season Mining"
         idx = int(data.get("index") or data.get("group_index") or 1)
@@ -833,9 +937,32 @@ class ProjectQueue:
             _update_progress(10 + int(((idx + 1) / num_eps) * 10))
             self._notify_update(record)
 
-        # 4. AnalysisEngine execution (evidence 20-60, season 60-75, finalizer 75-85)
+        # 4. Analysis execution. A valid persisted Final JSON is reused when only
+        # voice/render settings changed; Scanner/Finalizer dependencies have their
+        # own signature and caches.
         if self._cancel_event.is_set():
             raise RenderCancelled()
+
+        analysis_signature = compute_project_analysis_signature(record, self.settings)
+        previous_outputs = {out.output_id: out for out in record.outputs}
+        manifest: AnalysisManifest | None = None
+        persisted_manifest = Path(record.manifest_path) if record.manifest_path else None
+        if (
+            record.analysis_signature == analysis_signature
+            and persisted_manifest is not None
+            and persisted_manifest.is_file()
+        ):
+            try:
+                persisted_raw = json.loads(persisted_manifest.read_text(encoding="utf-8"))
+                if not isinstance(persisted_raw, dict) or "outputs" not in persisted_raw:
+                    raise ValueError("Persisted manifest is not a Final JSON document.")
+                if not persisted_raw.get("outputs") and persisted_raw.get("zero_output_status") != "VALID_EMPTY_OUTPUT":
+                    raise ValueError("Persisted empty output is not an explicit VALID_EMPTY_OUTPUT result.")
+                manifest = AnalysisManifest.from_dict(persisted_raw, validate=True)
+                record.current_message = "Sử dụng Final JSON hợp lệ đã lưu; bỏ qua Scanner và Finalizer."
+                self._notify_update(record)
+            except Exception:
+                manifest = None
 
         ev_cache_mgr = EvidenceCacheManager()
         engine = AnalysisEngine(
@@ -853,17 +980,18 @@ class ProjectQueue:
             self._notify_update(record)
 
         try:
-            manifest = engine.analyze(
-                project_id=record.id,
-                episodes=record.source_episodes,
-                scope=record.analysis_scope,
-                injected_transcripts=transcript_cues_by_episode,
-                injected_probes=probes_by_episode,
-                cancel_event=self._cancel_event,
-                on_phase=_on_engine_phase,
-                log=_engine_log,
-                legacy_wrapper=not self.settings.gateway_enabled,
-            )
+            if manifest is None:
+                manifest = engine.analyze(
+                    project_id=record.id,
+                    episodes=record.source_episodes,
+                    scope=record.analysis_scope,
+                    injected_transcripts=transcript_cues_by_episode,
+                    injected_probes=probes_by_episode,
+                    cancel_event=self._cancel_event,
+                    on_phase=_on_engine_phase,
+                    log=_engine_log,
+                    legacy_wrapper=not self.settings.gateway_enabled,
+                )
         except Exception as exc:
             if self._cancel_event.is_set() or isinstance(exc, (RenderCancelled, AnalysisCancelledError)):
                 raise
@@ -902,8 +1030,27 @@ class ProjectQueue:
                     ep0.error = err_text
             raise
 
+        if manifest is None:
+            raise RuntimeError("Analysis completed without a Final JSON manifest.")
         record.manifest_path = str(out_dir / f"{record.name}_manifest.json")
-        Path(record.manifest_path).write_text(manifest.to_json(indent=2), encoding="utf-8")
+        manifest_tmp = Path(record.manifest_path).with_suffix(".tmp")
+        manifest_tmp.write_text(manifest.to_json(indent=2), encoding="utf-8")
+        os.replace(manifest_tmp, Path(record.manifest_path))
+        record.analysis_signature = analysis_signature
+
+        render_signature = compute_project_render_signature(analysis_signature, record, self.settings)
+        resume_render = bool(record.render_signature and record.render_signature == render_signature)
+        if resume_render:
+            for out in manifest.outputs:
+                prior = previous_outputs.get(out.output_id)
+                if prior is not None:
+                    out.status = prior.status
+                    out.progress = prior.progress
+                    out.error = prior.error
+                    out.publication_video_path = prior.publication_video_path
+                    out.publication_original_srt_path = prior.publication_original_srt_path
+                    out.publication_narration_srt_path = prior.publication_narration_srt_path
+        record.render_signature = render_signature
         record.outputs = manifest.outputs
         record.zero_output_reason = manifest.zero_output_reason
         record.zero_output_status = manifest.zero_output_status
@@ -924,7 +1071,7 @@ class ProjectQueue:
                 record.season_progress = 100
             msg = ZERO_OUTPUT_MESSAGES.get(
                 manifest.zero_output_reason or "",
-                "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs).",
+                "Finalizer đã trả về một Final JSON hợp lệ với 0 output.",
             )
             record.current_message = msg
             self._notify_update(record)
@@ -954,6 +1101,7 @@ class ProjectQueue:
                 output_root=out_dir,
                 callbacks=_render_prog,
                 cancel_event=self._cancel_event,
+                resume_completed=resume_render,
             )
         except Exception as exc:
             if self._cancel_event.is_set() or isinstance(exc, (RenderCancelled, AnalysisCancelledError)):

@@ -85,6 +85,7 @@ def compute_scanner_config_version(
     scanner_directive: ScannerDirective | None = None,
     scanner_directive_hash: str | None = None,
     policy: EditorialPolicy | None = None,
+    transcript_hash: str = "",
 ) -> str:
     """Deterministic config version for scanner evidence caching.
 
@@ -109,9 +110,11 @@ def compute_scanner_config_version(
     payload = {
         "scanner_model": settings.scanner_model,
         "scanner_thinking": settings.scanner_thinking,
+        "scanner_supports_vision": bool(settings.scanner_supports_vision),
         "api_chunk_seconds": settings.api_chunk_seconds,
         "prompt_version": prompt_version,
         "scanner_directive_hash": effective_directive_hash,
+        "transcript_hash": transcript_hash,
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -537,25 +540,7 @@ class EvidenceScanner:
         if cancel_event and cancel_event.is_set():
             raise AnalysisCancelledError(f"Phân tích tập {episode.episode_id} đã bị hủy.")
 
-        config_version = compute_scanner_config_version(
-            self.settings,
-            scanner_directive=self.directive,
-        )
-
-        # 1. Check atomic independent cache
-        cached_evidence = self.cache_manager.load_evidence(episode, config_version)
-        if cached_evidence is not None:
-            if log:
-                log(f"Sử dụng evidence bộ nhớ đệm cho tập {episode.episode_id}.")
-            if on_phase:
-                on_phase(
-                    AnalysisPhase.SCANNER,
-                    episode.episode_id,
-                    {"cached": True, "status": "complete"},
-                )
-            return cached_evidence
-
-        # 2. Resolve media duration & probe
+        # 1. Resolve media duration & probe
         if on_phase:
             on_phase(AnalysisPhase.MEDIA_PROBE, episode.episode_id, {"status": "starting"})
 
@@ -576,7 +561,9 @@ class EvidenceScanner:
 
         duration_sec = max(1.0, duration_sec)
 
-        # 3. Resolve subtitle / transcript cues
+        # 2. Resolve subtitle / transcript cues. The normalized transcript hash is
+        # part of Scanner cache identity so a changed sidecar/OCR/STT result cannot
+        # reuse stale evidence.
         if on_phase:
             on_phase(AnalysisPhase.SUBTITLES, episode.episode_id, {"status": "resolving"})
 
@@ -596,7 +583,31 @@ class EvidenceScanner:
 
         has_speech = bool(cues)
 
-        # 4. Scanner chunks execution
+        transcript_raw = json.dumps(
+            [[round(s, 3), round(e, 3), text] for s, e, text in cues],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        transcript_hash = hashlib.sha256(transcript_raw.encode("utf-8")).hexdigest()
+        config_version = compute_scanner_config_version(
+            self.settings,
+            scanner_directive=self.directive,
+            transcript_hash=transcript_hash,
+        )
+
+        cached_evidence = self.cache_manager.load_evidence(episode, config_version)
+        if cached_evidence is not None:
+            if log:
+                log(f"Sử dụng evidence bộ nhớ đệm cho tập {episode.episode_id}.")
+            if on_phase:
+                on_phase(
+                    AnalysisPhase.SCANNER,
+                    episode.episode_id,
+                    {"cached": True, "status": "complete"},
+                )
+            return cached_evidence
+
+        # 3. Scanner chunks execution
         plans: list[ScannerChunkPlan] = []
         is_gateway_enabled = (
             self.settings.gateway_enabled

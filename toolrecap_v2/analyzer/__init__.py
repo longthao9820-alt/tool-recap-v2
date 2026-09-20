@@ -43,6 +43,12 @@ from .evidence import (
     compute_scanner_config_version,
 )
 from .finalizer import CandidateFinalizer
+from .final_json import (
+    CanonicalProjectFinalizer,
+    FinalJsonIssue,
+    FinalJsonValidationError,
+    validate_final_json,
+)
 from .phases import AnalysisPhase, PhaseCallback
 from .prompts import (
     CANDIDATE_CONSOLIDATION_SYSTEM_PROMPT,
@@ -63,6 +69,7 @@ __all__ = [
     "CandidateConsolidator",
     "CandidateDiscoverer",
     "CandidateFinalizer",
+    "CanonicalProjectFinalizer",
     "CandidateProposal",
     "CandidateVerifier",
     "CANDIDATE_CONSOLIDATION_SYSTEM_PROMPT",
@@ -77,6 +84,8 @@ __all__ = [
     "EpisodeCoverage",
     "EvidenceScanner",
     "FINALIZER_SYSTEM_PROMPT",
+    "FinalJsonIssue",
+    "FinalJsonValidationError",
     "GapType",
     "PhaseCallback",
     "SCANNER_GAP_SYSTEM_PROMPT",
@@ -104,4 +113,5 @@ __all__ = [
     "run_analysis",
     "subtract_intervals",
     "verify_zero_or_low_output",
+    "validate_final_json",
 ]

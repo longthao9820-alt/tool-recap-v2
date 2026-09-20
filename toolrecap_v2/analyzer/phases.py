@@ -20,6 +20,9 @@ class AnalysisPhase(str, Enum):
     CANDIDATE_CONSOLIDATION = "candidate_consolidation"
     CANDIDATE_VERIFYING = "candidate_verifying"
     ZERO_OUTPUT_VERIFICATION = "zero_output_verification"
+    FINALIZER = "finalizer"
+    JSON_VALIDATION = "json_validation"
+    JSON_REPAIR = "json_repair"
     OUTPUT_PLAN_READY = "output_plan_ready"
 
 

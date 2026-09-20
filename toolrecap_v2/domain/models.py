@@ -133,15 +133,28 @@ class Segment:
     original_dialogue: str = ""
     narration: str = ""
     audio_policy: str = AudioPolicy.DUCK.value
+    segment_type: str = ""
+    purpose: str = ""
+    subtitle_policy: str = ""
+    recommended_visual_speed: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "segment_id": self.segment_id,
             "source_clips": [c.to_dict() for c in self.source_clips],
             "original_dialogue": self.original_dialogue,
             "narration": self.narration,
             "audio_policy": self.audio_policy,
         }
+        if self.segment_type:
+            data["segment_type"] = self.segment_type
+        if self.purpose:
+            data["purpose"] = self.purpose
+        if self.subtitle_policy:
+            data["subtitle_policy"] = self.subtitle_policy
+        if self.recommended_visual_speed != 1.0:
+            data["recommended_visual_speed"] = float(self.recommended_visual_speed)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Segment":
@@ -157,6 +170,10 @@ class Segment:
             original_dialogue=str(data.get("original_dialogue", "")),
             narration=str(data.get("narration", "")),
             audio_policy=str(data.get("audio_policy", AudioPolicy.DUCK.value)),
+            segment_type=str(data.get("segment_type", "")),
+            purpose=str(data.get("purpose", "")),
+            subtitle_policy=str(data.get("subtitle_policy", "")),
+            recommended_visual_speed=float(data.get("recommended_visual_speed", 1.0) or 1.0),
         )
 
 
@@ -175,6 +192,9 @@ class CommentaryOutput:
     progress: int = 0
     candidate_id: str = ""
     source_candidate_id: str = ""
+    file_name: str = ""
+    output_type: str = ""
+    language: str = ""
 
     @property
     def video_path(self) -> str | None:
@@ -218,6 +238,12 @@ class CommentaryOutput:
         if cid:
             d["source_candidate_id"] = cid
             d["candidate_id"] = cid
+        if self.file_name:
+            d["file_name"] = self.file_name
+        if self.output_type:
+            d["output_type"] = self.output_type
+        if self.language:
+            d["language"] = self.language
         return d
 
     def to_json(self, indent: int = 2) -> str:
@@ -248,6 +274,9 @@ class CommentaryOutput:
             progress=int(data.get("progress", 0)),
             candidate_id=cid,
             source_candidate_id=cid,
+            file_name=str(data.get("file_name", "")),
+            output_type=str(data.get("output_type", "")),
+            language=str(data.get("language", "")),
         )
 
     @classmethod
@@ -1495,7 +1524,10 @@ class AnalysisManifest:
             seen_output_ids.add(out.output_id)
 
         # Sanitize and resolve unique titles deterministically <= 120 chars
-        raw_titles = [out.title or out.output_id for out in self.outputs]
+        raw_titles = [
+            Path(out.file_name).stem if out.file_name else (out.title or out.output_id)
+            for out in self.outputs
+        ]
         sanitized_unique_titles = resolve_unique_titles(raw_titles, max_length=120)
         for out, san_title in zip(self.outputs, sanitized_unique_titles):
             out.sanitized_title = san_title

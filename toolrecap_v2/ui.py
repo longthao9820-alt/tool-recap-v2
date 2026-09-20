@@ -19,6 +19,12 @@ from .paths import default_data_directory, set_window_icon
 from .projects import ProjectQueue, ProjectRecord, ProjectStore, ZERO_OUTPUT_MESSAGES
 
 SEASON_STAGE_TRANSLATIONS: dict[str, str] = {
+    "Finalizer": "Finalizer",
+    "finalizer": "Finalizer",
+    "Technical JSON Validation": "Kiểm tra kỹ thuật Final JSON",
+    "json_validation": "Kiểm tra kỹ thuật Final JSON",
+    "Final JSON Repair": "Sửa Final JSON",
+    "json_repair": "Sửa Final JSON",
     "CANDIDATE_DISCOVERY": "Khám phá ứng viên",
     "candidate_discovery": "Khám phá ứng viên",
     "Candidate Discovery": "Khám phá ứng viên",
@@ -33,8 +39,6 @@ SEASON_STAGE_TRANSLATIONS: dict[str, str] = {
     "Zero Output Verification": "Xác minh kết quả 0 output",
     "Season Mining": "Khai thác cốt truyện",
     "season_mining": "Khai thác cốt truyện",
-    "finalizer": "Khai thác cốt truyện",
-    "Finalizer": "Khai thác cốt truyện",
     "Season Batch": "Phân tích nhóm mùa",
     "season_batch": "Phân tích nhóm mùa",
     "Episode Summarizing": "Tóm tắt tập",
@@ -609,6 +613,7 @@ class ToolRecapV2App(tk.Tk):
                 "CANDIDATE_DISCOVERY", "CANDIDATE_CONSOLIDATION", "CANDIDATE_VERIFYING", "ZERO_OUTPUT_VERIFICATION",
                 "season_barrier", "season_connecting", "season_mining", "season_batch", "season_merging", "episode_summarizing",
                 "candidate_discovery", "candidate_consolidation", "candidate_verifying", "zero_output_verification",
+                "finalizer", "json_validation", "json_repair",
             } or "Season Analysis" in msg:
                 raw_stage = record.season_stage if record.season_stage != "Sẵn sàng" else "Season Analysis"
                 s_stage = translate_season_stage(raw_stage)
