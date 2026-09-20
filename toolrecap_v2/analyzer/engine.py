@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..api_client import OpenAICompatibleClient
-from ..domain.cache import EvidenceCacheManager
+from ..domain.cache import EvidenceCacheManager, HierarchyCacheManager
 from ..domain.enums import AnalysisScope
 from ..domain.models import AnalysisManifest, CommentaryOutput, EpisodeEvidence, SourceEpisode
 from ..paths import default_data_directory
@@ -33,10 +33,11 @@ def compute_final_plan_cache_key(
     rights: str | None = None,
     recap_prompt: str | None = None,
     legacy_wrapper: bool = False,
+    connection_key: str | None = None,
 ) -> str:
     """Compute deterministic cache key for final CommentaryOutput plans.
 
-    Keyed by hashes of all episode evidence payloads + finalizer config.
+    Keyed by hashes of all episode evidence payloads + finalizer config + connection identity.
     Excludes all API credentials or secrets.
     """
     sorted_items = sorted(evidence_map.items(), key=lambda x: x[0])
@@ -57,6 +58,7 @@ def compute_final_plan_cache_key(
         "content_type": content_type or getattr(settings, "content_type", "US_TV_SHOW"),
         "rights": rights or getattr(settings, "source_rights_status", "UNVERIFIED"),
         "legacy_wrapper": legacy_wrapper,
+        "connection_key": connection_key or "",
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -71,10 +73,16 @@ class AnalysisEngine:
         client: OpenAICompatibleClient | None = None,
         cache_manager: EvidenceCacheManager | None = None,
         subtitle_pipeline: SubtitlePipeline | None = None,
+        hierarchy_cache: HierarchyCacheManager | None = None,
     ) -> None:
         self.settings = settings or AppSettings()
         self.client = client
         self.cache_manager = cache_manager or EvidenceCacheManager()
+        if hierarchy_cache is not None:
+            self.hierarchy_cache = hierarchy_cache
+        else:
+            hierarchy_dir = self.cache_manager.cache_dir.parent / "season_hierarchy"
+            self.hierarchy_cache = HierarchyCacheManager(base_dir=hierarchy_dir)
         self.subtitle_pipeline = subtitle_pipeline
         self.scanner = EvidenceScanner(
             settings=self.settings,
@@ -82,7 +90,11 @@ class AnalysisEngine:
             cache_manager=self.cache_manager,
             subtitle_pipeline=self.subtitle_pipeline,
         )
-        self.connector = SeasonConnector(settings=self.settings, client=self.client)
+        self.connector = SeasonConnector(
+            settings=self.settings,
+            client=self.client,
+            hierarchy_cache=self.hierarchy_cache,
+        )
         self.finalizer = CandidateFinalizer(settings=self.settings, client=self.client)
 
     def analyze(
@@ -146,6 +158,9 @@ class AnalysisEngine:
         # 2. Check Plan Cache (optional)
         plan_cache_key = ""
         if use_final_plan_cache and evidence_map:
+            conn_key = None
+            if scope_str == AnalysisScope.SEASON.value:
+                conn_key = self.connector.compute_connection_key(episodes, evidence_map)
             plan_cache_key = compute_final_plan_cache_key(
                 evidence_map,
                 self.settings,
@@ -156,6 +171,7 @@ class AnalysisEngine:
                 rights=self.settings.source_rights_status,
                 recap_prompt=self.settings.recap_prompt,
                 legacy_wrapper=legacy_wrapper,
+                connection_key=conn_key,
             )
             cached_manifest = self._load_final_plan_cache(plan_cache_key, project_id)
             if cached_manifest is not None:
@@ -248,8 +264,14 @@ class AnalysisEngine:
 
         return manifest
 
+    @property
+    def plan_cache_dir(self) -> Path:
+        cache_dir = self.cache_manager.cache_dir.parent / "analysis_plans"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
     def _load_final_plan_cache(self, cache_key: str, project_id: str) -> AnalysisManifest | None:
-        cache_file = default_data_directory() / "cache" / "analysis_plans" / f"{cache_key}.json"
+        cache_file = self.plan_cache_dir / f"{cache_key}.json"
         if not cache_file.is_file():
             return None
         try:
@@ -260,10 +282,9 @@ class AnalysisEngine:
             return None
 
     def _save_final_plan_cache(self, cache_key: str, manifest: AnalysisManifest) -> None:
-        cache_dir = default_data_directory() / "cache" / "analysis_plans"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = self.plan_cache_dir
         cache_file = cache_dir / f"{cache_key}.json"
-        tmp_file = cache_file.with_suffix(".tmp")
+        tmp_file = cache_file.with_suffix(f".tmp.{threading.get_ident()}")
         tmp_file.write_text(manifest.to_json(indent=2), encoding="utf-8")
         tmp_file.replace(cache_file)
 
@@ -277,6 +298,7 @@ def run_analysis(
     client: OpenAICompatibleClient | None = None,
     cache_manager: EvidenceCacheManager | None = None,
     subtitle_pipeline: SubtitlePipeline | None = None,
+    hierarchy_cache: HierarchyCacheManager | None = None,
     allow_incomplete: bool = False,
     injected_transcripts: dict[str, list[SubtitleCue] | list[tuple[float, float, str]]] | None = None,
     injected_probes: dict[str, MediaProbeResult | dict[str, Any]] | None = None,
@@ -292,6 +314,7 @@ def run_analysis(
         client=client,
         cache_manager=cache_manager,
         subtitle_pipeline=subtitle_pipeline,
+        hierarchy_cache=hierarchy_cache,
     )
     return engine.analyze(
         project_id=project_id,

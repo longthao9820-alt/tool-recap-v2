@@ -1,4 +1,4 @@
-# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.0)
+# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.1)
 
 ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim, truyền hình, tài liệu) tiếng Anh chất lượng cao chỉ với một cú nhấp chuột: quét nguồn video, phân tích và trích xuất hội thoại thực tế (qua phụ đề companion SRT/VTT/ASS, phụ đề đồ họa bitmap PGS/VobSub qua RapidOCR/AI Vision, hoặc nhận diện giọng nói STT faster-whisper), suy luận kịch bản phân đoạn 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, tổng hợp giọng dẫn thuyết minh chân thực với 12 giọng thiết kế chuẩn, phối trộn âm thanh tự động (Real Audio Mix with Auto-Ducking), nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
 
@@ -96,11 +96,29 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 - **Thư mục xuất video**: Chọn vị trí lưu trữ thành phẩm recap.
 - **Hệ thống phụ & Cập nhật**: Kiểm tra phiên bản và môi trường phụ trợ VoiceStudio.
 
-*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong).*
+*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong. Các thông số độ tin cậy AI như phase timeouts, số lượt thử lại 3 attempts, kích thước batching 3-4 cũng được quản lý hoàn toàn nội bộ, không đưa vào giao diện Settings nhằm tránh làm phức tạp trải nghiệm người dùng).*
 
 ---
 
-## 5. Trích Xuất Hội Thoại & Phụ Đề: PGS / VobSub / RapidOCR / AI Vision / STT
+## 5. Độ Tin Cậy AI Gateway (AI Reliability & Resilience)
+
+Quy trình phân tích kịch bản bằng AI Gateway được thiết kế với cơ chế độ tin cậy công nghiệp:
+
+1. **Phase Timeouts nội bộ**: Mỗi giai đoạn phân tích AI (`scanner`, `season_connecting`, `season_mining`, `finalizer`) được ấn định thời hạn chờ (timeout) nội bộ riêng biệt, tối ưu theo khối lượng tính toán. Người dùng không phải bận tâm cấu hình thủ công.
+2. **Tự động thử tối đa 3 lần**: Khi gặp lỗi timeout, mất kết nối, HTTP 429 hoặc lỗi máy chủ tạm thời, hệ thống tự động thử lại với khoảng chờ 5 và 15 giây. Nút Stop ngắt khoảng chờ ngay lập tức.
+3. **Phân tích mùa theo lô 3–4 tập**: Mỗi request Season Connection chỉ nhận compact summaries của tối đa 3–4 tập. Các kết quả lô được hợp nhất phân cấp để kết nối cốt truyện xuyên suốt mùa.
+4. **Tóm tắt cô đọng, Cache & Khôi phục (Compact Summaries, Caching & Resume)**:
+   - Tự động sinh tóm tắt cô đọng cho các đoạn hội thoại dài, giảm thiểu token dư thừa.
+   - Lưu trữ kết quả phân tích theo mã băm định danh nội dung (content hash cache).
+   - Hỗ trợ khôi phục và tiếp tục (resume) xử lý ngay tại giai đoạn dang dở mà không cần quét lại từ đầu.
+5. **Phân định rõ quyền sở hữu tiến trình & lỗi (Progress & Error Ownership)**:
+   - Trạng thái tiến trình được gán rõ ràng theo từng giai đoạn và từng tập phim.
+   - Khi phát sinh lỗi, hệ thống phân định chính xác phạm vi (tập phim đơn lẻ hay toàn mùa) và thông báo lỗi rõ ràng trên hàng đợi, không làm gián đoạn hay làm sai lệch dữ liệu của các tập thành công khác.
+6. **Cài đặt tinh gọn**: Toàn bộ các cơ chế độ tin cậy trên hoạt động ngầm (internal), không đưa các thiết lập kỹ thuật này vào bảng cài đặt.
+
+---
+
+## 6. Trích Xuất Hội Thoại & Phụ Đề: PGS / VobSub / RapidOCR / AI Vision / STT
 
 Ứng dụng sở hữu cơ chế bóc tách hội thoại đa tầng hiện đại:
 
@@ -113,7 +131,7 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 
 ---
 
-## 6. 12 Giọng Thiết Kế Chuẩn & Cơ Chế Tải Runtime/Model Lần Đầu
+## 7. 12 Giọng Thiết Kế Chuẩn & Cơ Chế Tải Runtime/Model Lần Đầu
 
 - **Danh mục 12 giọng chính thức**: Kế thừa kiến trúc VoiceStudio / OmniVoice với 12 nhân vật giọng đọc chuyên biệt (6 giọng `en-US` và 6 giọng `en-GB`, nam/nữ, phù hợp cho tóm tắt phim, kịch tính, tài liệu).
 - **Tải lần đầu (First-use download)**:
@@ -124,7 +142,7 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 
 ---
 
-## 7. Sản Phẩm Xuất Bản: Đúng 3 Tệp Thành Phẩm (Outputs Exact Three)
+## 8. Sản Phẩm Xuất Bản: Đúng 3 Tệp Thành Phẩm (Outputs Exact Three)
 
 Mỗi phân đoạn video recap được xuất bản vào một thư mục riêng biệt sạch sẽ, chỉ chứa **ĐÚNG BA TỆP THÀNH PHẨM**:
 
@@ -136,19 +154,21 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
 
 ---
 
-## 8. Dừng An Toàn (Stop / Safe Cancellation)
+## 9. Dừng An Toàn (Stop / Safe Cancellation)
 
 - Trong quá trình phân tích hoặc kết xuất, nút **"⏹ Stop"** luôn sẵn sàng.
 - Khi nhấn nút dừng:
   - Ứng dụng lập tức phát cờ hủy tiến trình an toàn (`cancel_event`).
+  - Ngắt quãng tức thì chu kỳ chờ thử lại (backoff delay), hủy bỏ ngay các giai đoạn xử lý kế tiếp (next phases).
   - Đóng sạch sẽ cây tiến trình con FFmpeg bằng lệnh hệ thống (`taskkill /F /T /PID`).
   - Xóa bỏ các tệp tạm thời chưa hoàn thiện.
   - Mở khóa lại toàn bộ các nút bấm trên giao diện và đánh dấu trạng thái của các tập chưa hoàn thành là `CANCELLED`.
   - Tuyệt đối không để xảy ra hiện tượng treo tiến trình nền (orphan process).
+  - **Giới hạn kỹ thuật chính xác**: Một yêu cầu HTTP `urlopen` đang gửi nhận dở dang (active in-flight) trên socket chỉ có thể trả về khi nhận phản hồi từ server hoặc khi hết thời gian chờ socket timeout; ngay khi socket hoàn tất hoặc chạm timeout, thao tác Stop lập tức chặn đứng mọi hành động tiếp theo.
 
 ---
 
-## 9. Cập Nhật & Lưu Trữ Dữ Liệu
+## 10. Cập Nhật & Lưu Trữ Dữ Liệu
 
 - **Cập nhật ứng dụng ToolRecap V2**: Tự động kiểm tra GitHub Releases chính thức từ `longthao9820-alt/tool-recap-v2`. Bản cập nhật được xác thực mã băm SHA256 trước khi hoán đổi an toàn có cơ chế khôi phục (rollback).
 - **Cập nhật VoiceStudio Subsystem**: Kiểm tra và áp dụng gói cập nhật adapter tách biệt, xác thực mã băm SHA256 và manifest hợp lệ.
@@ -166,15 +186,16 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
 
 ---
 
-## 10. Giới Hạn Của Hệ Thống (Limitations)
+## 11. Giới Hạn Của Hệ Thống (Limitations)
 
 - **Mạng Internet lần đầu**: Cần kết nối Internet ổn định ở lần sử dụng đầu tiên để tải các gói runtime và mô hình AI nặng.
 - **Yêu cầu phần cứng**: Để đạt tốc độ mã hóa video cao nhất, khuyến nghị máy tính có card đồ họa hỗ trợ NVIDIA NVENC, AMD AMF hoặc Intel QSV. Nếu không có card rời, ứng dụng tự động dùng CPU với bộ mã hóa `libx264` chất lượng cao nhưng thời gian kết xuất sẽ lâu hơn.
 - **Độ phụ thuộc vào nguồn thoại**: AI Gateway suy luận và tạo kịch bản dựa trên phụ đề và lời thoại nhận dạng được. Đối với video không có bất kỳ lời thoại hay phụ đề nào, kịch bản recap sẽ chỉ dựa trên thông tin dòng thời gian tổng quát.
+- **Giới hạn kết nối mạng HTTP In-Flight**: Yêu cầu mạng HTTP `urlopen` đang gửi nhận trực tiếp trên socket không thể bị ngắt giữa chừng từ bên ngoài Python socket mà phải chờ máy chủ phản hồi hoặc chạm thời gian chờ socket timeout. Nút Stop sẽ ngắt chu kỳ chờ thử lại (backoff) và ngăn không cho các giai đoạn kế tiếp được kích hoạt.
 
 ---
 
-## 11. Đóng Gói Bản Phát Hành Portable
+## 12. Đóng Gói Bản Phát Hành Portable
 
 Để tạo bản phân phối Portable độc lập:
 1. Nhấp đúp vào `Dong-Goi-ToolRecapV2.cmd` (hoặc chạy lệnh `python build_exe.py`).
@@ -182,11 +203,11 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
    - Dựng ứng dụng bằng PyInstaller với tệp cấu hình `ToolRecapV2.spec`.
    - Nhúng FFmpeg, FFprobe, giấy phép và tệp hướng dẫn sử dụng vào `release\ToolRecapV2\`.
    - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp thực thi đã dựng.
-   - Nén toàn bộ thành `release\ToolRecapV2-v0.3.0-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.0-windows-portable.zip.sha256.txt`.
+   - Nén toàn bộ thành `release\ToolRecapV2-v0.3.1-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.1-windows-portable.zip.sha256.txt`.
 
 ---
 
-## 12. Giấy Phép Bản Quyền (Licenses)
+## 13. Giấy Phép Bản Quyền (Licenses)
 
 - Mã nguồn chính của ToolRecap V2 được phát hành theo giấy phép **MIT License**.
 - Các thành phần bên thứ ba (FFmpeg, Piper, RapidOCR, OmniVoice, faster-whisper, PyTorch, OpenCV, Shapely) tuân theo giấy phép mã nguồn mở tương ứng. Xem chi tiết tại tệp `THIRD_PARTY_LICENSES.md`.

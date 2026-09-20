@@ -1,7 +1,17 @@
 """Domain foundation for ToolRecap V2 multi-episode analysis, commentary, and persistence."""
 from __future__ import annotations
 
-from .cache import EvidenceCacheManager, compute_cache_key, default_evidence_cache_dir
+from .cache import (
+    EvidenceCacheManager,
+    HierarchyCacheManager,
+    compute_batch_cache_key,
+    compute_cache_key,
+    compute_connection_cache_key,
+    compute_merge_cache_key,
+    compute_summary_cache_key,
+    default_evidence_cache_dir,
+    default_hierarchy_cache_dir,
+)
 from .enums import (
     AnalysisScope,
     AudioPolicy,
@@ -12,13 +22,17 @@ from .enums import (
 from .models import (
     AnalysisManifest,
     CommentaryOutput,
+    CompactEpisodeSummary,
+    CompactSummaryItem,
     DomainError,
     EpisodeEvidence,
     MediaSelection,
+    SUMMARY_SCHEMA_VERSION,
     Segment,
     SourceClip,
     SourceEpisode,
     ValidationError,
+    build_compact_summary,
 )
 from .title import resolve_unique_titles, sanitize_title
 
@@ -28,18 +42,28 @@ __all__ = [
     "AudioPolicy",
     "CandidateScope",
     "CommentaryOutput",
+    "CompactEpisodeSummary",
+    "CompactSummaryItem",
     "DomainError",
     "EpisodeEvidence",
     "EvidenceCacheManager",
+    "HierarchyCacheManager",
     "MediaSelection",
     "OutputStatus",
     "ProjectPhase",
+    "SUMMARY_SCHEMA_VERSION",
     "Segment",
     "SourceClip",
     "SourceEpisode",
     "ValidationError",
+    "build_compact_summary",
+    "compute_batch_cache_key",
     "compute_cache_key",
+    "compute_connection_cache_key",
+    "compute_merge_cache_key",
+    "compute_summary_cache_key",
     "default_evidence_cache_dir",
+    "default_hierarchy_cache_dir",
     "resolve_unique_titles",
     "sanitize_title",
 ]

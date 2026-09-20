@@ -38,7 +38,13 @@ from toolrecap_v2.analyzer import (
     compute_scanner_config_version,
     run_analysis,
 )
-from toolrecap_v2.api_client import OpenAICompatibleClient
+from toolrecap_v2.analyzer.connection import (
+    check_payload_size,
+    partition_season_batches,
+    validate_batch_response_schema,
+)
+from toolrecap_v2.analyzer.engine import compute_final_plan_cache_key
+from toolrecap_v2.api_client import APIError, OpenAICompatibleClient
 from toolrecap_v2.domain import (
     AnalysisManifest,
     AnalysisScope,
@@ -47,10 +53,18 @@ from toolrecap_v2.domain import (
     CommentaryOutput,
     EpisodeEvidence,
     EvidenceCacheManager,
+    HierarchyCacheManager,
     Segment,
     SourceClip,
     SourceEpisode,
     ValidationError,
+    compute_cache_key,
+)
+from toolrecap_v2.domain.cache import (
+    compute_batch_cache_key,
+    compute_connection_cache_key,
+    compute_merge_cache_key,
+    compute_summary_cache_key,
 )
 from toolrecap_v2.settings import AppSettings
 from toolrecap_v2.subtitles.models import SubtitleCue
@@ -325,8 +339,65 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
         },
     ]
 
-    # Connection pass response
-    connection_resp = {
+    # Batch 1 response (E01-E03)
+    batch1_resp = {
+        "batch_id": "batch_E01_E03",
+        "cross_episode_links": [
+            {
+                "thread_id": "thread_ledger_early",
+                "theme": "The Hidden Ledger Setup",
+                "episodes": ["E01", "E03"],
+                "summary": "Setup in E01, uncovered in E03.",
+            }
+        ],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_ledger_part1",
+                "title": "The Ledger Setup",
+                "candidate_scope": "CROSS_EPISODE",
+                "episodes": ["E01", "E03"],
+                "editorial_reason": "Setup and early investigation.",
+                "status": "keep",
+            }
+        ],
+        "supporting_character_arcs": [
+            {
+                "character": "Deputy Adams",
+                "arc_summary": "Uncovers critical evidence in E03.",
+                "episodes": ["E03"],
+                "has_dedicated_candidate": True,
+            }
+        ],
+        "rejected_or_merged": [],
+    }
+
+    # Batch 2 response (E04-E05)
+    batch2_resp = {
+        "batch_id": "batch_E04_E05",
+        "cross_episode_links": [
+            {
+                "thread_id": "thread_ledger_late",
+                "theme": "The Ledger Payoff",
+                "episodes": ["E04", "E05"],
+                "summary": "Consequences and payoff.",
+            }
+        ],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_ledger_part2",
+                "title": "The Ledger Payoff",
+                "candidate_scope": "CROSS_EPISODE",
+                "episodes": ["E04", "E05"],
+                "editorial_reason": "Consequence and resolution.",
+                "status": "keep",
+            }
+        ],
+        "supporting_character_arcs": [],
+        "rejected_or_merged": [],
+    }
+
+    # Cross-batch merge response
+    merge_resp = {
         "cross_episode_links": [
             {
                 "thread_id": "thread_ledger",
@@ -393,7 +464,7 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
         ]
     }
 
-    mock_client = MockAIClient(scanner_responses + [connection_resp, finalizer_resp])
+    mock_client = MockAIClient(scanner_responses + [batch1_resp, batch2_resp, merge_resp, finalizer_resp])
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
 
     phase_log: list[tuple[AnalysisPhase, str]] = []
@@ -420,19 +491,33 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
     assert barrier_idx and connecting_idx
     assert barrier_idx[0] < connecting_idx[0]
 
-    # 2. Inspect the Season Connection call prompt
-    conn_call = [c for c in mock_client.call_history if "season narrative architect" in c["system"].lower()][0]
-    assert "CROSS-EPISODE LINKS" in conn_call["system"]
-    assert "SUPPORTING/MINOR CHARACTERS" in conn_call["system"]
-    assert "NO QUOTA" in conn_call["system"]
+    # 2. Inspect the Season Connection calls (hierarchical: batch 1, batch 2, and cross-batch merge)
+    conn_calls = [c for c in mock_client.call_history if "season narrative architect" in c["system"].lower()]
+    assert len(conn_calls) == 3  # Batch 1 (E01-E03), Batch 2 (E04-E05), Merge (Round final)
 
-    # Verify connection prompt user text contains evidence from E01, E02, E03, E04, E05
-    assert "E01" in conn_call["user_text"]
-    assert "E02" in conn_call["user_text"]
-    assert "E03" in conn_call["user_text"]
-    assert "E04" in conn_call["user_text"]
-    assert "E05" in conn_call["user_text"]
-    assert "conspiracy" in conn_call["user_text"] or "ledger" in conn_call["user_text"]
+    # Batch 1 call: strictly compact summaries of E01-E03, no raw evidence_categories
+    b1_call = conn_calls[0]
+    assert "CROSS-EPISODE LINKS" in b1_call["system"]
+    assert "SUPPORTING/MINOR CHARACTERS" in b1_call["system"]
+    assert "NO QUOTA" in b1_call["system"]
+    assert "E01" in b1_call["user_text"]
+    assert "E02" in b1_call["user_text"]
+    assert "E03" in b1_call["user_text"]
+    assert "E04" not in b1_call["user_text"]
+    assert "evidence_categories" not in b1_call["user_text"]
+    assert "conspiracy" in b1_call["user_text"] or "ledger" in b1_call["user_text"]
+
+    # Batch 2 call: strictly compact summaries of E04-E05
+    b2_call = conn_calls[1]
+    assert "E04" in b2_call["user_text"]
+    assert "E05" in b2_call["user_text"]
+    assert '"episode_id": "E01"' not in b2_call["user_text"]
+    assert "evidence_categories" not in b2_call["user_text"]
+
+    # Merge call: contains batch results from both batches
+    merge_call = conn_calls[2]
+    assert "batch_results" in merge_call["user_text"]
+    assert "evidence_categories" not in merge_call["user_text"]
 
     # 3. Output validation
     assert len(manifest.outputs) == 1
@@ -863,6 +948,7 @@ def test_cancellation_during_season_connection(tmp_path: Path) -> None:
     """Cancellation during season connection pass stops execution."""
     episodes = [make_dummy_episode("E01", duration=100.0, tmp_path=tmp_path)]
     cancel_event = threading.Event()
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
 
     def mock_chat(*args: Any, **kwargs: Any) -> dict[str, Any]:
         system = kwargs.get("system", "")
@@ -876,7 +962,7 @@ def test_cancellation_during_season_connection(tmp_path: Path) -> None:
     client = MockAIClient()
     client.chat_json = mock_chat  # type: ignore[assignment]
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
-    engine = AnalysisEngine(settings=settings, client=client)
+    engine = AnalysisEngine(settings=settings, client=client, cache_manager=cache_mgr)
 
     with pytest.raises(AnalysisCancelledError):
         engine.analyze(
@@ -891,6 +977,7 @@ def test_cancellation_during_finalizer(tmp_path: Path) -> None:
     """Cancellation during finalizer phase stops execution."""
     episodes = [make_dummy_episode("E01", duration=100.0, tmp_path=tmp_path)]
     cancel_event = threading.Event()
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
 
     def mock_chat(*args: Any, **kwargs: Any) -> dict[str, Any]:
         system = kwargs.get("system", "")
@@ -906,7 +993,7 @@ def test_cancellation_during_finalizer(tmp_path: Path) -> None:
     client = MockAIClient()
     client.chat_json = mock_chat  # type: ignore[assignment]
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
-    engine = AnalysisEngine(settings=settings, client=client)
+    engine = AnalysisEngine(settings=settings, client=client, cache_manager=cache_mgr)
 
     with pytest.raises(AnalysisCancelledError):
         engine.analyze(
@@ -1091,3 +1178,522 @@ def test_offline_mode_with_injected_transcripts(tmp_path: Path) -> None:
     )
     assert len(legacy_manifest.outputs) >= 1
     legacy_manifest.validate()
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Cross-Batch Merge Setup E02 / Payoff E08 & Preserves Supporting Arcs
+# ---------------------------------------------------------------------------
+
+def test_cross_batch_merge_finds_e02_setup_e08_payoff_preserves_supporting_arcs(tmp_path: Path) -> None:
+    """Cross-batch merge identifies E02 setup to E08 payoff arc while preserving supporting character arcs."""
+    episodes = [make_dummy_episode(f"E0{i}", duration=300.0, tmp_path=tmp_path) for i in range(1, 9)]
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
+
+    scanner_responses = [{cat: [] for cat in EVIDENCE_CATEGORIES} for _ in range(8)]
+
+    # Batch 1 (E01-E04)
+    batch1_resp = {
+        "batch_id": "batch_E01_E04",
+        "cross_episode_links": [
+            {"thread_id": "thread_early_conspiracy", "episodes": ["E01", "E02"], "summary": "Early conspiracy setup"}
+        ],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_e02_setup",
+                "title": "Conspiracy Setup",
+                "candidate_scope": "CROSS_EPISODE",
+                "episodes": ["E01", "E02"],
+                "editorial_reason": "Setup of the conspiracy in E02.",
+                "status": "keep",
+            }
+        ],
+        "supporting_character_arcs": [
+            {
+                "character": "Officer Miller",
+                "arc_summary": "Officer Miller investigates unauthorized transactions in E03.",
+                "episodes": ["E03"],
+                "has_dedicated_candidate": True,
+            }
+        ],
+        "rejected_or_merged": [],
+    }
+
+    # Batch 2 (E05-E08)
+    batch2_resp = {
+        "batch_id": "batch_E05_E08",
+        "cross_episode_links": [
+            {"thread_id": "thread_late_payoff", "episodes": ["E07", "E08"], "summary": "Conspiracy reaches climax and payoff"}
+        ],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_e08_payoff",
+                "title": "Conspiracy Payoff",
+                "candidate_scope": "CROSS_EPISODE",
+                "episodes": ["E07", "E08"],
+                "editorial_reason": "Payoff of the conspiracy in E08.",
+                "status": "keep",
+            }
+        ],
+        "supporting_character_arcs": [],
+        "rejected_or_merged": [],
+    }
+
+    # Cross-batch merge response
+    merge_resp = {
+        "cross_episode_links": [
+            {
+                "thread_id": "thread_full_conspiracy",
+                "episodes": ["E02", "E08"],
+                "summary": "Full conspiracy arc connecting E02 setup directly to E08 payoff.",
+            }
+        ],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_full_conspiracy",
+                "title": "The Master Conspiracy",
+                "candidate_scope": "SEASON_ARC",
+                "episodes": ["E02", "E08"],
+                "editorial_reason": "Master arc connecting early setup in E02 to resolution in E08.",
+                "status": "keep",
+            },
+            {
+                "proposal_id": "prop_officer_miller",
+                "title": "Officer Miller's Stand",
+                "candidate_scope": "SINGLE_EPISODE",
+                "episodes": ["E03"],
+                "editorial_reason": "Crucial supporting investigation preserved.",
+                "status": "keep",
+            },
+        ],
+        "supporting_character_arcs": [
+            {
+                "character": "Officer Miller",
+                "arc_summary": "Officer Miller's parallel investigation survives cross-batch merge.",
+                "episodes": ["E03"],
+                "has_dedicated_candidate": True,
+            }
+        ],
+        "rejected_or_merged": [
+            {"proposal_id": "prop_e02_setup", "reason": "Merged into prop_full_conspiracy"},
+            {"proposal_id": "prop_e08_payoff", "reason": "Merged into prop_full_conspiracy"},
+        ],
+    }
+
+    finalizer_resp = {
+        "outputs": [
+            {
+                "output_id": "out_conspiracy",
+                "title": "The Master Conspiracy",
+                "candidate_scope": "SEASON_ARC",
+                "segments": [
+                    {
+                        "segment_id": "seg_01",
+                        "source_clips": [{"episode_id": "E02", "source_video": episodes[1].source_video, "start": 10.0, "end": 30.0}],
+                        "narration": "The conspiracy takes root in Episode 2.",
+                        "audio_policy": "mute",
+                    },
+                    {
+                        "segment_id": "seg_02",
+                        "source_clips": [{"episode_id": "E08", "source_video": episodes[7].source_video, "start": 20.0, "end": 45.0}],
+                        "narration": "The payoff is revealed in Episode 8.",
+                        "audio_policy": "mute",
+                    },
+                ],
+            }
+        ]
+    }
+
+    mock_client = MockAIClient(scanner_responses + [batch1_resp, batch2_resp, merge_resp, finalizer_resp])
+    settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
+
+    manifest = run_analysis(
+        project_id="season_e02_e08",
+        episodes=episodes,
+        scope=AnalysisScope.SEASON,
+        settings=settings,
+        client=mock_client,
+        cache_manager=cache_mgr,
+    )
+
+    # 1. Verify merge call received both batches in user_text
+    merge_calls = [c for c in mock_client.call_history if "cross-batch merge synthesizer" in c["system"].lower()]
+    assert len(merge_calls) == 1
+    m_text = merge_calls[0]["user_text"]
+    assert "batch_E01_E04" in m_text
+    assert "batch_E05_E08" in m_text
+    assert "prop_e02_setup" in m_text
+    assert "prop_e08_payoff" in m_text
+
+    # 2. Verify manifest output spans E02 and E08
+    assert len(manifest.outputs) == 1
+    out = manifest.outputs[0]
+    clip_eps = [c.episode_id for s in out.segments for c in s.source_clips]
+    assert "E02" in clip_eps
+    assert "E08" in clip_eps
+    manifest.validate()
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Resume Exact Batch 3 Failure Reuses Prior Batches and Evidence
+# ---------------------------------------------------------------------------
+
+def test_resume_exact_batch3_failure_reuses_prior_batches_and_evidence(tmp_path: Path) -> None:
+    """When batch 3 fails on first run, second run reuses evidence and batches 1-2, only executing batch 3 and merge."""
+    episodes = [make_dummy_episode(f"E{i:02d}", duration=100.0, tmp_path=tmp_path) for i in range(1, 11)]
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
+    settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
+
+    # 10 episodes -> 3 batches: [4, 3, 3] -> batch_E01_E04, batch_E05_E07, batch_E08_E10
+    scanner_responses = [{cat: [] for cat in EVIDENCE_CATEGORIES} for _ in range(10)]
+    b1_resp = {"candidate_proposals": [{"proposal_id": "p1", "title": "Part 1", "episodes": ["E01", "E02"]}]}
+    b2_resp = {"candidate_proposals": [{"proposal_id": "p2", "title": "Part 2", "episodes": ["E05", "E06"]}]}
+    b3_fail = APIError("Simulated Batch 3 rate limit failure")
+
+    client1 = MockAIClient(scanner_responses + [b1_resp, b2_resp, b3_fail])
+    engine1 = AnalysisEngine(settings=settings, client=client1, cache_manager=cache_mgr)
+
+    with pytest.raises(AnalysisError, match="season batch batch_E08_E10"):
+        engine1.analyze(
+            project_id="proj_resume",
+            episodes=episodes,
+            scope=AnalysisScope.SEASON,
+            use_final_plan_cache=False,
+        )
+
+    # Verify first run scanned 10 episodes and called 3 batches
+    scanner_calls_1 = [c for c in client1.call_history if "evidence scanner" in c["system"].lower()]
+    assert len(scanner_calls_1) == 10
+    batch_calls_1 = [c for c in client1.call_history if "batch connection analyst" in c["system"].lower()]
+    assert len(batch_calls_1) == 3
+
+    # Run 2: Provide Batch 3 success, Merge success, and Finalizer success
+    b3_success = {"candidate_proposals": [{"proposal_id": "p3", "title": "Part 3", "episodes": ["E08", "E09"]}]}
+    merge_resp = {
+        "candidate_proposals": [{"proposal_id": "p_full", "title": "Full Season Story", "episodes": ["E01", "E08"]}],
+        "cross_episode_links": [],
+    }
+    finalizer_resp = {
+        "outputs": [
+            {
+                "output_id": "out_resumed",
+                "title": "Full Season Story",
+                "candidate_scope": "SEASON_ARC",
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "source_clips": [{"episode_id": "E01", "source_video": episodes[0].source_video, "start": 0.0, "end": 10.0}],
+                        "narration": "Resumed narration.",
+                        "audio_policy": "mute",
+                    }
+                ],
+            }
+        ]
+    }
+
+    client2 = MockAIClient([b3_success, merge_resp, finalizer_resp])
+    engine2 = AnalysisEngine(settings=settings, client=client2, cache_manager=cache_mgr)
+
+    manifest = engine2.analyze(
+        project_id="proj_resume",
+        episodes=episodes,
+        scope=AnalysisScope.SEASON,
+        use_final_plan_cache=False,
+    )
+
+    # Verify on run 2:
+    # 0 scanner calls (all 10 hit evidence cache)
+    scanner_calls_2 = [c for c in client2.call_history if "evidence scanner" in c["system"].lower()]
+    assert len(scanner_calls_2) == 0
+
+    # Only Batch 3 was called (Batches 1 & 2 hit cache)
+    batch_calls_2 = [c for c in client2.call_history if "batch connection analyst" in c["system"].lower()]
+    assert len(batch_calls_2) == 1
+    assert "batch_E08_E10" in batch_calls_2[0]["user_text"]
+
+    # Merge was called once
+    merge_calls_2 = [c for c in client2.call_history if "cross-batch merge synthesizer" in c["system"].lower()]
+    assert len(merge_calls_2) == 1
+
+    assert len(manifest.outputs) == 1
+    manifest.validate()
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Finalizer Fail then Retry Reuses Connection Cache
+# ---------------------------------------------------------------------------
+
+def test_finalizer_fail_then_retry_connection_cache_hit_no_connection_calls(tmp_path: Path) -> None:
+    """When finalizer fails on first run, retry reuses full connection cache without making connection calls."""
+    episodes = [make_dummy_episode("E01", duration=100.0, tmp_path=tmp_path), make_dummy_episode("E02", duration=100.0, tmp_path=tmp_path)]
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
+    settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
+
+    # Run 1: Scanner succeeds, Connection succeeds, Finalizer fails
+    scanner_resps = [{cat: [] for cat in EVIDENCE_CATEGORIES}, {cat: [] for cat in EVIDENCE_CATEGORIES}]
+    conn_resp = {
+        "candidate_proposals": [
+            {"proposal_id": "prop_1", "title": "Duo Journey", "episodes": ["E01", "E02"], "candidate_scope": "CROSS_EPISODE"}
+        ],
+        "cross_episode_links": [],
+    }
+    finalizer_fail = APIError("Simulated finalizer 503 error")
+
+    client1 = MockAIClient(scanner_resps + [conn_resp, finalizer_fail])
+    engine1 = AnalysisEngine(settings=settings, client=client1, cache_manager=cache_mgr)
+
+    with pytest.raises(AnalysisError, match="Finalizer"):
+        engine1.analyze(
+            project_id="proj_fin_retry",
+            episodes=episodes,
+            scope=AnalysisScope.SEASON,
+            use_final_plan_cache=False,
+        )
+
+    # Run 2: Finalizer succeeds
+    finalizer_success = {
+        "outputs": [
+            {
+                "output_id": "out_01",
+                "title": "Duo Journey",
+                "candidate_scope": "CROSS_EPISODE",
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "source_clips": [{"episode_id": "E01", "source_video": episodes[0].source_video, "start": 0.0, "end": 10.0}],
+                        "narration": "Narration.",
+                        "audio_policy": "mute",
+                    }
+                ],
+            }
+        ]
+    }
+    client2 = MockAIClient([finalizer_success])
+    engine2 = AnalysisEngine(settings=settings, client=client2, cache_manager=cache_mgr)
+
+    manifest = engine2.analyze(
+        project_id="proj_fin_retry",
+        episodes=episodes,
+        scope=AnalysisScope.SEASON,
+        use_final_plan_cache=False,
+    )
+
+    # Verify run 2:
+    # 0 scanner calls
+    scanner_calls = [c for c in client2.call_history if "evidence scanner" in c["system"].lower()]
+    assert len(scanner_calls) == 0
+
+    # 0 connection calls (connection cache hit!)
+    conn_calls = [c for c in client2.call_history if "season narrative architect" in c["system"].lower()]
+    assert len(conn_calls) == 0
+
+    # Exactly 1 finalizer call
+    fin_calls = [c for c in client2.call_history if "lead editor" in c["system"].lower()]
+    assert len(fin_calls) == 1
+
+    assert len(manifest.outputs) == 1
+    manifest.validate()
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Hierarchy Cache Root Derived from Injected Cache Parent
+# ---------------------------------------------------------------------------
+
+def test_hierarchy_cache_root_derived_from_injected_cache_parent(tmp_path: Path) -> None:
+    """Hierarchy cache root and plan cache dir must be derived from injected evidence cache parent."""
+    custom_root = tmp_path / "custom_isolation"
+    ev_cache_dir = custom_root / "evidence_store"
+    cache_mgr = EvidenceCacheManager(cache_dir=ev_cache_dir)
+
+    engine = AnalysisEngine(cache_manager=cache_mgr)
+
+    expected_hierarchy = custom_root / "season_hierarchy"
+    expected_plan = custom_root / "analysis_plans"
+
+    assert engine.hierarchy_cache.base_dir == expected_hierarchy
+    assert engine.plan_cache_dir == expected_plan
+    assert engine.hierarchy_cache.summary_dir == expected_hierarchy / "summaries"
+    assert engine.hierarchy_cache.batch_dir == expected_hierarchy / "batches"
+    assert engine.hierarchy_cache.merge_dir == expected_hierarchy / "merges"
+    assert engine.hierarchy_cache.connection_dir == expected_hierarchy / "connections"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Validate AI Batch Responses Schema Before Cache
+# ---------------------------------------------------------------------------
+
+def test_validate_ai_batch_responses_schema_before_cache_malformed_no_cache(tmp_path: Path) -> None:
+    """Malformed AI responses raise AnalysisError and are strictly never written to hierarchy cache."""
+    # Test validate_batch_response_schema unit behaviors
+    with pytest.raises(AnalysisError, match="phải là một dictionary"):
+        validate_batch_response_schema("not a dict")
+
+    with pytest.raises(AnalysisError, match="phải là kiểu list"):
+        validate_batch_response_schema({"candidate_proposals": "not a list"})
+
+    with pytest.raises(AnalysisError, match="phải là dict"):
+        validate_batch_response_schema({"candidate_proposals": ["not a dict item"]})
+
+    with pytest.raises(AnalysisError, match="thiếu các trường danh sách liên kết bắt buộc"):
+        validate_batch_response_schema({"irrelevant_field": 123})
+
+    # Test integration: malformed batch is NOT cached
+    h_cache = HierarchyCacheManager(tmp_path / "hierarchy")
+    episodes = [make_dummy_episode("E01", duration=60.0, tmp_path=tmp_path)]
+    evidence_map = {
+        "E01": EpisodeEvidence(
+            episode_id="E01",
+            source_video=episodes[0].source_video,
+            duration_seconds=60.0,
+            coverage={"ratio": 1.0},
+        )
+    }
+
+    client = MockAIClient([{"candidate_proposals": "invalid_string_not_list"}])
+    connector = SeasonConnector(
+        settings=AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234"),
+        client=client,
+        hierarchy_cache=h_cache,
+    )
+
+    with pytest.raises(AnalysisError, match="phải là kiểu list"):
+        connector.connect_season(episodes, evidence_map)
+
+    # Verify no batch cache file was created
+    batch_files = list(h_cache.batch_dir.glob("*.json"))
+    assert len(batch_files) == 0
+    conn_files = list(h_cache.connection_dir.glob("*.json"))
+    assert len(conn_files) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Payload Size Protection and Pre-Serialization Reduction (10 eps)
+# ---------------------------------------------------------------------------
+
+def test_payload_size_protection_and_pre_serialization_reduction_10_episodes(tmp_path: Path) -> None:
+    """Payload size protection triggers on oversized text, and 10-episode batch requests contain <=4 summary IDs."""
+    # 1. Payload size check raises AnalysisError
+    with pytest.raises(AnalysisError, match="exceeds max allowed limit"):
+        check_payload_size("x" * 1000, max_bytes=500, context="test_overflow")
+
+    # 2. 10 episodes analyzed in season mode
+    episodes = [make_dummy_episode(f"E{i:02d}", duration=100.0, tmp_path=tmp_path) for i in range(1, 11)]
+    cache_mgr = EvidenceCacheManager(tmp_path / "cache")
+
+    scanner_resps = [{cat: [] for cat in EVIDENCE_CATEGORIES} for _ in range(10)]
+    batch_resps = [
+        {"candidate_proposals": [{"proposal_id": f"p_{i}", "title": f"Batch {i}", "episodes": [f"E{i:02d}"]}]}
+        for i in range(1, 4)
+    ]
+    merge_resp = {
+        "candidate_proposals": [{"proposal_id": "p_merge", "title": "Full Story", "episodes": ["E01", "E10"]}],
+        "cross_episode_links": [],
+    }
+    finalizer_resp = {
+        "outputs": [
+            {
+                "output_id": "out_01",
+                "title": "Full Story",
+                "candidate_scope": "SEASON_ARC",
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "source_clips": [{"episode_id": "E01", "source_video": episodes[0].source_video, "start": 0.0, "end": 10.0}],
+                        "narration": "Full season recap narration.",
+                        "audio_policy": "mute",
+                    }
+                ],
+            }
+        ]
+    }
+
+    client = MockAIClient(scanner_resps + batch_resps + [merge_resp, finalizer_resp])
+    settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
+
+    manifest = run_analysis(
+        project_id="proj_10_episodes",
+        episodes=episodes,
+        scope=AnalysisScope.SEASON,
+        settings=settings,
+        client=client,
+        cache_manager=cache_mgr,
+    )
+
+    batch_calls = [c for c in client.call_history if "batch connection analyst" in c["system"].lower()]
+    assert len(batch_calls) == 3
+
+    for call in batch_calls:
+        text = call["user_text"]
+        assert len(text.encode("utf-8")) <= 500_000
+        # Must not contain raw evidence categories or transcripts
+        assert "evidence_categories" not in text
+        # Must have at most 4 episode summaries per batch
+        ep_count = text.count('"episode_id"')
+        assert 1 <= ep_count <= 4
+
+    manifest.validate()
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Partition Season Batches N=1 to 24
+# ---------------------------------------------------------------------------
+
+def test_partition_season_batches_n1_to_24() -> None:
+    """Deterministic partition of N=1 to 24 episodes preserves all items with sizes <= 4 and 3-4 for N>=6."""
+    for n in range(1, 25):
+        items = [f"E{i:02d}" for i in range(1, n + 1)]
+        batches = partition_season_batches(items)
+
+        # 1. Total items preserved
+        total_items = sum(len(b[1]) for b in batches)
+        assert total_items == n, f"Failed item preservation for N={n}"
+
+        # 2. Every batch size <= 4
+        for bid, bitems in batches:
+            assert 1 <= len(bitems) <= 4, f"Batch size violation {len(bitems)} for N={n}"
+            assert bid.startswith("batch_")
+
+        # 3. For N >= 6, every batch has size 3 or 4
+        if n >= 6:
+            for bid, bitems in batches:
+                assert len(bitems) in (3, 4), f"N={n} produced invalid batch size {len(bitems)} in {bid}"
+
+        # 4. Batch IDs are unique
+        bids = [b[0] for b in batches]
+        assert len(bids) == len(set(bids)), f"Duplicate batch ID for N={n}: {bids}"
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Cache Keys and Disk Payloads Strictly Exclude Secrets
+# ---------------------------------------------------------------------------
+
+def test_cache_keys_and_payloads_strictly_exclude_secrets(tmp_path: Path) -> None:
+    """All cache key computations and disk payloads strictly exclude API keys, tokens, or credentials."""
+    secret_token = "sk-proj-super-secret-key-12345"
+
+    k_ev = compute_cache_key("E01", "C:/video.mp4", "v1", 100, 1.0)
+    k_sum = compute_summary_cache_key("E01", "abc123hash")
+    k_batch = compute_batch_cache_key("b1", ["h1", "h2"], "model-x", "auto", "prompt")
+    k_merge = compute_merge_cache_key("m1", ["b1", "b2"], "model-x", "auto", "prompt")
+    k_conn = compute_connection_cache_key(["h1", "h2"], "model-x", "auto", "prompt")
+
+    ev_map = {
+        "E01": EpisodeEvidence(episode_id="E01", source_video="C:/video.mp4", duration_seconds=60.0)
+    }
+    settings = AppSettings(api_key=secret_token, api_endpoint="http://secret-endpoint/v1")
+    k_plan = compute_final_plan_cache_key(ev_map, settings, "SEASON")
+
+    for k in (k_ev, k_sum, k_batch, k_merge, k_conn, k_plan):
+        assert isinstance(k, str)
+        assert secret_token not in k
+        assert "secret" not in k
+
+    # Verify saved cache files do not contain secrets
+    h_cache = HierarchyCacheManager(tmp_path / "hierarchy")
+    b_path = h_cache.save_batch_result("b1", k_batch, {"candidate_proposals": []})
+    m_path = h_cache.save_merge_result("m1", k_merge, {"candidate_proposals": []})
+    c_path = h_cache.save_connection_result(k_conn, {"candidate_proposals": []})
+
+    for path in (b_path, m_path, c_path):
+        content = path.read_text(encoding="utf-8")
+        assert secret_token not in content
+        assert "api_key" not in content

@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from .analyzer.prompts import get_default_recap_prompt
-from .api_client import OpenAICompatibleClient
+from .api_client import API_TEST_TIMEOUT, OpenAICompatibleClient
 from .gpu import EncoderStatus, detect_gpu_encoder, get_acceleration_plan
 from .notifications import DesktopNotification, NotificationBanner, show_desktop_notification
 from .paths import default_data_directory, set_window_icon
@@ -423,32 +423,92 @@ class ToolRecapV2App(tk.Tk):
             for ep in p.source_episodes:
                 row_id = f"{p.id}_{ep.episode_id}"
                 v_name = Path(ep.source_video).name if ep.source_video else "—"
-                stage_val = "Hoàn thành" if p.status == "COMPLETED" else ("Lỗi" if p.status == "ERROR" else "Sẵn sàng")
-                prog_val = f"{p.progress}%" if p.status in {"COMPLETED", "RUNNING"} else "0%"
-                stat_val = p.current_message if p.status in {"COMPLETED", "ERROR", "RUNNING"} else "Sẵn sàng"
+                if ep.status in {"COMPLETED", "CACHED", "EVIDENCE_COMPLETE"}:
+                    stage_val = "Evidence Complete"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = "Đã có trong bộ nhớ đệm" if ep.cached or ep.status == "CACHED" else (ep.current_message or "Hoàn tất")
+                elif ep.status == "ERROR":
+                    stage_val = "Lỗi"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.error or "Lỗi"
+                elif ep.status == "RUNNING":
+                    stage_val = ep.stage or "Đang xử lý"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or "Đang xử lý"
+                elif ep.status == "PAUSED":
+                    stage_val = ep.stage or "Đã dừng"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or "Đã dừng"
+                else:
+                    stage_val = ep.stage or "Sẵn sàng"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or "Sẵn sàng"
+
                 self.tree.insert(
                     "",
                     "end",
                     iid=row_id,
                     values=(ep.episode_id, v_name, stage_val, prog_val, stat_val),
                 )
-            if p.analysis_scope == "SEASON" and p.phase in {"SEASON_BARRIER", "SEASON_CONNECTING", "SEASON_MINING"}:
+
+            if p.analysis_scope == "SEASON":
                 row_id = f"{p.id}_season"
+                s_stat = p.season_status or "WAITING"
+                if s_stat == "ERROR":
+                    s_stage = "Lỗi"
+                    s_prog = f"{p.season_progress}%"
+                    s_msg = p.season_error or p.current_message or "Lỗi"
+                elif s_stat == "COMPLETED":
+                    s_stage = "Hoàn thành"
+                    s_prog = "100%"
+                    s_msg = "Hoàn tất"
+                elif s_stat == "RUNNING":
+                    s_stage = p.season_stage or "Season Analysis"
+                    s_prog = f"{p.season_progress}%"
+                    s_msg = p.current_message or "Đang phân tích mùa phim"
+                elif s_stat == "PAUSED":
+                    s_stage = p.season_stage or "Đã dừng"
+                    s_prog = f"{p.season_progress}%"
+                    s_msg = "Đã dừng"
+                else:
+                    s_stage = p.season_stage or "Sẵn sàng"
+                    s_prog = f"{p.season_progress}%"
+                    s_msg = "Sẵn sàng"
+
                 self.tree.insert(
                     "",
                     "end",
                     iid=row_id,
-                    values=("Season", "Toàn bộ mùa phim", "Season Analysis", f"{p.progress}%", p.current_message),
+                    values=("Season", "Toàn bộ mùa phim", s_stage, s_prog, s_msg),
                 )
+
             if p.outputs:
                 for idx, out in enumerate(p.outputs, start=1):
                     row_id = f"{p.id}_output_{idx}"
                     out_name = Path(out.publication_video_path).name if getattr(out, "publication_video_path", None) else "—"
+                    out_st = getattr(out, "status", None)
+                    if out_st == "ERROR":
+                        out_stage = "Lỗi"
+                        out_prog = "0%"
+                        out_stat = getattr(out, "error", None) or "Lỗi kết xuất"
+                    elif out_st == "COMPLETED" or p.status == "COMPLETED":
+                        out_stage = "Hoàn thành"
+                        out_prog = "100%"
+                        out_stat = "Hoàn tất"
+                    elif out_st == "RUNNING" or p.status == "RUNNING":
+                        out_stage = "Rendering"
+                        out_prog = f"{p.progress}%"
+                        out_stat = out.title
+                    else:
+                        out_stage = "Sẵn sàng"
+                        out_prog = "0%"
+                        out_stat = out.title
+
                     self.tree.insert(
                         "",
                         "end",
                         iid=row_id,
-                        values=(f"Output {idx}", out_name, "Rendering" if p.status == "RUNNING" else "Hoàn thành", "100%" if p.status == "COMPLETED" else "0%", out.title),
+                        values=(f"Output {idx}", out_name, out_stage, out_prog, out_stat),
                     )
 
     # -------------------------------------------------------------------------
@@ -462,46 +522,118 @@ class ToolRecapV2App(tk.Tk):
         msg = record.current_message or ""
         phase = record.phase or ""
 
-        # Update matching source episode row
-        matched_ep = None
+        # Update source episode rows
         for ep in record.source_episodes:
-            if ep.episode_id in msg or (phase in {"MEDIA_PROBE", "SUBTITLES", "SCANNER"} and ep.episode_id in msg):
-                matched_ep = ep
-                break
-
-        if matched_ep:
-            row_id = f"{record.id}_{matched_ep.episode_id}"
+            row_id = f"{record.id}_{ep.episode_id}"
             if self.tree.exists(row_id):
-                if "Media/Subtitles" in msg or phase in {"MEDIA_PROBE", "SUBTITLES"}:
-                    stage_name = "Media/Subtitles"
-                elif "Scanner" in msg or phase == "SCANNER":
-                    stage_name = "Scanner"
+                if ep.status in {"COMPLETED", "CACHED", "EVIDENCE_COMPLETE"}:
+                    stage_name = "Evidence Complete"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = "Đã có trong bộ nhớ đệm" if ep.cached or ep.status == "CACHED" else (ep.current_message or "Hoàn tất")
+                elif ep.status == "ERROR":
+                    stage_name = "Lỗi"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.error or "Lỗi"
+                elif ep.episode_id in msg or (phase in {"MEDIA_PROBE", "SUBTITLES", "SCANNER", "media_probe", "subtitles", "scanner"} and ep.episode_id in msg):
+                    if "Media/Subtitles" in msg or phase in {"MEDIA_PROBE", "SUBTITLES", "media_probe", "subtitles"}:
+                        stage_name = "Media/Subtitles"
+                    elif "Scanner" in msg or phase in {"SCANNER", "scanner"}:
+                        stage_name = "Scanner"
+                    else:
+                        stage_name = ep.stage or phase
+                    prog_val = f"{ep.progress}%" if ep.progress > 0 else f"{record.progress}%"
+                    stat_val = msg
+                elif ep.status == "RUNNING":
+                    stage_name = ep.stage or "Đang xử lý"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or msg
+                elif ep.status == "PAUSED":
+                    stage_name = ep.stage or "Đã dừng"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or "Đã dừng"
                 else:
-                    stage_name = phase
-                self.tree.set(row_id, "stage", stage_name)
-                self.tree.set(row_id, "progress", f"{record.progress}%")
-                self.tree.set(row_id, "status", msg)
+                    stage_name = ep.stage or "Sẵn sàng"
+                    prog_val = f"{ep.progress}%"
+                    stat_val = ep.current_message or "Sẵn sàng"
 
-        # Dynamic season connection/mining row
-        if record.analysis_scope == "SEASON" and (
-            phase in {"SEASON_BARRIER", "SEASON_CONNECTING", "SEASON_MINING"}
-            or "Season Analysis" in msg
-        ):
+                self.tree.set(row_id, "stage", stage_name)
+                self.tree.set(row_id, "progress", prog_val)
+                self.tree.set(row_id, "status", stat_val)
+
+        # Dynamic season connection/mining row (always present for SEASON)
+        if record.analysis_scope == "SEASON":
             season_row_id = f"{record.id}_season"
+            s_stat = record.season_status or "WAITING"
+            if s_stat == "ERROR" or (record.error_scope == "SEASON" and record.status == "ERROR"):
+                s_stage = "Lỗi"
+                s_prog = f"{record.season_progress}%"
+                s_msg = record.season_error or record.error or msg or "Lỗi"
+            elif s_stat == "COMPLETED":
+                s_stage = "Hoàn thành"
+                s_prog = "100%"
+                s_msg = "Hoàn tất"
+            elif s_stat == "RUNNING" or phase in {"SEASON_BARRIER", "SEASON_CONNECTING", "SEASON_MINING", "SEASON_BATCH", "SEASON_MERGING", "EPISODE_SUMMARIZING", "season_barrier", "season_connecting", "season_mining", "season_batch", "season_merging", "episode_summarizing"} or "Season Analysis" in msg:
+                s_stage = record.season_stage if record.season_stage != "Sẵn sàng" else "Season Analysis"
+                s_prog = f"{record.progress}%"
+                s_msg = msg
+            elif s_stat == "PAUSED":
+                s_stage = record.season_stage or "Đã dừng"
+                s_prog = f"{record.season_progress}%"
+                s_msg = "Đã dừng"
+            else:
+                s_stage = record.season_stage or "Sẵn sàng"
+                s_prog = f"{record.season_progress}%"
+                s_msg = "Sẵn sàng"
+
             if not self.tree.exists(season_row_id):
                 self.tree.insert(
                     "",
                     "end",
                     iid=season_row_id,
-                    values=("Season", "Toàn bộ mùa phim", "Season Analysis", f"{record.progress}%", msg),
+                    values=("Season", "Toàn bộ mùa phim", s_stage, s_prog, s_msg),
                 )
             else:
-                self.tree.set(season_row_id, "stage", "Season Analysis")
-                self.tree.set(season_row_id, "progress", f"{record.progress}%")
-                self.tree.set(season_row_id, "status", msg)
+                self.tree.set(season_row_id, "stage", s_stage)
+                self.tree.set(season_row_id, "progress", s_prog)
+                self.tree.set(season_row_id, "status", s_msg)
 
         # Dynamic output rendering rows
-        if "Output" in msg and "Rendering" in msg:
+        if record.outputs:
+            for idx, out in enumerate(record.outputs, start=1):
+                out_row_id = f"{record.id}_output_{idx}"
+                out_name = Path(out.publication_video_path).name if getattr(out, "publication_video_path", None) else "—"
+                out_st = getattr(out, "status", None)
+                if out_st == "ERROR" or (record.error_scope == "OUTPUT" and record.error_target == out.output_id):
+                    out_stage = "Lỗi"
+                    out_prog = "0%"
+                    out_stat = getattr(out, "error", None) or record.error or "Lỗi kết xuất"
+                elif out_st == "COMPLETED" or record.status == "COMPLETED":
+                    out_stage = "Hoàn thành"
+                    out_prog = "100%"
+                    out_stat = "Hoàn tất"
+                elif out_st == "RUNNING" or ("Output" in msg and "Rendering" in msg):
+                    out_stage = "Rendering"
+                    out_prog = f"{record.progress}%"
+                    out_stat = msg if ("Output" in msg and "Rendering" in msg) else out.title
+                else:
+                    out_stage = "Sẵn sàng"
+                    out_prog = "0%"
+                    out_stat = out.title
+
+                if not self.tree.exists(out_row_id):
+                    self.tree.insert(
+                        "",
+                        "end",
+                        iid=out_row_id,
+                        values=(f"Output {idx}", out_name, out_stage, out_prog, out_stat),
+                    )
+                else:
+                    if out_name != "—":
+                        self.tree.set(out_row_id, "source_video", out_name)
+                    self.tree.set(out_row_id, "stage", out_stage)
+                    self.tree.set(out_row_id, "progress", out_prog)
+                    self.tree.set(out_row_id, "status", out_stat)
+        elif "Output" in msg and "Rendering" in msg:
             m = re.search(r"Output\s+(\d+)\s+Rendering", msg)
             out_idx = int(m.group(1)) if m else 1
             out_row_id = f"{record.id}_output_{out_idx}"
@@ -517,35 +649,14 @@ class ToolRecapV2App(tk.Tk):
                 self.tree.set(out_row_id, "progress", f"{record.progress}%")
                 self.tree.set(out_row_id, "status", msg)
 
-        # Handle completion or error
-        if record.status == "COMPLETED":
-            if not record.outputs:
-                for ep in record.source_episodes:
-                    row_id = f"{record.id}_{ep.episode_id}"
-                    if self.tree.exists(row_id):
-                        self.tree.set(row_id, "stage", "Hoàn thành")
-                        self.tree.set(row_id, "progress", "100%")
-                        self.tree.set(row_id, "status", "0 output (không có ứng viên phù hợp)")
-            else:
-                for idx, out in enumerate(record.outputs, start=1):
-                    out_row_id = f"{record.id}_output_{idx}"
-                    if self.tree.exists(out_row_id):
-                        out_name = Path(out.publication_video_path).name if getattr(out, "publication_video_path", None) else "—"
-                        self.tree.set(out_row_id, "source_video", out_name)
-                        self.tree.set(out_row_id, "stage", "Hoàn thành")
-                        self.tree.set(out_row_id, "progress", "100%")
-                        self.tree.set(out_row_id, "status", "Hoàn tất")
-                for ep in record.source_episodes:
-                    row_id = f"{record.id}_{ep.episode_id}"
-                    if self.tree.exists(row_id):
-                        self.tree.set(row_id, "stage", "Hoàn thành")
-                        self.tree.set(row_id, "progress", "100%")
-        elif record.status == "ERROR":
+        # Zero outputs completion special case
+        if record.status == "COMPLETED" and not record.outputs:
             for ep in record.source_episodes:
                 row_id = f"{record.id}_{ep.episode_id}"
                 if self.tree.exists(row_id):
-                    self.tree.set(row_id, "stage", "Lỗi")
-                    self.tree.set(row_id, "status", record.error or msg)
+                    self.tree.set(row_id, "stage", "Hoàn thành")
+                    self.tree.set(row_id, "progress", "100%")
+                    self.tree.set(row_id, "status", "0 output (không có ứng viên phù hợp)")
 
         self.status_var.set(f"{record.name}: {msg}")
         self.progress_var.set(float(record.progress))
@@ -571,7 +682,13 @@ class ToolRecapV2App(tk.Tk):
         safe_after(self, 0, self._apply_batch_completed, completed, total)
 
     def _apply_batch_completed(self, completed: int, total: int) -> None:
-        self.progress_var.set(100.0)
+        if completed == total and total > 0:
+            self.progress_var.set(100.0)
+        elif getattr(self, "projects", None):
+            agg_prog = sum(p.progress for p in self.projects) / len(self.projects)
+            self.progress_var.set(float(agg_prog))
+        else:
+            self.progress_var.set(0.0)
 
         def _cleanup_notification() -> None:
             self._active_desktop_notification = None
@@ -1441,7 +1558,14 @@ class SettingsDialog(tk.Toplevel):
             import time
             started = time.monotonic()
             try:
-                result = OpenAICompatibleClient(endpoint, key, timeout=30).test(model, thinking)
+                def _status_cb(msg: str) -> None:
+                    result_queue.put(f"{label} — {msg}")
+
+                client = OpenAICompatibleClient(endpoint, key, timeout=API_TEST_TIMEOUT)
+                try:
+                    result = client.test(model, thinking, on_status=_status_cb)
+                except TypeError:
+                    result = client.test(model, thinking)
                 elapsed = time.monotonic() - started
                 result_queue.put(f"{label} hoạt động — {model} / {thinking} — {elapsed:.1f}s — {result}")
             except Exception as exc:

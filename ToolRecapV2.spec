@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 repo = Path(SPECPATH)
 
@@ -83,7 +83,9 @@ a = Analysis(
         "toolrecap_v2.voice.manager",
         "toolrecap_v2.voice.omnivoice_adapter",
         "toolrecap_v2.voice.voice_updater",
-    ],
+    ]
+    + collect_submodules("toolrecap_v2.analyzer")
+    + collect_submodules("toolrecap_v2.domain"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

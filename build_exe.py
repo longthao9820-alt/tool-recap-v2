@@ -160,7 +160,7 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.0)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.1)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
@@ -203,8 +203,23 @@ def build_portable_package() -> int:
    - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU
      (NVENC/AMF/QSV), nhúng phụ đề (Burn subtitles), thư mục xuất và kiểm tra subsystem.
    * Chú ý: Không có tab STT riêng biệt; STT hoạt động ngầm (internal) hoàn toàn tự động.
+   * Chú ý: Các thông số kỹ thuật nội bộ (phase timeouts, số lần thử retry, batching)
+     được tối ưu ngầm tự động, không để lộ ra bảng cài đặt nhằm giữ giao diện tinh gọn.
 
-5. PHỤ ĐỀ PGS / VOBSUB / RAPIDOCR / AI VISION & INTERNAL STT:
+5. ĐỘ TIN CẬY AI GATEWAY (AI RELIABILITY):
+   - Phase timeouts nội bộ: Mỗi giai đoạn (scanner, season connecting, season mining,
+     finalizer) đều có thời hạn chờ nội bộ được cân chỉnh tối ưu, không cần tinh chỉnh thủ công.
+   - Tối đa 3 lần thử: Tự động thử lại khi timeout, mất kết nối, HTTP 429 hoặc lỗi máy chủ
+     tạm thời; khoảng chờ 5 và 15 giây có thể bị ngắt ngay bằng nút Stop.
+   - Phân tích mùa theo lô 3-4 tập: Mỗi request chỉ nhận compact summaries của một lô;
+     kết quả được hợp nhất phân cấp để tìm cốt truyện xuyên suốt mùa.
+   - Tóm tắt cô đọng & Bộ nhớ đệm (Compact summaries/caches/resume): Tạo bản tóm tắt
+     ngắn gọn, lưu kết quả theo mã băm video và hỗ trợ tiếp tục (resume) xử lý ngay
+     giai đoạn dang dở mà không tốn công chạy lại từ đầu.
+   - Phân định tiến trình & lỗi rõ ràng (Progress/error ownership): Hiển thị chính xác
+     tập phim nào gặp lỗi và lỗi tại giai đoạn nào mà không ảnh hưởng đến các tập khác.
+
+6. PHỤ ĐỀ PGS / VOBSUB / RAPIDOCR / AI VISION & INTERNAL STT:
    - Ưu tiên chọn luồng âm thanh và phụ đề tiếng Anh trong video hoặc sidecar ngoài.
    - Phụ đề đồ họa Blu-ray (PGS) và DVD (VobSub) được nhận dạng chữ tự động qua RapidOCR ONNX.
    - Chỉ khi bật checkbox "Scanner model supports image/Vision input" trong Cài đặt,
@@ -212,31 +227,37 @@ def build_portable_package() -> int:
    - Nếu không có phụ đề hoặc nhận dạng lỗi, hệ thống tự động fallback sang STT nội bộ
      (faster-whisper CPU) hoặc OpenAI Whisper API.
 
-6. 12 GIỌNG THIẾT KẾ & TẢI MÔ HÌNH LẦN ĐẦU:
+7. 12 GIỌNG THIẾT KẾ & TẢI MÔ HÌNH LẦN ĐẦU:
    - Danh mục 12 giọng đọc tiếng Anh chính thức từ VoiceStudio/OmniVoice (6 en-US, 6 en-GB).
    - Lần đầu sử dụng cần kết nối Internet để tải môi trường runtime Python độc lập và
      mô hình OmniVoice dung lượng lớn (~vài GB) vào bộ nhớ đệm %LOCALAPPDATA%\ToolRecapV2.
    - Sau khi tải, hệ thống hoạt động hoàn toàn offline. Luôn có Piper TTS nội bộ sẵn sàng.
 
-7. ĐẦU RA CHÍNH XÁC 3 TỆP (OUTPUTS EXACT THREE):
+8. ĐẦU RA CHÍNH XÁC 3 TỆP (OUTPUTS EXACT THREE):
    Mỗi phân đoạn video recap được xuất vào thư mục riêng với ĐÚNG 3 tệp thành phẩm:
    1. {safe_title}.mp4: Video recap hoàn chỉnh chất lượng cao.
    2. {safe_title}.original.srt: Phụ đề các đoạn thoại gốc giữ lại trong video.
    3. {safe_title}.narration.srt: Phụ đề lời dẫn thuyết minh AI chuẩn xác.
    Tuyệt đối sạch sẽ, không có tệp tạm hay tệp rác.
 
-8. DỪNG AN TOÀN (STOP / CANCELLATION):
+9. DỪNG AN TOÀN (STOP / CANCELLATION):
    - Nhấn "⏹ Stop" bất kỳ lúc nào để dừng xử lý ngay lập tức.
-   - Hệ thống đóng sạch cây tiến trình con FFmpeg, mở khóa lại giao diện và đánh dấu CANCELLED.
+   - Hệ thống ngắt chu kỳ chờ thử lại (backoff delay), hủy các giai đoạn kế tiếp,
+     đóng sạch cây tiến trình con FFmpeg, mở khóa lại giao diện và đánh dấu CANCELLED.
+   - Giới hạn kỹ thuật chính xác: Yêu cầu mạng HTTP urlopen đang gửi/nhận dở dang trên
+     socket chỉ có thể kết thúc khi nhận được phản hồi hoặc hết socket timeout; sau đó
+     tiến trình dừng hoàn toàn theo cờ Stop mà không sinh tiến trình mồ côi (orphan).
 
-9. CẬP NHẬT & DỮ LIỆU:
-   - Tự động kiểm tra GitHub Releases chính thức từ longthao9820-alt/tool-recap-v2 kèm SHA256.
-   - Dữ liệu lưu ngoài thư mục ứng dụng tại %LOCALAPPDATA%\ToolRecapV2.
+10. CẬP NHẬT & DỮ LIỆU:
+    - Tự động kiểm tra GitHub Releases chính thức từ longthao9820-alt/tool-recap-v2 kèm SHA256.
+    - Dữ liệu lưu ngoài thư mục ứng dụng tại %LOCALAPPDATA%\ToolRecapV2.
 
-10. GIỚI HẠN:
+11. GIỚI HẠN CỦA HỆ THỐNG:
     - Cần Internet khi tải mô hình/runtime lớn lần đầu.
     - Cần card đồ họa tương thích để tăng tốc GPU (nếu không có sẽ dùng CPU libx264).
     - Chất lượng kịch bản phụ thuộc vào nội dung thoại thực tế của video.
+    - Kết nối HTTP AI Gateway: Yêu cầu urlopen đang in-flight trên socket chỉ kết thúc khi
+      có phản hồi hoặc chạm socket timeout; nút Stop sẽ ngắt các pha kế tiếp và tiến trình kịp thời.
 ========================================================================
 """
     (app_dir / "HUONG_DAN_SU_DUNG.txt").write_text(guide_content, encoding="utf-8")

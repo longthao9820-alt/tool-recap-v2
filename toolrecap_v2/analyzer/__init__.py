@@ -1,7 +1,12 @@
 """Analyzer package providing single and season AI analysis, episode evidence, and candidate mining."""
 from __future__ import annotations
 
-from .connection import CandidateProposal, SeasonConnectionResult, SeasonConnector
+from .connection import (
+    CandidateProposal,
+    SeasonConnectionResult,
+    SeasonConnector,
+    partition_season_batches,
+)
 from .engine import AnalysisEngine, compute_final_plan_cache_key, run_analysis
 from .errors import AnalysisCancelledError, AnalysisError, CoverageIncompleteError
 from .evidence import (
@@ -14,7 +19,9 @@ from .phases import AnalysisPhase, PhaseCallback
 from .prompts import (
     FINALIZER_SYSTEM_PROMPT,
     SCANNER_SYSTEM_PROMPT,
+    SEASON_BATCH_SYSTEM_PROMPT,
     SEASON_CONNECTION_SYSTEM_PROMPT,
+    SEASON_MERGE_SYSTEM_PROMPT,
 )
 
 __all__ = [
@@ -30,10 +37,13 @@ __all__ = [
     "FINALIZER_SYSTEM_PROMPT",
     "PhaseCallback",
     "SCANNER_SYSTEM_PROMPT",
+    "SEASON_BATCH_SYSTEM_PROMPT",
     "SEASON_CONNECTION_SYSTEM_PROMPT",
+    "SEASON_MERGE_SYSTEM_PROMPT",
     "SeasonConnectionResult",
     "SeasonConnector",
     "compute_final_plan_cache_key",
     "compute_scanner_config_version",
+    "partition_season_batches",
     "run_analysis",
 ]

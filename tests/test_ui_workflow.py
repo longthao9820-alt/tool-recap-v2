@@ -145,13 +145,15 @@ def test_file_and_folder_project_scope_direct_only(tk_root: tk.Tk, tmp_path: Pat
         assert season_rec.source_episodes[0].episode_id == "E01"
         assert season_rec.source_episodes[1].episode_id == "E02"
 
-        # Check Treeview rows
+        # Check Treeview rows (2 episodes + 1 season row)
         children = app.tree.get_children()
-        assert len(children) == 2
+        assert len(children) == 3
         vals1 = app.tree.item(children[0])["values"]
         vals2 = app.tree.item(children[1])["values"]
+        vals3 = app.tree.item(children[2])["values"]
         assert vals1[0] == "E01"
         assert vals2[0] == "E02"
+        assert vals3[0] == "Season"
     finally:
         app.destroy()
 

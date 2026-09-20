@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .api_client import APIError, OpenAICompatibleClient
+from .api_client import APIError, FINALIZER_TIMEOUT, OpenAICompatibleClient, SCANNER_TIMEOUT
 from .gpu import bundled_binary
 from .media import probe_media
 from .paths import default_data_directory, get_stt_model_cache_dir
@@ -159,6 +159,7 @@ def _scan_transcript_chunk(
     end_sec: float,
     dialogue: list[tuple[float, float, str]],
     cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if cancel_event and cancel_event.is_set():
         raise NarrationError("Phân tích AI Gateway đã bị dừng.")
@@ -190,6 +191,9 @@ def _scan_transcript_chunk(
             system=SCANNER_SYSTEM,
             user_text=user_text,
             cancel_event=cancel_event,
+            phase="scanner",
+            timeout=SCANNER_TIMEOUT,
+            log=log,
         )
         raw_events = raw_result.get("events")
         if not isinstance(raw_events, list):
@@ -229,6 +233,7 @@ def _finalize_gateway_recap(
     language: str,
     mode: str,
     cancel_event: threading.Event | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> list[RecapSegment]:
     if cancel_event and cancel_event.is_set():
         raise NarrationError("Phân tích AI Gateway đã bị dừng.")
@@ -263,10 +268,13 @@ def _finalize_gateway_recap(
             system=system_prompt,
             user_text=user_text,
             cancel_event=cancel_event,
+            phase="finalizer",
+            timeout=FINALIZER_TIMEOUT,
+            log=log,
         )
     except APIError as exc:
         raise NarrationError(
-            f"Không thể kết nối đến AI Gateway ({settings.api_endpoint}): Finalizer ({settings.finalizer_model}) gặp lỗi: {exc}"
+            f"Không thể kết nối đến AI Gateway ({settings.api_endpoint}): Finalizer ({settings.finalizer_model}) gặp lỗi sau các lần thử: {exc}. Dữ liệu quét transcript đã được lưu an toàn (preserved work)."
         ) from exc
 
     raw_segments = result.get("segments")
@@ -1008,6 +1016,7 @@ def prepare_narration_for_video(
                     end_sec=e_sec,
                     dialogue=dialogue,
                     cancel_event=cancel_event,
+                    log=log,
                 ): idx
                 for idx, (s_sec, e_sec) in enumerate(ranges)
             }
@@ -1043,6 +1052,7 @@ def prepare_narration_for_video(
             language=language,
             mode=mode,
             cancel_event=cancel_event,
+            log=log,
         )
 
         manifest = RecapManifest(

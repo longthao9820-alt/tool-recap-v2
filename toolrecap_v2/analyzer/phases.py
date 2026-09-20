@@ -11,6 +11,10 @@ class AnalysisPhase(str, Enum):
     SCANNER = "scanner"
     SEASON_BARRIER = "season_barrier"
     SEASON_CONNECTING = "season_connecting"
+    EPISODE_SUMMARIZING = "episode_summarizing"
+    BATCH_SUMMARIZING = "episode_summarizing"
+    SEASON_BATCH = "season_batch"
+    SEASON_MERGING = "season_merging"
     SEASON_MINING = "season_mining"
     OUTPUT_PLAN_READY = "output_plan_ready"
 

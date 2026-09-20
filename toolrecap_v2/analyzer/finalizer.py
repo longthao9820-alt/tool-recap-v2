@@ -6,7 +6,7 @@ from pathlib import Path
 import threading
 from typing import Any, Callable
 
-from ..api_client import APIError, OpenAICompatibleClient
+from ..api_client import APIError, FINALIZER_TIMEOUT, OpenAICompatibleClient, _is_cancelled
 from ..domain.enums import AudioPolicy, CandidateScope, OutputStatus
 from ..domain.models import CommentaryOutput, EpisodeEvidence, Segment, SourceClip, SourceEpisode, ValidationError
 from ..domain.title import resolve_unique_titles, sanitize_title
@@ -39,7 +39,7 @@ class CandidateFinalizer:
         legacy_wrapper: bool = False,
     ) -> list[CommentaryOutput]:
         """Finalize commentary outputs for a single episode."""
-        if cancel_event and cancel_event.is_set():
+        if _is_cancelled(cancel_event):
             raise AnalysisCancelledError("Finalizer đã bị hủy.")
 
         if on_phase:
@@ -53,6 +53,9 @@ class CandidateFinalizer:
         )
 
         if is_gateway_enabled and self.client is not None:
+            if _is_cancelled(cancel_event):
+                raise AnalysisCancelledError("Finalizer đã bị hủy.")
+
             user_text = (
                 f"Episode ID: {episode.episode_id}\n"
                 f"Source Video: {episode.source_video}\n"
@@ -65,18 +68,42 @@ class CandidateFinalizer:
                 f"Episode Evidence:\n{json.dumps(evidence.to_dict(), ensure_ascii=False, indent=2)}\n"
             )
 
+            def _status_cb(msg: str) -> None:
+                if on_phase:
+                    on_phase(AnalysisPhase.SEASON_MINING, episode.episode_id, {"status": msg, "status_message": msg})
+
+            call_kwargs: dict[str, Any] = {
+                "model": self.settings.finalizer_model,
+                "thinking": self.settings.finalizer_thinking,
+                "system": FINALIZER_SYSTEM_PROMPT,
+                "user_text": user_text,
+                "cancel_event": cancel_event,
+                "phase": "finalizer",
+                "timeout": FINALIZER_TIMEOUT,
+                "on_status": _status_cb,
+                "log": log,
+            }
             try:
-                raw_result = self.client.chat_json(
-                    model=self.settings.finalizer_model,
-                    thinking=self.settings.finalizer_thinking,
-                    system=FINALIZER_SYSTEM_PROMPT,
-                    user_text=user_text,
-                    cancel_event=cancel_event,
-                )
+                try:
+                    raw_result = self.client.chat_json(**call_kwargs)
+                except TypeError as te:
+                    if "unexpected keyword argument" in str(te):
+                        filtered = {k: v for k, v in call_kwargs.items() if k not in ("phase", "timeout", "on_status", "log")}
+                        raw_result = self.client.chat_json(**filtered)
+                    else:
+                        raise
+            except AnalysisCancelledError:
+                raise
             except APIError as exc:
+                if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
+                    raise AnalysisCancelledError("Finalizer đã bị hủy.") from exc
                 raise AnalysisError(
-                    f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): Finalizer lỗi: {exc}"
+                    f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): Finalizer lỗi sau các lần thử: {exc}. "
+                    f"Dữ liệu evidence của tập {episode.episode_id} đã được lưu an toàn trong bộ nhớ đệm (preserved work)."
                 ) from exc
+
+            if _is_cancelled(cancel_event):
+                raise AnalysisCancelledError("Finalizer đã bị hủy.")
 
             return self.parse_outputs(raw_result, [episode])
         else:
@@ -96,7 +123,7 @@ class CandidateFinalizer:
         legacy_wrapper: bool = False,
     ) -> list[CommentaryOutput]:
         """Finalize commentary outputs for a full season with cross-episode candidates."""
-        if cancel_event and cancel_event.is_set():
+        if _is_cancelled(cancel_event):
             raise AnalysisCancelledError("Finalizer đã bị hủy.")
 
         if on_phase:
@@ -110,6 +137,9 @@ class CandidateFinalizer:
         )
 
         if is_gateway_enabled and self.client is not None:
+            if _is_cancelled(cancel_event):
+                raise AnalysisCancelledError("Finalizer đã bị hủy.")
+
             episodes_summary = [
                 {
                     "episode_id": ep.episode_id,
@@ -141,18 +171,42 @@ class CandidateFinalizer:
                 f"{json.dumps(connection_result.to_dict(), ensure_ascii=False, indent=2)}\n"
             )
 
+            def _status_cb(msg: str) -> None:
+                if on_phase:
+                    on_phase(AnalysisPhase.SEASON_MINING, "season", {"status": msg, "status_message": msg})
+
+            call_kwargs: dict[str, Any] = {
+                "model": self.settings.finalizer_model,
+                "thinking": self.settings.finalizer_thinking,
+                "system": FINALIZER_SYSTEM_PROMPT,
+                "user_text": user_text,
+                "cancel_event": cancel_event,
+                "phase": "finalizer",
+                "timeout": FINALIZER_TIMEOUT,
+                "on_status": _status_cb,
+                "log": log,
+            }
             try:
-                raw_result = self.client.chat_json(
-                    model=self.settings.finalizer_model,
-                    thinking=self.settings.finalizer_thinking,
-                    system=FINALIZER_SYSTEM_PROMPT,
-                    user_text=user_text,
-                    cancel_event=cancel_event,
-                )
+                try:
+                    raw_result = self.client.chat_json(**call_kwargs)
+                except TypeError as te:
+                    if "unexpected keyword argument" in str(te):
+                        filtered = {k: v for k, v in call_kwargs.items() if k not in ("phase", "timeout", "on_status", "log")}
+                        raw_result = self.client.chat_json(**filtered)
+                    else:
+                        raise
+            except AnalysisCancelledError:
+                raise
             except APIError as exc:
+                if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
+                    raise AnalysisCancelledError("Finalizer đã bị hủy.") from exc
                 raise AnalysisError(
-                    f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): Finalizer lỗi: {exc}"
+                    f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): Finalizer lỗi sau các lần thử: {exc}. "
+                    f"Dữ liệu evidence mùa phim đã được lưu an toàn trong bộ nhớ đệm (preserved work)."
                 ) from exc
+
+            if _is_cancelled(cancel_event):
+                raise AnalysisCancelledError("Finalizer đã bị hủy.")
 
             return self.parse_outputs(raw_result, episodes)
         else:

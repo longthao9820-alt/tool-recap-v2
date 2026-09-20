@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
-from ..api_client import APIError, OpenAICompatibleClient
+from ..api_client import APIError, OpenAICompatibleClient, SCANNER_TIMEOUT, _is_cancelled
 from ..domain.cache import EvidenceCacheManager
 from ..domain.models import EpisodeEvidence, SourceEpisode
 from ..media import probe_media
@@ -220,8 +220,22 @@ class EvidenceScanner:
         if is_gateway_enabled and self.client is not None:
             parallelism = max(1, min(4, self.settings.scanner_parallelism))
             chunk_results: list[dict[str, Any] | None] = [None] * len(chunk_ranges)
+            on_chunk_status = (
+                (lambda msg: on_phase(AnalysisPhase.SCANNER, episode.episode_id, {"status": msg, "status_message": msg}))
+                if on_phase
+                else None
+            )
 
-            with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            # Note on in-flight cancellation: In Python urllib.request.urlopen, active socket
+            # read waits up to the phase timeout (SCANNER_TIMEOUT) as standard synchronous sockets
+            # cannot be asynchronously interrupted without closing the underlying descriptor.
+            # However, cancellation between chunks, before chunks, or during retry backoff sleeper
+            # returns promptly. We manage ThreadPoolExecutor explicitly without a 'with' block
+            # context so that shutdown(wait=False, cancel_futures=True) immediately unblocks the
+            # caller rather than joining running threads at context exit.
+            executor = ThreadPoolExecutor(max_workers=parallelism)
+            futures: dict[Any, int] = {}
+            try:
                 futures = {
                     executor.submit(
                         self._scan_single_chunk,
@@ -230,12 +244,14 @@ class EvidenceScanner:
                         end_sec=e_sec,
                         dialogue=cues,
                         cancel_event=cancel_event,
+                        log=log,
+                        on_status=on_chunk_status,
                     ): idx
                     for idx, (s_sec, e_sec) in enumerate(chunk_ranges)
                 }
 
                 for future in as_completed(futures):
-                    if cancel_event and cancel_event.is_set():
+                    if _is_cancelled(cancel_event):
                         for f in futures:
                             f.cancel()
                         executor.shutdown(wait=False, cancel_futures=True)
@@ -250,12 +266,23 @@ class EvidenceScanner:
                         executor.shutdown(wait=False, cancel_futures=True)
                         raise
                     except Exception as exc:
+                        if _is_cancelled(cancel_event):
+                            for f in futures:
+                                f.cancel()
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise AnalysisCancelledError(f"Phân tích tập {episode.episode_id} đã bị hủy.") from exc
                         for f in futures:
                             f.cancel()
                         executor.shutdown(wait=False, cancel_futures=True)
                         raise AnalysisError(
                             f"Scanner lỗi tại tập {episode.episode_id}, đoạn {idx + 1}/{len(chunk_ranges)}: {exc}"
                         ) from exc
+                executor.shutdown(wait=True)
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
             # Aggregate chunk results
             for idx, res in enumerate(chunk_results):
@@ -318,11 +345,13 @@ class EvidenceScanner:
         episode: SourceEpisode,
         start_sec: float,
         end_sec: float,
-        dialogue: list[tuple[float, float, str]],
+        dialogue: list[SubtitleCue] | list[tuple[float, float, str]],
         cancel_event: threading.Event | None = None,
+        log: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Perform AI scanner call for a single chunk of an episode."""
-        if cancel_event and cancel_event.is_set():
+        if _is_cancelled(cancel_event):
             raise AnalysisCancelledError("Phân tích đã bị hủy.")
 
         assert self.client is not None
@@ -347,15 +376,28 @@ class EvidenceScanner:
             f"Timestamped Transcript Excerpt:\n{chunk_transcript}\n"
         )
 
+        call_kwargs: dict[str, Any] = {
+            "model": self.settings.scanner_model,
+            "thinking": self.settings.scanner_thinking,
+            "system": SCANNER_SYSTEM_PROMPT,
+            "user_text": user_text,
+            "cancel_event": cancel_event,
+            "phase": "scanner",
+            "timeout": SCANNER_TIMEOUT,
+            "on_status": on_status,
+            "log": log,
+        }
         try:
-            return self.client.chat_json(
-                model=self.settings.scanner_model,
-                thinking=self.settings.scanner_thinking,
-                system=SCANNER_SYSTEM_PROMPT,
-                user_text=user_text,
-                cancel_event=cancel_event,
-            )
+            try:
+                return self.client.chat_json(**call_kwargs)
+            except TypeError as te:
+                if "unexpected keyword argument" in str(te):
+                    filtered = {k: v for k, v in call_kwargs.items() if k not in ("phase", "timeout", "on_status", "log")}
+                    return self.client.chat_json(**filtered)
+                raise
         except APIError as exc:
+            if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
+                raise AnalysisCancelledError("Scanner đã bị hủy.") from exc
             raise AnalysisError(
                 f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): API Scanner lỗi ({self.settings.scanner_model}): {exc}"
             ) from exc

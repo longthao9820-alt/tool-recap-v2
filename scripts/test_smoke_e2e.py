@@ -112,7 +112,7 @@ He uncovers an unexpected secret that changes everything.
     )
 
     queue.start()
-    for _ in range(60):
+    for _ in range(180):
         if finished or not queue.is_running:
             break
         time.sleep(0.5)
