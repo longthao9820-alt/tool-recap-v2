@@ -85,7 +85,10 @@ a = Analysis(
         "toolrecap_v2.voice.voice_updater",
     ]
     + collect_submodules("toolrecap_v2.analyzer")
-    + collect_submodules("toolrecap_v2.domain"),
+    + collect_submodules("toolrecap_v2.domain")
+    + collect_submodules("toolrecap_v2.subtitles")
+    + collect_submodules("toolrecap_v2.voice")
+    + collect_submodules("toolrecap_v2"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

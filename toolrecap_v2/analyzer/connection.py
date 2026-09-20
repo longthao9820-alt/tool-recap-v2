@@ -7,7 +7,13 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..api_client import APIError, OpenAICompatibleClient, SEASON_CONNECTION_TIMEOUT, _is_cancelled
+from ..api_client import (
+    APIError,
+    OpenAICompatibleClient,
+    SEASON_CONNECTION_TIMEOUT,
+    _is_cancelled,
+    estimate_request_size,
+)
 from ..domain.cache import (
     HierarchyCacheManager,
     compute_batch_cache_key,
@@ -15,12 +21,15 @@ from ..domain.cache import (
     compute_merge_cache_key,
     compute_summary_cache_key,
 )
-from ..domain.enums import CandidateScope
+from ..domain.enums import CandidateScope, CompactionLevel
 from ..domain.models import (
     CompactEpisodeSummary,
+    CompactSummaryItem,
     EpisodeEvidence,
     SourceEpisode,
     build_compact_summary,
+    compact_summary,
+    split_summary_by_timeline,
 )
 from ..settings import AppSettings
 from .errors import AnalysisCancelledError, AnalysisError, CoverageIncompleteError
@@ -31,7 +40,11 @@ from .prompts import (
     SEASON_MERGE_SYSTEM_PROMPT,
 )
 
-MAX_PAYLOAD_BYTES = 500_000
+HARD_PAYLOAD_CEILING = 500_000
+TARGET_PAYLOAD_CEILING = 480_000
+HIERARCHY_ALGO_VERSION = "v3"
+MAX_ITEMS_PER_BATCH_HINT = 4
+MAX_PAYLOAD_BYTES = HARD_PAYLOAD_CEILING
 
 
 def check_payload_size(payload: str, max_bytes: int = MAX_PAYLOAD_BYTES, context: str = "") -> None:
@@ -80,6 +93,542 @@ def validate_batch_response_schema(raw: Any, context: str = "batch") -> None:
         raise AnalysisError(
             f"Phản hồi AI {context} thiếu các trường danh sách liên kết bắt buộc (cross_episode_links/candidate_proposals)."
         )
+
+
+def format_node_id(
+    level: str,
+    span_start: int,
+    span_end: int,
+    content_hash: str,
+    fragment_label: str = "",
+) -> str:
+    """Generic content/order based node ID: node_<level>_<span ordinals>_<hash> without episode names."""
+    short_hash = content_hash[:8] if content_hash else "00000000"
+    if fragment_label:
+        return f"node_{level}_{span_start}_{span_end}_{fragment_label}_{short_hash}"
+    return f"node_{level}_{span_start}_{span_end}_{short_hash}"
+
+
+@dataclass
+class AdaptiveBatchPlanItem:
+    node_id: str
+    span_start: int
+    span_end: int
+    summaries: list[CompactEpisodeSummary]
+    compaction_level: CompactionLevel
+    user_text: str
+    cache_key: str
+    estimated_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "span_start": self.span_start,
+            "span_end": self.span_end,
+            "episode_ids": [s.episode_id for s in self.summaries],
+            "compaction_level": self.compaction_level.value,
+            "estimated_bytes": self.estimated_bytes,
+        }
+
+
+def format_batch_user_text(
+    node_id: str,
+    summaries: list[CompactEpisodeSummary],
+    coverage_notice: str,
+    recap_prompt: str,
+) -> str:
+    batch_payload = {
+        "node_id": node_id,
+        "batch_id": node_id,
+        "episodes": [s.to_dict() for s in summaries],
+    }
+    return (
+        f"Analyze batch connections for {node_id} across {len(summaries)} episodes.\n"
+        f"{coverage_notice}\n"
+        f"Recap instructions:\n{recap_prompt or 'Standard video recap'}\n\n"
+        f"Batch Compact Summaries:\n{json.dumps(batch_payload, ensure_ascii=False, indent=2)}\n"
+    )
+
+
+def estimate_batch_request_size(
+    model: str,
+    user_text: str,
+    thinking: str = "auto",
+    max_tokens: int = 32_000,
+) -> int:
+    return estimate_request_size(
+        model=model,
+        system=SEASON_BATCH_SYSTEM_PROMPT,
+        user_text=user_text,
+        thinking=thinking,
+        max_tokens=max_tokens,
+        variant=0,
+    )
+
+
+def format_merge_user_text(
+    node_id: str,
+    group: list[dict[str, Any]],
+    coverage_notice: str,
+    recap_prompt: str,
+) -> str:
+    merge_payload = {
+        "node_id": node_id,
+        "merge_id": node_id,
+        "batch_results": group,
+    }
+    return (
+        f"Merge and synthesize {len(group)} batch results into unified season connections for {node_id}.\n"
+        f"{coverage_notice}\n"
+        f"Recap instructions:\n{recap_prompt or 'Standard video recap'}\n\n"
+        f"Batch Results:\n{json.dumps(merge_payload, ensure_ascii=False, indent=2)}\n"
+    )
+
+
+def estimate_merge_request_size(
+    model: str,
+    user_text: str,
+    thinking: str = "auto",
+    max_tokens: int = 32_000,
+) -> int:
+    return estimate_request_size(
+        model=model,
+        system=SEASON_MERGE_SYSTEM_PROMPT,
+        user_text=user_text,
+        thinking=thinking,
+        max_tokens=max_tokens,
+        variant=0,
+    )
+
+
+def normalize_and_dedup_merge_result(raw: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically normalize and deduplicate AI result structures."""
+    if not isinstance(raw, dict):
+        return {}
+
+    raw_links: list[dict[str, Any]] = []
+    raw_proposals: list[dict[str, Any]] = []
+    raw_arcs: list[dict[str, Any]] = []
+    raw_rejected: list[dict[str, Any]] = []
+
+    def _collect(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        for key in ("cross_episode_links", "links", "narrative_links"):
+            if key in node and isinstance(node[key], list):
+                raw_links.extend(item for item in node[key] if isinstance(item, dict))
+        for key in ("candidate_proposals", "candidates", "proposals"):
+            if key in node and isinstance(node[key], list):
+                raw_proposals.extend(item for item in node[key] if isinstance(item, dict))
+        for key in ("supporting_character_arcs", "supporting_arcs", "character_arcs"):
+            if key in node and isinstance(node[key], list):
+                raw_arcs.extend(item for item in node[key] if isinstance(item, dict))
+        for key in ("rejected_or_merged", "rejected"):
+            if key in node and isinstance(node[key], list):
+                raw_rejected.extend(item for item in node[key] if isinstance(item, dict))
+        if "batch_results" in node and isinstance(node["batch_results"], list):
+            for sub in node["batch_results"]:
+                _collect(sub)
+
+    _collect(raw)
+
+    seen_pids: set[str] = set()
+    proposals: list[dict[str, Any]] = []
+    for p in raw_proposals:
+        pid = str(p.get("proposal_id", "")).strip()
+        title = str(p.get("title", "")).strip()
+        sig = pid or title.lower()
+        if not sig or sig in seen_pids:
+            continue
+        seen_pids.add(sig)
+        proposals.append(p)
+
+    seen_links: set[str] = set()
+    links: list[dict[str, Any]] = []
+    for l in raw_links:
+        tid = str(l.get("thread_id", "")).strip()
+        theme = str(l.get("theme", "")).strip().lower()
+        eps = "-".join(sorted(str(e) for e in l.get("episodes", [])))
+        sig = tid or f"{theme}:{eps}"
+        if not sig or sig in seen_links:
+            continue
+        seen_links.add(sig)
+        links.append(l)
+
+    seen_chars: set[str] = set()
+    arcs: list[dict[str, Any]] = []
+    for a in raw_arcs:
+        c = str(a.get("character", a.get("name", ""))).strip().lower()
+        if not c or c in seen_chars:
+            continue
+        seen_chars.add(c)
+        arcs.append(a)
+
+    seen_rej: set[str] = set()
+    rejected: list[dict[str, Any]] = []
+    for r in raw_rejected:
+        rid = str(r.get("proposal_id", r.get("thread_id", r.get("title", "")))).strip()
+        sig = rid or json.dumps(r, sort_keys=True)
+        if not sig or sig in seen_rej:
+            continue
+        seen_rej.add(sig)
+        rejected.append(r)
+
+    res: dict[str, Any] = {
+        "cross_episode_links": links,
+        "candidate_proposals": proposals,
+        "supporting_character_arcs": arcs,
+        "rejected_or_merged": rejected,
+    }
+    if "node_id" in raw:
+        res["node_id"] = raw["node_id"]
+    if "batch_id" in raw:
+        res["batch_id"] = raw["batch_id"]
+    return res
+
+
+def compact_merge_result(raw: dict[str, Any], level: CompactionLevel) -> dict[str, Any]:
+    norm = normalize_and_dedup_merge_result(raw)
+    if level == CompactionLevel.FULL:
+        return norm
+
+    props = norm.get("candidate_proposals", [])
+    links = norm.get("cross_episode_links", [])
+    arcs = norm.get("supporting_character_arcs", [])
+    rej = norm.get("rejected_or_merged", [])
+
+    if level == CompactionLevel.TRIMMED:
+        out_props = []
+        for p in props:
+            p_copy = dict(p)
+            if "editorial_reason" in p_copy:
+                p_copy["editorial_reason"] = str(p_copy["editorial_reason"])[:120]
+            if "description" in p_copy:
+                p_copy["description"] = str(p_copy["description"])[:120]
+            out_props.append(p_copy)
+        out_links = []
+        for l in links:
+            l_copy = dict(l)
+            if "summary" in l_copy:
+                l_copy["summary"] = str(l_copy["summary"])[:120]
+            out_links.append(l_copy)
+        out_arcs = []
+        for a in arcs:
+            a_copy = dict(a)
+            if "arc_summary" in a_copy:
+                a_copy["arc_summary"] = str(a_copy["arc_summary"])[:120]
+            out_arcs.append(a_copy)
+        return {
+            "node_id": norm.get("node_id", ""),
+            "batch_id": norm.get("batch_id", ""),
+            "cross_episode_links": out_links,
+            "candidate_proposals": out_props,
+            "supporting_character_arcs": out_arcs,
+            "rejected_or_merged": rej[:10],
+        }
+
+    if level == CompactionLevel.PRIORITY:
+        out_props = []
+        for p in props:
+            p_copy = dict(p)
+            if "editorial_reason" in p_copy:
+                p_copy["editorial_reason"] = str(p_copy["editorial_reason"])[:80]
+            if "description" in p_copy:
+                p_copy["description"] = str(p_copy["description"])[:80]
+            out_props.append(p_copy)
+        out_links = []
+        for l in links:
+            l_copy = dict(l)
+            if "summary" in l_copy:
+                l_copy["summary"] = str(l_copy["summary"])[:80]
+            out_links.append(l_copy)
+        out_arcs = []
+        for a in arcs:
+            a_copy = dict(a)
+            if "arc_summary" in a_copy:
+                a_copy["arc_summary"] = str(a_copy["arc_summary"])[:80]
+            out_arcs.append(a_copy)
+        return {
+            "node_id": norm.get("node_id", ""),
+            "batch_id": norm.get("batch_id", ""),
+            "cross_episode_links": out_links,
+            "candidate_proposals": out_props,
+            "supporting_character_arcs": out_arcs,
+            "rejected_or_merged": [],
+        }
+
+    # SKELETON
+    out_props = []
+    for p in props:
+        prop_item = {
+            "proposal_id": p.get("proposal_id", ""),
+            "title": str(p.get("title", ""))[:120],
+            "candidate_scope": p.get("candidate_scope", "CROSS_EPISODE"),
+            "episodes": p.get("episodes", []),
+            "characters": [str(c)[:80] for c in p.get("characters", [])[:5]],
+            "editorial_reason": str(p.get("editorial_reason", ""))[:80] if p.get("editorial_reason") else "",
+            "status": p.get("status", "keep"),
+        }
+        if "description" in p:
+            prop_item["description"] = str(p.get("description", ""))[:80]
+        out_props.append(prop_item)
+    out_links = []
+    for l in links:
+        out_links.append({
+            "thread_id": l.get("thread_id", ""),
+            "theme": str(l.get("theme", ""))[:50],
+            "episodes": l.get("episodes", []),
+            "summary": str(l.get("summary", ""))[:80] if l.get("summary") else "",
+        })
+    out_arcs = []
+    for a in arcs:
+        out_arcs.append({
+            "character": str(a.get("character", a.get("name", "")))[:80],
+            "episodes": a.get("episodes", []),
+            "arc_summary": str(a.get("arc_summary", ""))[:80] if a.get("arc_summary") else "",
+            "has_dedicated_candidate": a.get("has_dedicated_candidate", True),
+        })
+    return {
+        "node_id": norm.get("node_id", ""),
+        "batch_id": norm.get("batch_id", ""),
+        "cross_episode_links": out_links,
+        "candidate_proposals": out_props,
+        "supporting_character_arcs": out_arcs,
+        "rejected_or_merged": [],
+    }
+
+
+def split_merge_result(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split a merge result into two halves if oversized."""
+    props = list(raw.get("candidate_proposals", []))
+    links = list(raw.get("cross_episode_links", []))
+    arcs = list(raw.get("supporting_character_arcs", []))
+
+    if len(props) <= 1 and len(links) <= 1:
+        return [raw]
+
+    mid_p = max(1, len(props) // 2) if len(props) > 1 else len(props)
+    mid_l = max(1, len(links) // 2) if len(links) > 1 else len(links)
+
+    part1 = {
+        "node_id": raw.get("node_id", ""),
+        "merge_id": raw.get("merge_id", ""),
+        "cross_episode_links": links[:mid_l],
+        "candidate_proposals": props[:mid_p],
+        "supporting_character_arcs": arcs,
+        "rejected_or_merged": [],
+    }
+    part2 = {
+        "node_id": raw.get("node_id", ""),
+        "merge_id": raw.get("merge_id", ""),
+        "cross_episode_links": links[mid_l:],
+        "candidate_proposals": props[mid_p:],
+        "supporting_character_arcs": arcs,
+        "rejected_or_merged": [],
+    }
+    return [part1, part2]
+
+
+def deterministic_cap_merge_item(raw: dict[str, Any], cap: int = 80) -> dict[str, Any]:
+    """Deterministically cap string fields in a merge item to prevent indivisible string overflow."""
+    norm = normalize_and_dedup_merge_result(raw)
+    props = norm.get("candidate_proposals", [])
+    links = norm.get("cross_episode_links", [])
+    arcs = norm.get("supporting_character_arcs", [])
+    rej = norm.get("rejected_or_merged", [])
+
+    out_props = []
+    for p in props:
+        p_copy = dict(p)
+        if "title" in p_copy:
+            p_copy["title"] = str(p_copy["title"])[:cap]
+        if "editorial_reason" in p_copy:
+            p_copy["editorial_reason"] = str(p_copy["editorial_reason"])[:cap]
+        if "characters" in p_copy and isinstance(p_copy["characters"], list):
+            p_copy["characters"] = [str(c)[:cap] for c in p_copy["characters"][:5]]
+        out_props.append(p_copy)
+
+    out_links = []
+    for l in links:
+        l_copy = dict(l)
+        if "theme" in l_copy:
+            l_copy["theme"] = str(l_copy["theme"])[:cap]
+        if "summary" in l_copy:
+            l_copy["summary"] = str(l_copy["summary"])[:cap]
+        out_links.append(l_copy)
+
+    out_arcs = []
+    for a in arcs:
+        a_copy = dict(a)
+        if "character" in a_copy:
+            a_copy["character"] = str(a_copy["character"])[:cap]
+        if "name" in a_copy:
+            a_copy["name"] = str(a_copy["name"])[:cap]
+        if "arc_summary" in a_copy:
+            a_copy["arc_summary"] = str(a_copy["arc_summary"])[:cap]
+        out_arcs.append(a_copy)
+
+    return {
+        "node_id": norm.get("node_id", ""),
+        "batch_id": norm.get("batch_id", ""),
+        "cross_episode_links": out_links,
+        "candidate_proposals": out_props,
+        "supporting_character_arcs": out_arcs,
+        "rejected_or_merged": rej[:5] if cap > 40 else [],
+    }
+
+
+def _highest_compaction_level(levels: list[CompactionLevel]) -> CompactionLevel:
+    order = [CompactionLevel.FULL, CompactionLevel.TRIMMED, CompactionLevel.PRIORITY, CompactionLevel.SKELETON]
+    max_idx = max((order.index(lvl) for lvl in levels), default=0)
+    return order[max_idx]
+
+
+def _recursively_split_summary_to_fit(
+    summary: CompactEpisodeSummary,
+    test_fit_fn: Callable[[CompactEpisodeSummary], bool],
+    base_check_fn: Callable[[], None],
+) -> list[CompactEpisodeSummary]:
+    """Recursively split a summary by timeline into fragments until each fits."""
+    if test_fit_fn(summary):
+        return [summary]
+
+    if len(summary.items) <= 1:
+        base_check_fn()
+        raise AnalysisError(
+            f"Atomic evidence item in episode {summary.episode_id} exceeds payload ceiling even at skeleton cap."
+        )
+
+    parts = split_summary_by_timeline(summary)
+    result: list[CompactEpisodeSummary] = []
+    for part in parts:
+        result.extend(_recursively_split_summary_to_fit(part, test_fit_fn, base_check_fn))
+    return result
+
+
+def plan_adaptive_batches(
+    ordered_summaries: list[CompactEpisodeSummary],
+    model: str,
+    thinking: str = "auto",
+    recap_prompt: str = "",
+    coverage_notice: str = "",
+    target_ceiling: int = TARGET_PAYLOAD_CEILING,
+    hard_ceiling: int = HARD_PAYLOAD_CEILING,
+    max_items_hint: int = MAX_ITEMS_PER_BATCH_HINT,
+) -> list[AdaptiveBatchPlanItem]:
+    """Plan adaptive batches greedily bounded by request body size <= target_ceiling."""
+    if not ordered_summaries:
+        return []
+
+    # 1. Baseline envelope check
+    empty_text = format_batch_user_text("node_L0_baseline", [], coverage_notice, recap_prompt)
+    empty_size = estimate_batch_request_size(model, empty_text, thinking)
+    if empty_size >= target_ceiling:
+        raise AnalysisError(
+            f"Baseline batch prompt envelope size {empty_size} bytes exceeds target limit of {target_ceiling} bytes."
+        )
+
+    def _base_check() -> None:
+        if empty_size >= target_ceiling:
+            raise AnalysisError("Baseline envelope exceeds limit.")
+
+    # 2. Pre-fit each summary into units that fit alone <= target_ceiling
+    units: list[tuple[int, int, CompactEpisodeSummary, CompactionLevel]] = []
+
+    for ord_idx, summ in enumerate(ordered_summaries):
+        def _fits(s: CompactEpisodeSummary) -> bool:
+            txt = format_batch_user_text(f"node_L0_{ord_idx}_{ord_idx}_test", [s], coverage_notice, recap_prompt)
+            return estimate_batch_request_size(model, txt, thinking) <= target_ceiling
+
+        if _fits(summ):
+            units.append((ord_idx, ord_idx, summ, CompactionLevel.FULL))
+            continue
+
+        fit_level: CompactionLevel | None = None
+        compacted_unit: CompactEpisodeSummary | None = None
+        for lvl in (CompactionLevel.TRIMMED, CompactionLevel.PRIORITY, CompactionLevel.SKELETON):
+            c_s = compact_summary(summ, lvl)
+            if _fits(c_s):
+                fit_level = lvl
+                compacted_unit = c_s
+                break
+
+        if fit_level is not None and compacted_unit is not None:
+            units.append((ord_idx, ord_idx, compacted_unit, fit_level))
+        else:
+            skeleton_s = compact_summary(summ, CompactionLevel.SKELETON)
+            frags = _recursively_split_summary_to_fit(skeleton_s, _fits, _base_check)
+            for frag in frags:
+                units.append((ord_idx, ord_idx, frag, CompactionLevel.SKELETON))
+
+    # 3. Left-greedy batch packing
+    batch_plans: list[AdaptiveBatchPlanItem] = []
+    current_group: list[tuple[int, int, CompactEpisodeSummary, CompactionLevel]] = []
+
+    def _build_plan(group: list[tuple[int, int, CompactEpisodeSummary, CompactionLevel]]) -> AdaptiveBatchPlanItem:
+        span_start = group[0][0]
+        span_end = group[-1][1]
+        group_summs = [u[2] for u in group]
+        compaction_level = _highest_compaction_level([u[3] for u in group])
+
+        content_raw = json.dumps([s.to_dict() for s in group_summs], sort_keys=True)
+        content_hash = hashlib.sha256(content_raw.encode("utf-8")).hexdigest()
+
+        frag_label = ""
+        for s in group_summs:
+            if s.fragment_id:
+                frag_label = f"f{s.fragment_index}"
+                break
+
+        node_id = format_node_id("L0", span_start, span_end, content_hash, frag_label)
+        user_text = format_batch_user_text(node_id, group_summs, coverage_notice, recap_prompt)
+        est_size = estimate_batch_request_size(model, user_text, thinking)
+
+        if est_size > hard_ceiling:
+            raise AnalysisError(
+                f"Không thể tạo request batch an toàn cho node {node_id}: "
+                f"{est_size} bytes vượt giới hạn {hard_ceiling} bytes sau mọi bước compact/split."
+            )
+
+        child_hashes = [s.canonical_hash() for s in group_summs]
+        cache_key = compute_batch_cache_key(
+            node_id=node_id,
+            ordered_summary_hashes=child_hashes,
+            model=model,
+            thinking=thinking,
+            recap_prompt=recap_prompt,
+            algo=HIERARCHY_ALGO_VERSION,
+            compaction_level=compaction_level.value,
+        )
+        return AdaptiveBatchPlanItem(
+            node_id=node_id,
+            span_start=span_start,
+            span_end=span_end,
+            summaries=group_summs,
+            compaction_level=compaction_level,
+            user_text=user_text,
+            cache_key=cache_key,
+            estimated_bytes=est_size,
+        )
+
+    for unit in units:
+        if not current_group:
+            current_group.append(unit)
+        else:
+            if len(current_group) < max_items_hint:
+                test_group = current_group + [unit]
+                test_summs = [u[2] for u in test_group]
+                test_text = format_batch_user_text("test_node", test_summs, coverage_notice, recap_prompt)
+                if estimate_batch_request_size(model, test_text, thinking) <= target_ceiling:
+                    current_group.append(unit)
+                    continue
+            batch_plans.append(_build_plan(current_group))
+            current_group = [unit]
+
+    if current_group:
+        batch_plans.append(_build_plan(current_group))
+
+    return batch_plans
 
 
 def partition_season_batches(items: list[Any]) -> list[tuple[str, list[Any]]]:
@@ -149,6 +698,7 @@ class CandidateProposal:
     candidate_scope: str = CandidateScope.CROSS_EPISODE.value
     episodes: list[str] = field(default_factory=list)
     characters: list[str] = field(default_factory=list)
+    description: str = ""
     editorial_reason: str = ""
     status: str = "keep"  # keep, reject, merged
 
@@ -159,9 +709,23 @@ class CandidateProposal:
             "candidate_scope": self.candidate_scope,
             "episodes": self.episodes,
             "characters": self.characters,
+            "description": self.description,
             "editorial_reason": self.editorial_reason,
             "status": self.status,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CandidateProposal":
+        return cls(
+            proposal_id=str(data.get("proposal_id", "")),
+            title=str(data.get("title", "")),
+            candidate_scope=str(data.get("candidate_scope", CandidateScope.CROSS_EPISODE.value)),
+            episodes=list(data.get("episodes", [])),
+            characters=list(data.get("characters", [])),
+            description=str(data.get("description", "")),
+            editorial_reason=str(data.get("editorial_reason", "")),
+            status=str(data.get("status", "keep")),
+        )
 
 
 @dataclass
@@ -183,6 +747,41 @@ class SeasonConnectionResult:
             "missing_episodes": self.missing_episodes,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SeasonConnectionResult":
+        props = [
+            CandidateProposal.from_dict(p) if isinstance(p, dict) else p
+            for p in data.get("candidate_proposals", [])
+        ]
+        return cls(
+            cross_episode_links=list(data.get("cross_episode_links", [])),
+            candidate_proposals=props,
+            supporting_character_arcs=list(data.get("supporting_character_arcs", [])),
+            rejected_or_merged=list(data.get("rejected_or_merged", [])),
+            is_complete=bool(data.get("is_complete", True)),
+            missing_episodes=list(data.get("missing_episodes", [])),
+        )
+
+
+def compact_connection_result(
+    conn: SeasonConnectionResult,
+    level: CompactionLevel,
+) -> SeasonConnectionResult:
+    """Deterministically compact SeasonConnectionResult to FULL, TRIMMED, PRIORITY, or SKELETON."""
+    norm = compact_merge_result(conn.to_dict(), level)
+    props = [
+        CandidateProposal.from_dict(p) if isinstance(p, dict) else p
+        for p in norm.get("candidate_proposals", [])
+    ]
+    return SeasonConnectionResult(
+        cross_episode_links=list(norm.get("cross_episode_links", [])),
+        candidate_proposals=props,
+        supporting_character_arcs=list(norm.get("supporting_character_arcs", [])),
+        rejected_or_merged=list(norm.get("rejected_or_merged", [])),
+        is_complete=conn.is_complete,
+        missing_episodes=list(conn.missing_episodes),
+    )
+
 
 class SeasonConnector:
     """Performs hierarchical season-wide connection pass across all episode evidence."""
@@ -192,29 +791,43 @@ class SeasonConnector:
         settings: AppSettings | None = None,
         client: OpenAICompatibleClient | None = None,
         hierarchy_cache: HierarchyCacheManager | None = None,
+        *,
+        target_ceiling: int | None = None,
+        hard_ceiling: int | None = None,
     ) -> None:
         self.settings = settings or AppSettings()
         self.client = client
         self.hierarchy_cache = hierarchy_cache or HierarchyCacheManager()
+        self._target_ceiling = target_ceiling
+        self._hard_ceiling = hard_ceiling
+
+    @property
+    def target_ceiling(self) -> int:
+        return self._target_ceiling if self._target_ceiling is not None else TARGET_PAYLOAD_CEILING
+
+    @property
+    def hard_ceiling(self) -> int:
+        return self._hard_ceiling if self._hard_ceiling is not None else HARD_PAYLOAD_CEILING
 
     def compute_connection_key(
         self,
         episodes: list[SourceEpisode],
         evidence_map: dict[str, EpisodeEvidence],
     ) -> str:
-        """Deterministic cache key for season connection identity."""
+        """Deterministic cache key for season connection identity (algo v3)."""
         available = [ep for ep in episodes if ep.episode_id in evidence_map and evidence_map[ep.episode_id] is not None]
         sorted_eps = sorted(available, key=lambda x: x.episode_id)
         hashes: list[str] = []
         for ep in sorted_eps:
             ev = evidence_map[ep.episode_id]
             h = hashlib.sha256(json.dumps(ev.to_dict(), sort_keys=True).encode("utf-8")).hexdigest()[:16]
-            hashes.append(f"{ep.episode_id}:{h}")
+            hashes.append(f"{h}")
         return compute_connection_cache_key(
             ordered_evidence_hashes=hashes,
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
             recap_prompt=self.settings.recap_prompt or "",
+            algo=HIERARCHY_ALGO_VERSION,
         )
 
     def connect_season(
@@ -342,10 +955,6 @@ class SeasonConnector:
                     },
                 )
 
-        # 4. Partition available episodes into deterministic batches
-        batches = partition_season_batches(available_episodes)
-        total_batches = len(batches)
-
         if not is_gateway_enabled or self.client is None:
             # Deterministic offline season connection
             return self._connect_offline(
@@ -355,8 +964,6 @@ class SeasonConnector:
                 missing_episodes=missing_episodes,
             )
 
-        # 5. Process each batch
-        batch_results: list[dict[str, Any]] = []
         coverage_notice = ""
         if missing_episodes:
             coverage_notice = (
@@ -367,32 +974,39 @@ class SeasonConnector:
                 f"{[ep.episode_id for ep in available_episodes]}.\n"
             )
 
-        for batch_idx, (batch_id, batch_eps) in enumerate(batches, start=1):
+        # 4. Plan adaptive batches
+        batch_plans = plan_adaptive_batches(
+            ordered_summaries=[compact_summaries[ep.episode_id] for ep in available_episodes],
+            model=self.settings.finalizer_model,
+            thinking=self.settings.finalizer_thinking,
+            recap_prompt=self.settings.recap_prompt or "",
+            coverage_notice=coverage_notice,
+            target_ceiling=self.target_ceiling,
+            hard_ceiling=self.hard_ceiling,
+            max_items_hint=MAX_ITEMS_PER_BATCH_HINT,
+        )
+        total_batches = len(batch_plans)
+
+        # 5. Process each batch plan
+        batch_results: list[dict[str, Any]] = []
+
+        for batch_idx, plan in enumerate(batch_plans, start=1):
             if _is_cancelled(cancel_event):
                 raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
 
-            batch_summs = [compact_summaries[ep.episode_id] for ep in batch_eps]
-            ordered_hashes = [s.canonical_hash() for s in batch_summs]
-            batch_key = compute_batch_cache_key(
-                batch_id=batch_id,
-                ordered_summary_hashes=ordered_hashes,
-                model=self.settings.finalizer_model,
-                thinking=self.settings.finalizer_thinking,
-                recap_prompt=self.settings.recap_prompt or "",
-            )
-
-            cached_batch, b_meta = self.hierarchy_cache.load_batch_result(batch_id, batch_key)
+            cached_batch, b_meta = self.hierarchy_cache.load_batch_result(plan.node_id, plan.cache_key)
             if b_meta["hit"] and cached_batch is not None:
                 if log:
-                    log(f"Batch {batch_id} đã có trong bộ nhớ đệm (cache hit).")
+                    log(f"Batch {plan.node_id} đã có trong bộ nhớ đệm (cache hit).")
                 if on_phase:
                     on_phase(
                         AnalysisPhase.SEASON_BATCH,
-                        batch_id,
+                        plan.node_id,
                         {
                             "batch_index": batch_idx,
                             "total_batches": total_batches,
-                            "batch_id": batch_id,
+                            "batch_id": plan.node_id,
+                            "node_id": plan.node_id,
                             "cache_hit": True,
                         },
                     )
@@ -402,43 +1016,48 @@ class SeasonConnector:
             if on_phase:
                 on_phase(
                     AnalysisPhase.SEASON_BATCH,
-                    batch_id,
+                    plan.node_id,
                     {
                         "batch_index": batch_idx,
                         "total_batches": total_batches,
-                        "batch_id": batch_id,
+                        "batch_id": plan.node_id,
+                        "node_id": plan.node_id,
                         "cache_hit": False,
                     },
                 )
 
-            batch_payload = {
-                "batch_id": batch_id,
-                "episodes": [s.to_dict() for s in batch_summs],
-            }
-            user_text = (
-                f"Analyze batch connections for {batch_id} across {len(batch_summs)} episodes.\n"
-                f"{coverage_notice}\n"
-                f"Recap instructions:\n{self.settings.recap_prompt or 'Standard video recap'}\n\n"
-                f"Batch Compact Summaries:\n{json.dumps(batch_payload, ensure_ascii=False, indent=2)}\n"
+            # Invariant assertion
+            est_size = estimate_batch_request_size(
+                model=self.settings.finalizer_model,
+                user_text=plan.user_text,
+                thinking=self.settings.finalizer_thinking,
             )
-            check_payload_size(user_text, max_bytes=MAX_PAYLOAD_BYTES, context=f"batch {batch_id}")
-            payload_bytes = len(user_text.encode("utf-8"))
+            if est_size > self.hard_ceiling:
+                raise AnalysisError(
+                    f"Planner tạo batch {plan.node_id} vượt giới hạn an toàn: "
+                    f"{est_size}/{self.hard_ceiling} bytes."
+                )
+
             if log:
                 log(
-                    f"[Season Connection] phase=season_batch batch_id={batch_id} "
+                    f"[Season Connection] phase=season_batch batch_id={plan.node_id} "
                     f"model={self.settings.finalizer_model} cache=miss "
-                    f"count={len(batch_summs)} payload_bytes={payload_bytes}"
+                    f"count={len(plan.summaries)} payload_bytes={est_size}"
                 )
 
             def _batch_status_cb(msg: str) -> None:
                 if on_phase:
-                    on_phase(AnalysisPhase.SEASON_BATCH, batch_id, {"status": msg, "status_message": msg, "batch_id": batch_id})
+                    on_phase(
+                        AnalysisPhase.SEASON_BATCH,
+                        plan.node_id,
+                        {"status": msg, "status_message": msg, "batch_id": plan.node_id, "node_id": plan.node_id},
+                    )
 
             call_kwargs: dict[str, Any] = {
                 "model": self.settings.finalizer_model,
                 "thinking": self.settings.finalizer_thinking,
                 "system": SEASON_BATCH_SYSTEM_PROMPT,
-                "user_text": user_text,
+                "user_text": plan.user_text,
                 "cancel_event": cancel_event,
                 "phase": "season_batch",
                 "timeout": SEASON_CONNECTION_TIMEOUT,
@@ -461,20 +1080,28 @@ class SeasonConnector:
                 if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
                     raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.") from exc
                 raise AnalysisError(
-                    f"AI Gateway season batch {batch_id} lỗi sau các lần thử: {exc}. "
+                    f"AI Gateway season batch {plan.node_id} lỗi sau các lần thử: {exc}. "
                     f"Các batch và compact summaries trước đó đã được lưu an toàn trong bộ nhớ đệm."
                 ) from exc
 
+            # Requirement 7: Validate + Save successful batch BEFORE cancellation check!
+            if not isinstance(raw_batch, dict):
+                raise AnalysisError(f"Batch {plan.node_id} returned invalid non-dict response.")
+
+            raw_batch["node_id"] = plan.node_id
+            raw_batch["batch_id"] = plan.node_id
+            validate_batch_response_schema(raw_batch, context=f"batch {plan.node_id}")
+            self.hierarchy_cache.save_batch_result(
+                plan.node_id,
+                plan.cache_key,
+                raw_batch,
+                algo=HIERARCHY_ALGO_VERSION,
+                compaction_level=plan.compaction_level.value,
+            )
+            batch_results.append(raw_batch)
+
             if _is_cancelled(cancel_event):
                 raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
-
-            if not isinstance(raw_batch, dict):
-                raise AnalysisError(f"Batch {batch_id} returned invalid non-dict response.")
-
-            raw_batch["batch_id"] = batch_id
-            validate_batch_response_schema(raw_batch, context=f"batch {batch_id}")
-            self.hierarchy_cache.save_batch_result(batch_id, batch_key, raw_batch)
-            batch_results.append(raw_batch)
 
         # 6. Hierarchical cross-batch merge
         if len(batch_results) == 1:
@@ -490,7 +1117,7 @@ class SeasonConnector:
 
         # Save connection result cache after schema validation
         validate_batch_response_schema(final_raw, context="connection")
-        self.hierarchy_cache.save_connection_result(conn_key, final_raw)
+        self.hierarchy_cache.save_connection_result(conn_key, final_raw, algo=HIERARCHY_ALGO_VERSION)
 
         if on_phase:
             on_phase(
@@ -519,7 +1146,14 @@ class SeasonConnector:
         on_phase: PhaseCallback | None,
         log: Callable[[str], None] | None,
     ) -> dict[str, Any]:
-        """Merge batch results hierarchically in groups of 3-4 until 1 unified result remains."""
+        """Merge batch results hierarchically using adaptive byte packing until 1 unified result remains."""
+        empty_text = format_merge_user_text("node_L1_baseline", [], coverage_notice, self.settings.recap_prompt or "")
+        empty_size = estimate_merge_request_size(self.settings.finalizer_model, empty_text, self.settings.finalizer_thinking)
+        if empty_size >= self.target_ceiling:
+            raise AnalysisError(
+                f"Baseline merge prompt envelope size {empty_size} bytes exceeds target limit of {self.target_ceiling} bytes."
+            )
+
         current_level = list(batch_results)
         round_idx = 1
 
@@ -527,23 +1161,125 @@ class SeasonConnector:
             if _is_cancelled(cancel_event):
                 raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
 
-            if len(current_level) <= 4:
-                merge_id = f"merge_round_{round_idx}_final"
-                return self._merge_group(current_level, merge_id, coverage_notice, cancel_event, on_phase, log)
+            normalized_level = [normalize_and_dedup_merge_result(item) for item in current_level]
 
-            grouped = partition_season_batches(current_level)
+            fitted_items: list[dict[str, Any]] = []
+            for item in normalized_level:
+                fitted_items.extend(self._ensure_merge_item_fits_alone(item, coverage_notice))
+
+            groups = self._group_merge_items(fitted_items, coverage_notice)
+
+            # Avoid infinite loop when all groups are singletons
+            if len(groups) == len(fitted_items) and len(fitted_items) > 1:
+                groups = self._force_merge_pairs(fitted_items, coverage_notice)
+
             next_level: list[dict[str, Any]] = []
-            for g_num, (g_id, g_items) in enumerate(grouped, start=1):
+            for g_num, group in enumerate(groups, start=1):
                 if _is_cancelled(cancel_event):
                     raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
-                round_merge_id = f"merge_round_{round_idx}_g{g_num}"
-                merged_item = self._merge_group(g_items, round_merge_id, coverage_notice, cancel_event, on_phase, log)
+
+                group_raw = json.dumps(group, sort_keys=True)
+                content_hash = hashlib.sha256(group_raw.encode("utf-8")).hexdigest()
+                node_id = format_node_id(f"L{round_idx}", g_num - 1, g_num - 1 + len(group) - 1, content_hash)
+
+                merged_item = self._merge_group(
+                    group=group,
+                    merge_id=node_id,
+                    coverage_notice=coverage_notice,
+                    cancel_event=cancel_event,
+                    on_phase=on_phase,
+                    log=log,
+                )
                 next_level.append(merged_item)
 
             current_level = next_level
             round_idx += 1
 
         return current_level[0]
+
+    def _ensure_merge_item_fits_alone(
+        self,
+        item: dict[str, Any],
+        coverage_notice: str,
+    ) -> list[dict[str, Any]]:
+        ceiling = self.target_ceiling
+        txt = format_merge_user_text("test_node", [item], coverage_notice, self.settings.recap_prompt or "")
+        est = estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking)
+        if est <= ceiling:
+            return [item]
+
+        for lvl in (CompactionLevel.TRIMMED, CompactionLevel.PRIORITY, CompactionLevel.SKELETON):
+            compacted = compact_merge_result(item, lvl)
+            txt = format_merge_user_text("test_node", [compacted], coverage_notice, self.settings.recap_prompt or "")
+            if estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking) <= ceiling:
+                return [compacted]
+
+        skeleton_item = compact_merge_result(item, CompactionLevel.SKELETON)
+        parts = split_merge_result(skeleton_item)
+        if len(parts) > 1:
+            result: list[dict[str, Any]] = []
+            for p in parts:
+                result.extend(self._ensure_merge_item_fits_alone(p, coverage_notice))
+            return result
+
+        # Cannot split further: indivisible strings exist. Deterministic cap fields.
+        for cap in (80, 40, 20):
+            capped = deterministic_cap_merge_item(skeleton_item, cap=cap)
+            txt = format_merge_user_text("test_node", [capped], coverage_notice, self.settings.recap_prompt or "")
+            if estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking) <= ceiling:
+                return [capped]
+
+        node_lbl = item.get("node_id") or item.get("batch_id") or "merge_item"
+        raise AnalysisError(
+            f"Merge item {node_lbl} exceeds payload ceiling even at skeleton cap."
+        )
+
+    def _group_merge_items(
+        self,
+        items: list[dict[str, Any]],
+        coverage_notice: str,
+    ) -> list[list[dict[str, Any]]]:
+        groups: list[list[dict[str, Any]]] = []
+        current_group: list[dict[str, Any]] = []
+
+        for item in items:
+            if not current_group:
+                current_group.append(item)
+            else:
+                if len(current_group) < MAX_ITEMS_PER_BATCH_HINT:
+                    test_group = current_group + [item]
+                    test_txt = format_merge_user_text("test_group", test_group, coverage_notice, self.settings.recap_prompt or "")
+                    if estimate_merge_request_size(self.settings.finalizer_model, test_txt, self.settings.finalizer_thinking) <= self.target_ceiling:
+                        current_group.append(item)
+                        continue
+                groups.append(current_group)
+                current_group = [item]
+
+        if current_group:
+            groups.append(current_group)
+        return groups
+
+    def _force_merge_pairs(
+        self,
+        items: list[dict[str, Any]],
+        coverage_notice: str,
+    ) -> list[list[dict[str, Any]]]:
+        groups: list[list[dict[str, Any]]] = []
+        i = 0
+        while i < len(items):
+            if i + 1 < len(items):
+                p1 = compact_merge_result(items[i], CompactionLevel.SKELETON)
+                p2 = compact_merge_result(items[i + 1], CompactionLevel.SKELETON)
+                test_txt = format_merge_user_text("pair_test", [p1, p2], coverage_notice, self.settings.recap_prompt or "")
+                if estimate_merge_request_size(self.settings.finalizer_model, test_txt, self.settings.finalizer_thinking) > self.target_ceiling:
+                    p1 = deterministic_cap_merge_item(p1, cap=50)
+                    p2 = deterministic_cap_merge_item(p2, cap=50)
+                groups.append([p1, p2])
+                i += 2
+            else:
+                groups.append([items[i]])
+                i += 1
+        return groups
 
     def _merge_group(
         self,
@@ -562,11 +1298,13 @@ class SeasonConnector:
             for r in group
         ]
         merge_key = compute_merge_cache_key(
-            merge_id=merge_id,
+            node_id=merge_id,
             ordered_batch_hashes=input_hashes,
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
             recap_prompt=self.settings.recap_prompt or "",
+            algo=HIERARCHY_ALGO_VERSION,
+            merge_version="v3",
         )
 
         cached_merge, m_meta = self.hierarchy_cache.load_merge_result(merge_id, merge_key)
@@ -577,7 +1315,7 @@ class SeasonConnector:
                 on_phase(
                     AnalysisPhase.SEASON_MERGING,
                     merge_id,
-                    {"merge_id": merge_id, "cache_hit": True, "count": len(group)},
+                    {"merge_id": merge_id, "node_id": merge_id, "cache_hit": True, "count": len(group)},
                 )
             return cached_merge
 
@@ -585,31 +1323,42 @@ class SeasonConnector:
             on_phase(
                 AnalysisPhase.SEASON_MERGING,
                 merge_id,
-                {"merge_id": merge_id, "cache_hit": False, "count": len(group)},
+                {"merge_id": merge_id, "node_id": merge_id, "cache_hit": False, "count": len(group)},
             )
 
-        merge_payload = {
-            "merge_id": merge_id,
-            "batch_results": group,
-        }
-        user_text = (
-            f"Merge and synthesize {len(group)} batch results into unified season connections.\n"
-            f"{coverage_notice}\n"
-            f"Recap instructions:\n{self.settings.recap_prompt or 'Standard video recap'}\n\n"
-            f"Batch Results:\n{json.dumps(merge_payload, ensure_ascii=False, indent=2)}\n"
+        user_text = format_merge_user_text(
+            node_id=merge_id,
+            group=group,
+            coverage_notice=coverage_notice,
+            recap_prompt=self.settings.recap_prompt or "Standard video recap",
         )
-        check_payload_size(user_text, max_bytes=MAX_PAYLOAD_BYTES, context=f"merge {merge_id}")
-        payload_bytes = len(user_text.encode("utf-8"))
+
+        # Invariant assertion
+        est_bytes = estimate_merge_request_size(
+            model=self.settings.finalizer_model,
+            user_text=user_text,
+            thinking=self.settings.finalizer_thinking,
+        )
+        if est_bytes > self.hard_ceiling:
+            raise AnalysisError(
+                f"Không thể tạo request merge an toàn cho node {merge_id}: "
+                f"{est_bytes} bytes vượt giới hạn {self.hard_ceiling} bytes sau mọi bước compact/split."
+            )
+
         if log:
             log(
                 f"[Season Connection] phase=season_merging merge_id={merge_id} "
                 f"model={self.settings.finalizer_model} cache=miss "
-                f"count={len(group)} payload_bytes={payload_bytes}"
+                f"count={len(group)} payload_bytes={est_bytes}"
             )
 
         def _merge_status_cb(msg: str) -> None:
             if on_phase:
-                on_phase(AnalysisPhase.SEASON_MERGING, merge_id, {"status": msg, "status_message": msg, "merge_id": merge_id})
+                on_phase(
+                    AnalysisPhase.SEASON_MERGING,
+                    merge_id,
+                    {"status": msg, "status_message": msg, "merge_id": merge_id, "node_id": merge_id},
+                )
 
         call_kwargs: dict[str, Any] = {
             "model": self.settings.finalizer_model,
@@ -642,14 +1391,18 @@ class SeasonConnector:
                 f"Dữ liệu batch trước đó đã được lưu an toàn trong bộ nhớ đệm."
             ) from exc
 
-        if _is_cancelled(cancel_event):
-            raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
-
+        # Requirement 7: Validate + Save successful merge BEFORE cancellation check!
         if not isinstance(raw_merge, dict):
             raise AnalysisError(f"Merge {merge_id} returned invalid non-dict response.")
 
+        raw_merge["node_id"] = merge_id
+        raw_merge["merge_id"] = merge_id
         validate_batch_response_schema(raw_merge, context=f"merge {merge_id}")
-        self.hierarchy_cache.save_merge_result(merge_id, merge_key, raw_merge)
+        self.hierarchy_cache.save_merge_result(merge_id, merge_key, raw_merge, algo=HIERARCHY_ALGO_VERSION)
+
+        if _is_cancelled(cancel_event):
+            raise AnalysisCancelledError("Phân tích liên kết mùa phim đã bị hủy.")
+
         return raw_merge
 
     def _parse_connection_result(

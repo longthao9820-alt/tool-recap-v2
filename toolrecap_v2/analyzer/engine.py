@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from ..api_client import OpenAICompatibleClient
 from ..domain.cache import EvidenceCacheManager, HierarchyCacheManager
-from ..domain.enums import AnalysisScope
+from ..domain.enums import AnalysisScope, CandidateScope
 from ..domain.models import AnalysisManifest, CommentaryOutput, EpisodeEvidence, SourceEpisode
 from ..paths import default_data_directory
 from ..settings import AppSettings
@@ -95,7 +95,11 @@ class AnalysisEngine:
             client=self.client,
             hierarchy_cache=self.hierarchy_cache,
         )
-        self.finalizer = CandidateFinalizer(settings=self.settings, client=self.client)
+        self.finalizer = CandidateFinalizer(
+            settings=self.settings,
+            client=self.client,
+            hierarchy_cache=self.hierarchy_cache,
+        )
 
     def analyze(
         self,
@@ -159,7 +163,7 @@ class AnalysisEngine:
         plan_cache_key = ""
         if use_final_plan_cache and evidence_map:
             conn_key = None
-            if scope_str == AnalysisScope.SEASON.value:
+            if scope_str in (AnalysisScope.SEASON.value, AnalysisScope.SINGLE_EPISODE.value):
                 conn_key = self.connector.compute_connection_key(episodes, evidence_map)
             plan_cache_key = compute_final_plan_cache_key(
                 evidence_map,
@@ -190,14 +194,40 @@ class AnalysisEngine:
             if ev is None:
                 raise AnalysisError(f"Không có evidence cho tập {ep.episode_id}.")
 
-            outputs = self.finalizer.finalize_single(
-                ep,
-                ev,
-                cancel_event=cancel_event,
-                on_phase=on_phase,
-                log=log,
-                legacy_wrapper=legacy_wrapper,
+            is_gateway_enabled = (
+                self.settings.gateway_enabled
+                and bool(self.settings.api_endpoint.strip())
+                and self.settings.api_endpoint.strip().lower() != "offline"
+                and self.client is not None
             )
+
+            if is_gateway_enabled:
+                connection_result = self.connector.connect_season(
+                    episodes=[ep],
+                    evidence_map=evidence_map,
+                    allow_incomplete=allow_incomplete,
+                    cancel_event=cancel_event,
+                    on_phase=on_phase,
+                    log=log,
+                )
+                outputs = self.finalizer.finalize_from_connection(
+                    episodes=[ep],
+                    connection_result=connection_result,
+                    cancel_event=cancel_event,
+                    on_phase=on_phase,
+                    log=log,
+                    legacy_wrapper=legacy_wrapper,
+                    scope_hint=CandidateScope.SINGLE_EPISODE.value,
+                )
+            else:
+                outputs = self.finalizer.finalize_single(
+                    ep,
+                    ev,
+                    cancel_event=cancel_event,
+                    on_phase=on_phase,
+                    log=log,
+                    legacy_wrapper=legacy_wrapper,
+                )
         elif scope_str == AnalysisScope.SEASON.value:
             # Explicit Barrier: All episodes must complete evidence phase before season connection starts!
             if on_phase:
@@ -221,9 +251,8 @@ class AnalysisEngine:
             )
 
             # Candidate Mining & Finalization
-            outputs = self.finalizer.finalize_season(
+            outputs = self.finalizer.finalize_from_connection(
                 episodes=episodes,
-                evidence_map=evidence_map,
                 connection_result=connection_result,
                 cancel_event=cancel_event,
                 on_phase=on_phase,

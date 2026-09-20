@@ -1,7 +1,11 @@
 """Unified subtitles and media stream selection package for ToolRecap V2."""
 from __future__ import annotations
 
-from .cache import SubtitleCacheManager, compute_subtitle_cache_key
+from .cache import (
+    SubtitleCacheManager,
+    compute_source_identity_hash,
+    compute_subtitle_cache_key,
+)
 from .discovery import (
     discover_sidecars,
     extract_episode_identifiers,
@@ -54,6 +58,7 @@ __all__ = [
     "SubtitleTrack",
     "VideoStreamInfo",
     "VobSubEvent",
+    "compute_source_identity_hash",
     "compute_subtitle_cache_key",
     "create_minimal_pgs_sup",
     "create_synthetic_vobsub",

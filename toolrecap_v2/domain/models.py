@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .enums import AnalysisScope, AudioPolicy, CandidateScope, OutputStatus
+from .enums import AnalysisScope, AudioPolicy, CandidateScope, CompactionLevel, OutputStatus
 from .title import resolve_unique_titles, sanitize_title
 
 
@@ -239,6 +239,36 @@ class EpisodeEvidence:
     source_size: int = 0
     data: dict[str, Any] = field(default_factory=dict)
 
+    def __init__(
+        self,
+        episode_id: str = "",
+        source_video: str = "",
+        duration_seconds: float = 0.0,
+        coverage: dict[str, Any] | None = None,
+        missing_reasons: list[str] | None = None,
+        source_mtime: float = 0.0,
+        source_size: int = 0,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.episode_id = episode_id
+        self.source_video = source_video
+        self.duration_seconds = duration_seconds
+        self.coverage = coverage or {}
+        self.missing_reasons = missing_reasons or []
+        self.source_mtime = source_mtime
+        self.source_size = source_size
+        self.data = dict(data or {})
+        if kwargs:
+            self.data.update(kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("data", "__dataclass_fields__"):
+            raise AttributeError(name)
+        if "data" in self.__dict__ and name in self.__dict__["data"]:
+            return self.__dict__["data"][name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -308,15 +338,23 @@ class CompactEpisodeSummary:
     duration_seconds: float = 0.0
     items: list[CompactSummaryItem] = field(default_factory=list)
     schema_version: str = SUMMARY_SCHEMA_VERSION
+    fragment_id: str = ""
+    fragment_index: int = 0
+    total_fragments: int = 1
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "episode_id": self.episode_id,
             "title": self.title,
             "duration_seconds": round(float(self.duration_seconds), 3),
             "items": [item.to_dict() for item in self.items],
             "schema_version": self.schema_version,
         }
+        if self.fragment_id:
+            d["fragment_id"] = self.fragment_id
+            d["fragment_index"] = self.fragment_index
+            d["total_fragments"] = self.total_fragments
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CompactEpisodeSummary":
@@ -339,6 +377,9 @@ class CompactEpisodeSummary:
             duration_seconds=float(data.get("duration_seconds", 0.0)),
             items=items,
             schema_version=str(data.get("schema_version", SUMMARY_SCHEMA_VERSION)),
+            fragment_id=str(data.get("fragment_id", "")),
+            fragment_index=int(data.get("fragment_index", 0)),
+            total_fragments=int(data.get("total_fragments", 1)),
         )
 
     def canonical_json(self) -> str:
@@ -610,6 +651,188 @@ def build_compact_summary(
         items=merged,
         schema_version=schema_version,
     )
+
+
+SKELETON_TEXT_CAP = 80
+
+
+def compact_summary(
+    summary: CompactEpisodeSummary,
+    level: CompactionLevel | str = CompactionLevel.FULL,
+    *,
+    skeleton_cap: int = SKELETON_TEXT_CAP,
+) -> CompactEpisodeSummary:
+    """Deterministically compact a CompactEpisodeSummary to FULL, TRIMMED, PRIORITY, or SKELETON.
+
+    Preserves original episode_id, fragment metadata, timestamps, categories, characters,
+    and ref identity. Supporting character evidence explicitly prioritized to survive.
+    """
+    lvl = CompactionLevel(level) if isinstance(level, str) else level
+    if lvl == CompactionLevel.FULL:
+        return CompactEpisodeSummary(
+            episode_id=summary.episode_id,
+            title=summary.title,
+            duration_seconds=summary.duration_seconds,
+            items=[
+                CompactSummaryItem(
+                    refs=list(it.refs),
+                    episode_id=it.episode_id or summary.episode_id,
+                    start_sec=it.start_sec,
+                    end_sec=it.end_sec,
+                    characters=list(it.characters),
+                    summary=it.summary,
+                    categories=list(it.categories),
+                    item_type=it.item_type,
+                )
+                for it in summary.items
+            ],
+            schema_version=summary.schema_version,
+            fragment_id=summary.fragment_id,
+            fragment_index=summary.fragment_index,
+            total_fragments=summary.total_fragments,
+        )
+
+    if lvl == CompactionLevel.TRIMMED:
+        items: list[CompactSummaryItem] = []
+        for it in summary.items:
+            t_sum = it.summary[:140] if len(it.summary) > 140 else it.summary
+            items.append(
+                CompactSummaryItem(
+                    refs=list(it.refs[:3]),
+                    episode_id=it.episode_id or summary.episode_id,
+                    start_sec=it.start_sec,
+                    end_sec=it.end_sec,
+                    characters=list(it.characters),
+                    summary=t_sum,
+                    categories=list(it.categories),
+                    item_type=it.item_type,
+                )
+            )
+        return CompactEpisodeSummary(
+            episode_id=summary.episode_id,
+            title=summary.title,
+            duration_seconds=summary.duration_seconds,
+            items=items,
+            schema_version=summary.schema_version,
+            fragment_id=summary.fragment_id,
+            fragment_index=summary.fragment_index,
+            total_fragments=summary.total_fragments,
+        )
+
+    if lvl == CompactionLevel.PRIORITY:
+        priority_items: list[CompactSummaryItem] = []
+        fallback_items: list[CompactSummaryItem] = []
+        for it in summary.items:
+            is_supporting = (
+                it.item_type in ("supporting_development", "trait")
+                or any("supporting" in c.lower() or "strengths" in c.lower() for c in it.categories)
+                or bool(it.characters)
+            )
+            is_turning_point = (
+                it.item_type in ("setup", "payoff", "reveal", "reversal", "decision", "consequence", "failure", "conflict", "unresolved")
+                or any(c in ("setup_payoff", "reveals", "reversals", "character_decisions", "consequences", "failures", "conflicts", "unresolved") for c in it.categories)
+            )
+            t_sum = it.summary[:100] if len(it.summary) > 100 else it.summary
+            compacted_it = CompactSummaryItem(
+                refs=list(it.refs[:2]),
+                episode_id=it.episode_id or summary.episode_id,
+                start_sec=it.start_sec,
+                end_sec=it.end_sec,
+                characters=list(it.characters),
+                summary=t_sum,
+                categories=list(it.categories),
+                item_type=it.item_type,
+            )
+            if is_supporting or is_turning_point:
+                priority_items.append(compacted_it)
+            else:
+                fallback_items.append(compacted_it)
+
+        selected_items = priority_items if priority_items else fallback_items
+        return CompactEpisodeSummary(
+            episode_id=summary.episode_id,
+            title=summary.title,
+            duration_seconds=summary.duration_seconds,
+            items=selected_items,
+            schema_version=summary.schema_version,
+            fragment_id=summary.fragment_id,
+            fragment_index=summary.fragment_index,
+            total_fragments=summary.total_fragments,
+        )
+
+    # SKELETON
+    skeleton_items: list[CompactSummaryItem] = []
+    fallback_skeleton: list[CompactSummaryItem] = []
+    for it in summary.items:
+        is_supporting = (
+            it.item_type in ("supporting_development", "trait")
+            or any("supporting" in c.lower() or "strengths" in c.lower() for c in it.categories)
+            or bool(it.characters)
+        )
+        is_turning_point = (
+            it.item_type in ("setup", "payoff", "reveal", "reversal", "decision", "consequence", "failure", "conflict", "unresolved")
+            or any(c in ("setup_payoff", "reveals", "reversals", "character_decisions", "consequences", "failures", "conflicts", "unresolved") for c in it.categories)
+        )
+        t_sum = it.summary[:skeleton_cap] if len(it.summary) > skeleton_cap else it.summary
+        compacted_it = CompactSummaryItem(
+            refs=[str(r)[:80] for r in (it.refs[:2] if it.refs else [f"{it.item_type or 'ev'}:0"])],
+            episode_id=it.episode_id or summary.episode_id,
+            start_sec=it.start_sec,
+            end_sec=it.end_sec,
+            characters=[str(c)[:80] for c in it.characters[:5]],
+            summary=t_sum[:80],
+            categories=[str(c)[:50] for c in it.categories[:5]],
+            item_type=it.item_type,
+        )
+        if is_supporting or is_turning_point:
+            skeleton_items.append(compacted_it)
+        else:
+            fallback_skeleton.append(compacted_it)
+
+    final_skeleton_items = skeleton_items if skeleton_items else fallback_skeleton
+    return CompactEpisodeSummary(
+        episode_id=summary.episode_id,
+        title=summary.title[:120] if summary.title else "",
+        duration_seconds=summary.duration_seconds,
+        items=final_skeleton_items,
+        schema_version=summary.schema_version,
+        fragment_id=summary.fragment_id,
+        fragment_index=summary.fragment_index,
+        total_fragments=summary.total_fragments,
+    )
+
+
+def split_summary_by_timeline(summary: CompactEpisodeSummary) -> list[CompactEpisodeSummary]:
+    """Split a summary into two timeline fragments preserving original episode_id and grounding."""
+    if len(summary.items) <= 1:
+        return [summary]
+
+    mid = len(summary.items) // 2
+    base_ep_id = summary.episode_id
+    base_prefix = summary.fragment_id or base_ep_id
+
+    frag1 = CompactEpisodeSummary(
+        episode_id=base_ep_id,
+        title=summary.title,
+        duration_seconds=summary.duration_seconds,
+        items=list(summary.items[:mid]),
+        schema_version=summary.schema_version,
+        fragment_id=f"{base_prefix}_f1",
+        fragment_index=0,
+        total_fragments=2,
+    )
+    frag2 = CompactEpisodeSummary(
+        episode_id=base_ep_id,
+        title=summary.title,
+        duration_seconds=summary.duration_seconds,
+        items=list(summary.items[mid:]),
+        schema_version=summary.schema_version,
+        fragment_id=f"{base_prefix}_f2",
+        fragment_index=1,
+        total_fragments=2,
+    )
+    return [frag1, frag2]
+
 
 
 @dataclass

@@ -123,7 +123,7 @@ Core Mandates:
 
 Return JSON only:
 {
-  "batch_id": "batch_E01_E03",
+  "batch_id": "node_level0_span0_2",
   "cross_episode_links": [
     {
       "thread_id": "thread_1",

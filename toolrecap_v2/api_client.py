@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from enum import Enum
 import json
 import re
 import socket
@@ -16,6 +17,22 @@ SEASON_CONNECTION_TIMEOUT: int = 900
 FINALIZER_TIMEOUT: int = 900
 API_TEST_TIMEOUT: int = 120
 
+HARD_PAYLOAD_CEILING: int = 500_000
+TARGET_PAYLOAD_CEILING: int = 480_000
+DEFAULT_ANALYSIS_PAYLOAD_CEILING: int = 500_000
+DEFAULT_VISION_PAYLOAD_CEILING: int = 5_000_000
+
+
+def resolve_payload_ceiling(phase: Any = None, max_payload_bytes: int | None = None) -> int:
+    """Resolve maximum payload byte ceiling based on phase and explicit limit."""
+    if max_payload_bytes is not None and max_payload_bytes > 0:
+        return int(max_payload_bytes)
+    if phase is not None:
+        p = str(phase.value if hasattr(phase, "value") else phase).lower().strip()
+        if any(k in p for k in ("vision", "ocr", "subtitles", "subtitle")):
+            return DEFAULT_VISION_PAYLOAD_CEILING
+    return DEFAULT_ANALYSIS_PAYLOAD_CEILING
+
 MAX_TRANSPORT_ATTEMPTS: int = 3
 DEFAULT_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 30.0)
 
@@ -27,6 +44,32 @@ VARIANT_FALLBACK_HTTP_STATUSES: frozenset[int] = frozenset({400, 422})
 class APIError(RuntimeError):
     """Raised when an AI Gateway request fails or returns an invalid payload."""
     pass
+
+
+class ResponseDefectType(str, Enum):
+    """Six defect types that can occur in HTTP 200 AI Gateway responses."""
+    EMPTY_BODY = "empty_body"
+    OUTER_JSON_MALFORMED = "outer_json_malformed"
+    CHOICES_MISSING = "choices_missing"
+    MESSAGE_CONTENT_MISSING = "message_content_missing"
+    CONTENT_EMPTY = "content_empty"
+    MALFORMED_MODEL_JSON = "malformed_model_json"
+
+    @classmethod
+    def classify(cls, raw_text: str) -> ResponseDefectType | None:
+        return classify_response_defect(raw_text)
+
+
+# Aliases for enum members to ensure compatibility with varied naming
+ResponseDefectType.CHOICES_EMPTY = ResponseDefectType.CHOICES_MISSING
+ResponseDefectType.CHOICES_ABSENT = ResponseDefectType.CHOICES_MISSING
+ResponseDefectType.MESSAGE_CONTENT_ABSENT = ResponseDefectType.MESSAGE_CONTENT_MISSING
+ResponseDefectType.CONTENT_MISSING = ResponseDefectType.MESSAGE_CONTENT_MISSING
+ResponseDefectType.MESSAGE_MISSING = ResponseDefectType.MESSAGE_CONTENT_MISSING
+ResponseDefectType.OUTER_JSON = ResponseDefectType.OUTER_JSON_MALFORMED
+ResponseDefectType.TRUNCATED_JSON = ResponseDefectType.OUTER_JSON_MALFORMED
+ResponseDefectType.NON_DICT_JSON = ResponseDefectType.OUTER_JSON_MALFORMED
+ResponseDefectType.MODEL_JSON_MALFORMED = ResponseDefectType.MALFORMED_MODEL_JSON
 
 
 def parse_json_loose(text: str) -> dict[str, Any]:
@@ -52,6 +95,167 @@ def _data_url(path: Path) -> str:
     mime = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+def _image_to_data_url(image: Path | str) -> str:
+    """Convert an image file or data URL string to a base64 data URL."""
+    if isinstance(image, str) and image.startswith("data:"):
+        return image
+    path = Path(image)
+    if not path.is_file():
+        raise APIError(f"Thiếu file ảnh: {path}")
+    return _data_url(path)
+
+
+def _extract_content_text(content: Any) -> str | None:
+    """Extract string text from message content, supporting string or content parts list."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" or "text" in item:
+                    parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content)
+
+
+def build_request_payload(
+    model: str,
+    system: str = "",
+    user: str = "",
+    images: Iterable[Path | str] = (),
+    thinking: str = "auto",
+    max_tokens: int = 32_000,
+    variant: int = 0,
+    *,
+    user_text: str = "",
+) -> dict[str, Any]:
+    """Build OpenAI-compatible request payload for a specific variant (0=full, 1=no response_format, 2=base)."""
+    effective_user = user or user_text
+    content: list[dict[str, Any]] = [{"type": "text", "text": effective_user}]
+    for img in images:
+        content.append({"type": "image_url", "image_url": {"url": _image_to_data_url(img), "detail": "high"}})
+
+    base_payload: dict[str, Any] = {
+        "model": model.strip(),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+
+    payload = dict(base_payload)
+    if variant == 0:
+        payload["response_format"] = {"type": "json_object"}
+        if thinking and thinking.casefold() != "auto":
+            payload["reasoning_effort"] = thinking.casefold()
+    elif variant == 1:
+        if thinking and thinking.casefold() != "auto":
+            payload["reasoning_effort"] = thinking.casefold()
+    # variant 2 or any other: base_payload without response_format or reasoning_effort
+
+    return payload
+
+
+def estimate_request_size(
+    model: str | dict[str, Any],
+    system: str = "",
+    user: str = "",
+    images: Iterable[Path | str] = (),
+    thinking: str = "auto",
+    max_tokens: int = 32_000,
+    variant: int = 0,
+    *,
+    user_text: str = "",
+) -> int:
+    """Calculate exact byte size of serialized request payload."""
+    if isinstance(model, dict):
+        body = model
+    else:
+        body = build_request_payload(
+            model=model,
+            system=system,
+            user=user or user_text,
+            images=images,
+            thinking=thinking,
+            max_tokens=max_tokens,
+            variant=variant,
+        )
+    return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+
+def classify_response_defect(raw_text: str) -> ResponseDefectType | None:
+    """Classify response defect across six categories or return None if valid."""
+    if not raw_text or not raw_text.strip():
+        return ResponseDefectType.EMPTY_BODY
+
+    try:
+        outer = json.loads(raw_text)
+    except Exception:
+        return ResponseDefectType.OUTER_JSON_MALFORMED
+
+    if not isinstance(outer, dict):
+        return ResponseDefectType.OUTER_JSON_MALFORMED
+
+    choices = outer.get("choices")
+    if choices is None or not isinstance(choices, list) or len(choices) == 0:
+        return ResponseDefectType.CHOICES_MISSING
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict) or "message" not in first_choice:
+        return ResponseDefectType.MESSAGE_CONTENT_MISSING
+
+    message = first_choice["message"]
+    if not isinstance(message, dict) or "content" not in message:
+        return ResponseDefectType.MESSAGE_CONTENT_MISSING
+
+    content = message["content"]
+    if content is None:
+        return ResponseDefectType.CONTENT_EMPTY
+
+    extracted = _extract_content_text(content)
+    if extracted is None or not extracted.strip():
+        return ResponseDefectType.CONTENT_EMPTY
+
+    try:
+        parse_json_loose(extracted)
+    except Exception:
+        return ResponseDefectType.MALFORMED_MODEL_JSON
+
+    return None
+
+
+def parse_api_response_body(raw_text: str) -> dict[str, Any]:
+    """Parse JSON response text from AI Gateway, handling defects and markdown blocks."""
+    defect = classify_response_defect(raw_text)
+    if defect is not None:
+        raise APIError(f"HTTP 200 defect ({defect.value}): {raw_text[:200]}")
+    outer = json.loads(raw_text)
+    content = outer["choices"][0]["message"]["content"]
+    extracted = _extract_content_text(content)
+    return parse_json_loose(extracted if isinstance(extracted, str) else str(extracted))
+
+
+def _defect_reason(defect: ResponseDefectType) -> tuple[str, str]:
+    """Return Vietnamese and English reason labels for a response defect."""
+    mapping = {
+        ResponseDefectType.EMPTY_BODY: ("phản hồi rỗng", "empty body"),
+        ResponseDefectType.OUTER_JSON_MALFORMED: ("JSON không hợp lệ", "malformed outer JSON"),
+        ResponseDefectType.CHOICES_MISSING: ("thiếu choices", "missing choices"),
+        ResponseDefectType.MESSAGE_CONTENT_MISSING: ("thiếu nội dung phản hồi", "missing content"),
+        ResponseDefectType.CONTENT_EMPTY: ("nội dung rỗng", "empty content"),
+        ResponseDefectType.MALFORMED_MODEL_JSON: ("JSON mô hình không hợp lệ", "malformed model JSON"),
+    }
+    return mapping.get(defect, ("lỗi phản hồi", "response defect"))
 
 
 def _sanitize_error(message: str, secret: str) -> str:
@@ -195,6 +399,7 @@ class OpenAICompatibleClient:
         max_tokens: int = 32_000,
         cancel_event: threading.Event | None = None,
         phase: Any = None,
+        max_payload_bytes: int | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
         retry_delays: tuple[float, ...] | None = None,
@@ -209,37 +414,18 @@ class OpenAICompatibleClient:
         if not self.endpoint or not model.strip():
             raise APIError("Endpoint và model API không được để trống.")
 
-        content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-        for image in images:
-            path = Path(image)
-            if not path.is_file():
-                raise APIError(f"Thiếu file ảnh: {path}")
-            content.append({"type": "image_url", "image_url": {"url": _data_url(path), "detail": "high"}})
-
-        base_payload: dict[str, Any] = {
-            "model": model.strip(),
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": content},
-            ],
-            "temperature": 0.1,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-
-        # Payload variants: 1) full payload -> 2) drop response_format -> 3) drop reasoning_effort too
-        variant_0 = dict(base_payload)
-        variant_0["response_format"] = {"type": "json_object"}
-        if thinking and thinking.casefold() != "auto":
-            variant_0["reasoning_effort"] = thinking.casefold()
-
-        variant_1 = dict(base_payload)
-        if thinking and thinking.casefold() != "auto":
-            variant_1["reasoning_effort"] = thinking.casefold()
-
-        variant_2 = dict(base_payload)
-
-        variants = [variant_0, variant_1, variant_2]
+        variants = [
+            build_request_payload(
+                model=model,
+                system=system,
+                user=user_text,
+                images=images,
+                thinking=thinking,
+                max_tokens=max_tokens,
+                variant=v,
+            )
+            for v in (0, 1, 2)
+        ]
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -247,6 +433,7 @@ class OpenAICompatibleClient:
 
         resolved_timeout = _resolve_timeout(phase, timeout, self.timeout)
         phase_label = _resolve_phase_label(phase)
+        payload_ceiling = resolve_payload_ceiling(phase, max_payload_bytes)
         max_transport_attempts = max(1, max_retries if max_retries is not None else MAX_TRANSPORT_ATTEMPTS)
         delays = retry_delays if retry_delays is not None else DEFAULT_RETRY_DELAYS
         url = self.endpoint + "/chat/completions"
@@ -260,6 +447,16 @@ class OpenAICompatibleClient:
 
                 encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 payload_bytes = len(encoded)
+                if payload_bytes > payload_ceiling:
+                    raise APIError(
+                        _sanitize_error(
+                            f"Kích thước yêu cầu ({payload_bytes} bytes) vượt quá giới hạn tối đa cho phép "
+                            f"({payload_ceiling} bytes) cho phase '{phase_label}'. / "
+                            f"Request payload size ({payload_bytes} bytes) exceeds maximum ceiling "
+                            f"({payload_ceiling} bytes) for phase '{phase_label}'.",
+                            self.api_key,
+                        )
+                    )
                 api_request = request.Request(
                     url,
                     data=encoded,
@@ -430,23 +627,68 @@ class OpenAICompatibleClient:
                     _wait_delay(delay, cancel_event, _sleeper)
                     continue
 
-                # Successful HTTP 200 response
+                # Successful HTTP 200 response handling
                 try:
-                    raw = json.loads(raw_text)
-                    choices = raw.get("choices", [])
-                    if not choices:
-                        raise ValueError("Không tìm thấy choices trong phản hồi API.")
-                    message = choices[0]["message"]["content"]
-                    if isinstance(message, list):
-                        message = "\n".join(
-                            str(item.get("text", ""))
-                            for item in message
-                            if isinstance(item, dict) and (item.get("type") == "text" or "text" in item)
+                    defect = classify_response_defect(raw_text)
+                except Exception:
+                    defect = ResponseDefectType.OUTER_JSON_MALFORMED
+
+                if defect is None:
+                    try:
+                        outer = json.loads(raw_text)
+                        content = outer["choices"][0]["message"]["content"]
+                        extracted = _extract_content_text(content)
+                        return parse_json_loose(extracted if isinstance(extracted, str) else str(extracted))
+                    except Exception:
+                        defect = ResponseDefectType.MALFORMED_MODEL_JSON
+
+                sanitized_preview = _sanitize_error(raw_text, self.api_key)[:200]
+                if len(raw_text) > 200:
+                    sanitized_preview += "..."
+
+                defect_reason_vn, defect_reason_en = _defect_reason(defect)
+                sanitized_err = f"HTTP 200 defect ({defect.value}): {sanitized_preview}"
+                last_error = sanitized_err
+
+                if attempt >= max_transport_attempts:
+                    if log:
+                        log(
+                            _sanitize_error(
+                                f"[AI Gateway] phase={phase_label} attempt={attempt}/{max_transport_attempts} "
+                                f"exhausted ({defect.value}): {sanitized_preview}",
+                                self.api_key,
+                            )
                         )
-                    return parse_json_loose(message if isinstance(message, str) else str(message))
-                except Exception as exc:
-                    sanitized_text = _sanitize_error(raw_text[:4000], self.api_key)
-                    raise APIError(f"Không đọc được JSON từ API: {exc}\n{sanitized_text}") from exc
+                    exhaust_msg = (
+                        f"AI Gateway ({phase_label}) thất bại sau {max_transport_attempts} lần thử "
+                        f"/ failed after {max_transport_attempts} attempts: {sanitized_err}"
+                    )
+                    raise APIError(_sanitize_error(exhaust_msg, self.api_key))
+
+                # Recoverable defect retry with backoff on the SAME variant
+                delay_idx = attempt - 1
+                delay = delays[delay_idx] if delay_idx < len(delays) else delays[-1]
+
+                retry_status = (
+                    f"AI Gateway ({phase_label} - {defect_reason_vn}/{defect_reason_en}): "
+                    f"Thử lại {attempt}/{max_transport_attempts}... "
+                    f"/ Retrying {attempt}/{max_transport_attempts}..."
+                )
+                sanitized_status = _sanitize_error(retry_status, self.api_key)
+                if on_status:
+                    on_status(sanitized_status)
+                if log:
+                    log(
+                        _sanitize_error(
+                            f"[AI Gateway] phase={phase_label} attempt {attempt}/{max_transport_attempts} defect "
+                            f"({defect.value}, elapsed={elapsed:.2f}s, bytes={payload_bytes}). "
+                            f"Retrying in {delay:.1f}s: {sanitized_preview}",
+                            self.api_key,
+                        )
+                    )
+
+                _wait_delay(delay, cancel_event, _sleeper)
+                continue
 
         raise APIError(_sanitize_error(last_error or "Không thể kết nối API.", self.api_key))
 

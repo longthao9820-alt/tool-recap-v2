@@ -160,7 +160,7 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.1)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.2)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
@@ -203,21 +203,33 @@ def build_portable_package() -> int:
    - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU
      (NVENC/AMF/QSV), nhúng phụ đề (Burn subtitles), thư mục xuất và kiểm tra subsystem.
    * Chú ý: Không có tab STT riêng biệt; STT hoạt động ngầm (internal) hoàn toàn tự động.
-   * Chú ý: Các thông số kỹ thuật nội bộ (phase timeouts, số lần thử retry, batching)
-     được tối ưu ngầm tự động, không để lộ ra bảng cài đặt nhằm giữ giao diện tinh gọn.
+   * Chú ý: Toàn bộ cơ chế thích ứng tự động và độ tin cậy AI (đo lường byte chính xác,
+     chia nhỏ/cô đọng/hợp nhất đệ quy, khôi phục cache, phase timeouts, số lần thử retry)
+     được tối ưu ngầm tự động, không để lộ ra bảng cài đặt nhằm giữ giao diện tinh gọn,
+     không đòi hỏi người dùng phải điều chỉnh bất kỳ thông số kỹ thuật nào.
 
-5. ĐỘ TIN CẬY AI GATEWAY (AI RELIABILITY):
-   - Phase timeouts nội bộ: Mỗi giai đoạn (scanner, season connecting, season mining,
-     finalizer) đều có thời hạn chờ nội bộ được cân chỉnh tối ưu, không cần tinh chỉnh thủ công.
-   - Tối đa 3 lần thử: Tự động thử lại khi timeout, mất kết nối, HTTP 429 hoặc lỗi máy chủ
-     tạm thời; khoảng chờ 5 và 15 giây có thể bị ngắt ngay bằng nút Stop.
-   - Phân tích mùa theo lô 3-4 tập: Mỗi request chỉ nhận compact summaries của một lô;
-     kết quả được hợp nhất phân cấp để tìm cốt truyện xuyên suốt mùa.
-   - Tóm tắt cô đọng & Bộ nhớ đệm (Compact summaries/caches/resume): Tạo bản tóm tắt
-     ngắn gọn, lưu kết quả theo mã băm video và hỗ trợ tiếp tục (resume) xử lý ngay
-     giai đoạn dang dở mà không tốn công chạy lại từ đầu.
-   - Phân định tiến trình & lỗi rõ ràng (Progress/error ownership): Hiển thị chính xác
-     tập phim nào gặp lỗi và lỗi tại giai đoạn nào mà không ảnh hưởng đến các tập khác.
+5. ĐỘ TIN CẬY AI GATEWAY & CƠ CHẾ THÍCH ỨNG TỰ ĐỘNG (AI RELIABILITY & ADAPTIVE):
+   - Đo lường chính xác kích thước yêu cầu (Exact request measurement): Hệ thống tự đo
+     lường chính xác kích thước byte của mọi request trước khi gửi. Khi tiệm cận giới hạn
+     ngữ cảnh hoặc trần dữ liệu, hệ thống tự động chia nhỏ thích ứng mà không cần người
+     dùng phải tính toán hay tinh chỉnh thủ công.
+   - Chia nhỏ, cô đọng, hợp nhất đệ quy & Cache resume (Split, Compact, Recursive Merge):
+     Tự động chia nhỏ theo mốc thời gian (split), cô đọng các phân đoạn tóm tắt (compact),
+     hợp nhất theo cấu trúc cây phân cấp đệ quy (recursive merge) và lưu cache theo mã băm
+     từng nút. Khi tiếp tục (resume) hoặc chạy lại, hệ thống tái sử dụng ngay kết quả cache
+     mà không tốn công gọi lại API.
+   - Cơ chế thử lại phản hồi dùng chung (Shared response retry): Mọi giai đoạn AI đều dùng
+     chung một bộ xử lý thử lại chuẩn hóa; tự động xử lý khi mất mạng, quá tải tần suất
+     (HTTP 429), lỗi máy chủ, và 6 dạng khuyết tật phản hồi HTTP 200 (rỗng, hỏng JSON,
+     thiếu choices, thiếu content, v.v.) với tối đa 3 lần thử và khoảng chờ ngắt được bằng Stop.
+   - Hoàn toàn phổ quát, không quy tắc riêng theo phim (Explicit no show-specific tuning):
+     Toàn bộ cơ chế thích ứng hoạt động dựa trên kích thước dữ liệu và mốc thời gian thực tế,
+     tuyệt đối không dùng bất kỳ quy tắc hay tham số gán cứng nào theo phim hay thể loại.
+   - Không để lộ chi tiết byte ra giao diện (No overexposure of bytes): Giữ giao diện
+     tinh gọn, dễ dùng; các thông số byte và kích thước gói tin chỉ được ghi nhận trong
+     nhật ký chẩn đoán (diagnostics log) khi cần đối soát kỹ thuật.
+   - Phase timeouts nội bộ & Phân định lỗi rõ ràng: Mỗi giai đoạn có thời hạn chờ tối ưu
+     và lỗi được phân định chính xác theo từng tập phim, không làm gián đoạn các tập khác.
 
 6. PHỤ ĐỀ PGS / VOBSUB / RAPIDOCR / AI VISION & INTERNAL STT:
    - Ưu tiên chọn luồng âm thanh và phụ đề tiếng Anh trong video hoặc sidecar ngoài.

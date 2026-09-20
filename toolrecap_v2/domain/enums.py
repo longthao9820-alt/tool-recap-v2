@@ -38,3 +38,10 @@ class OutputStatus(str, Enum):
     COMPLETED = "COMPLETED"
     ERROR = "ERROR"
     CANCELLED = "CANCELLED"
+
+
+class CompactionLevel(str, Enum):
+    FULL = "FULL"
+    TRIMMED = "TRIMMED"
+    PRIORITY = "PRIORITY"
+    SKELETON = "SKELETON"

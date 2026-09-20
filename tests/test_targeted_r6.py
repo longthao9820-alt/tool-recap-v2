@@ -135,7 +135,7 @@ def test_old_project_load_and_defaults(tmp_path: Path) -> None:
 # 2. Season Error Preserves Episode Rows
 # ---------------------------------------------------------------------------
 
-def test_season_error_preserves_episode_rows(tk_root: pytest.MonkeyPatch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_season_error_preserves_episode_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """When season analysis fails, only season_status and season row become ERROR; completed episodes stay intact."""
     monkeypatch.setattr("toolrecap_v2.ui.default_data_directory", lambda: tmp_path)
     app = ToolRecapV2App()
@@ -535,8 +535,15 @@ def test_queue_season_actual_failure_ownership(tmp_path: Path, monkeypatch: pyte
     settings = AppSettings(gateway_enabled=True)
     queue = ProjectQueue([rec], store=store, settings=settings)
 
-    monkeypatch.setattr("toolrecap_v2.projects.probe_typed_media", lambda p: MagicMock(duration=60.0, has_audio=False, subtitle_streams=[], video_streams=[MagicMock(duration=60.0)]))
-    monkeypatch.setattr("toolrecap_v2.projects.probe_media", lambda p: MagicMock(duration=60.0, has_audio=False, subtitle_streams=[]))
+    class DummyMedia:
+        duration = 60.0
+        has_audio = False
+        subtitle_streams = []
+        video_streams = [type("VStream", (), {"duration": 60.0})()]
+        selected_audio = None
+
+    monkeypatch.setattr("toolrecap_v2.projects.probe_typed_media", lambda p: DummyMedia())
+    monkeypatch.setattr("toolrecap_v2.projects.probe_media", lambda p: DummyMedia())
     monkeypatch.setattr("toolrecap_v2.projects.probe_duration", lambda p: 60.0)
     monkeypatch.setattr("toolrecap_v2.subtitles.pipeline.SubtitlePipeline.get_episode_subtitles", lambda *a, **kw: [])
 
@@ -550,9 +557,8 @@ def test_queue_season_actual_failure_ownership(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.setattr("toolrecap_v2.analyzer.engine.AnalysisEngine.analyze", mock_analyze)
 
-    queue.start()
-    assert queue._thread is not None
-    queue._thread.join(timeout=5)
+    # Invoke _process_queue synchronously to verify ownership deterministically
+    queue._process_queue()
 
     assert rec.status == "ERROR"
     assert rec.season_status == "ERROR"
@@ -618,9 +624,9 @@ def test_plan_cache_hit_zero_calls_and_invalidation(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(client, "chat_json", mock_chat)
 
-    # 1. Cold cache: calls chat_json
+    # 1. Cold cache: calls chat_json (1 connector + 1 finalizer = 2 calls)
     m1 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 1
+    assert call_count == 2
     assert len(m1.outputs) == 1
 
     # 2. Warm cache hit: zero calls made!
@@ -629,14 +635,14 @@ def test_plan_cache_hit_zero_calls_and_invalidation(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(client, "chat_json", fail_chat)
     m2 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 1
+    assert call_count == 2
     assert m2.outputs[0].title == m1.outputs[0].title
 
-    # 3. Invalidation: change config -> cache miss, calls chat_json again
+    # 3. Invalidation: change config -> cache miss, reuses cached batch and re-runs finalizer (+1 call = 3)
     engine.settings.recap_mode = "DIFFERENT_MODE"
     monkeypatch.setattr(client, "chat_json", mock_chat)
     m3 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 2
+    assert call_count == 3
     assert len(m3.outputs) == 1
 
 

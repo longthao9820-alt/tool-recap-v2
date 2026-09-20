@@ -1,6 +1,7 @@
 """Comprehensive unit and integration tests for media probing, stream selection, and unified subtitles/OCR."""
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1202,3 +1203,142 @@ def test_cache_key_differs_by_engine_model_codec_index_source(tmp_path: Path):
 
     # Mismatched track_source -> miss
     assert cache_mgr.load_cues("E01", video, "track1", ocr_engine="rapidocr", model_version="PP-OCRv4", track_codec="srt", track_index=0, track_source="s2") is None
+
+
+def test_two_e01_subtitle_collision_isolation_and_selective_invalidation(tmp_path: Path):
+    """Two different video files with identical episode ID E01 do not collide in subtitle cache and can be selectively invalidated."""
+    cache_mgr = SubtitleCacheManager(cache_dir=tmp_path / "cache")
+
+    dir_a = tmp_path / "show_a"
+    dir_b = tmp_path / "show_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    video_a = dir_a / "E01.mp4"
+    video_b = dir_b / "E01.mp4"
+    video_a.write_bytes(b"Show A Video Content")
+    video_b.write_bytes(b"Show B Video Content Different")
+
+    cues_a = [
+        SubtitleCue(
+            start_ms=1000,
+            end_ms=3000,
+            text="Show A Subtitle Dialogue",
+            source_type="sidecar",
+            source_format="srt",
+            episode_id="E01",
+            source_video=str(video_a),
+        )
+    ]
+    cues_b = [
+        SubtitleCue(
+            start_ms=2000,
+            end_ms=4000,
+            text="Show B Subtitle Dialogue",
+            source_type="sidecar",
+            source_format="srt",
+            episode_id="E01",
+            source_video=str(video_b),
+        )
+    ]
+
+    path_a = cache_mgr.save_cues("E01", video_a, "track_a", cues_a)
+    path_b = cache_mgr.save_cues("E01", video_b, "track_b", cues_b)
+
+    # Distinct cache files created
+    assert path_a != path_b
+    assert path_a.is_file()
+    assert path_b.is_file()
+
+    # Both load their distinct cues without collision
+    loaded_a = cache_mgr.load_cues("E01", video_a, "track_a")
+    loaded_b = cache_mgr.load_cues("E01", video_b, "track_b")
+    assert loaded_a is not None
+    assert loaded_b is not None
+    assert loaded_a[0].text == "Show A Subtitle Dialogue"
+    assert loaded_b[0].text == "Show B Subtitle Dialogue"
+
+    # Selective invalidation of video_a only
+    cache_mgr.invalidate("E01", source_video=video_a)
+    assert cache_mgr.load_cues("E01", video_a, "track_a") is None
+    assert cache_mgr.load_cues("E01", video_b, "track_b") is not None
+
+    # Full invalidation without source_video removes all remaining E01 caches
+    cache_mgr.invalidate("E01")
+    assert cache_mgr.load_cues("E01", video_b, "track_b") is None
+
+
+def test_subtitle_legacy_migration(tmp_path: Path):
+    """Legacy unhashed subtitle cache file safely migrates to hashed filename on load."""
+    cache_dir = tmp_path / "cache"
+    cache_mgr = SubtitleCacheManager(cache_dir=cache_dir)
+
+    video_file = tmp_path / "E01.mp4"
+    video_file.write_bytes(b"Video file for subtitle migration")
+    stat = video_file.stat()
+
+    legacy_file = cache_dir / "E01.subtitles.json"
+    cues = [
+        SubtitleCue(
+            start_ms=500,
+            end_ms=2500,
+            text="Legacy Subtitle Line",
+            source_type="sidecar",
+            source_format="srt",
+            episode_id="E01",
+            source_video=str(video_file),
+        )
+    ]
+    payload = {
+        "cache_key": "legacy_sub_key",
+        "episode_id": "E01",
+        "source_video": str(video_file.resolve()),
+        "subtitle_source_id": "track_leg",
+        "ocr_engine_version": "rapidocr-v4:1.0",
+        "ocr_engine": "rapidocr",
+        "model_version": "PP-OCRv4",
+        "track_codec": "srt",
+        "track_index": 0,
+        "track_source": "track_leg",
+        "source_size": stat.st_size,
+        "source_mtime": stat.st_mtime,
+        "cues": [c.to_dict() for c in cues],
+    }
+    legacy_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    assert legacy_file.is_file()
+
+    # Load triggers automatic safe migration
+    loaded = cache_mgr.load_cues(
+        "E01",
+        video_file,
+        "track_leg",
+        ocr_engine_version="rapidocr-v4:1.0",
+        ocr_engine="rapidocr",
+        model_version="PP-OCRv4",
+        track_codec="srt",
+        track_index=0,
+        track_source="track_leg",
+    )
+    assert loaded is not None
+    assert len(loaded) == 1
+    assert loaded[0].text == "Legacy Subtitle Line"
+
+    # Legacy file was unlinked and migrated to hashed file
+    assert not legacy_file.is_file()
+    hashed_files = list(cache_dir.glob("E01_*.subtitles.json"))
+    assert len(hashed_files) == 1
+
+    # Subsequent load succeeds from new hashed file
+    reloaded = cache_mgr.load_cues(
+        "E01",
+        video_file,
+        "track_leg",
+        ocr_engine_version="rapidocr-v4:1.0",
+        ocr_engine="rapidocr",
+        model_version="PP-OCRv4",
+        track_codec="srt",
+        track_index=0,
+        track_source="track_leg",
+    )
+    assert reloaded is not None
+    assert reloaded[0].text == "Legacy Subtitle Line"

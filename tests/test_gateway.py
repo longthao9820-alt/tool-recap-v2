@@ -15,6 +15,10 @@ import tkinter as tk
 from toolrecap_v2.api_client import (
     APIError,
     OpenAICompatibleClient,
+    ResponseDefectType,
+    build_request_payload,
+    estimate_request_size,
+    classify_response_defect,
     parse_json_loose,
     SCANNER_TIMEOUT,
     SEASON_CONNECTION_TIMEOUT,
@@ -1125,3 +1129,394 @@ def test_sequential_batch_unaffected(tmp_path: Path, dummy_video: Path, monkeypa
     assert rec1.status == "COMPLETED"
     assert rec2.status == "COMPLETED"
     assert queue.is_running is False
+
+
+# ---------------------------------------------------------------------------
+# 8. Defect Classification, HTTP 200 Retries, and Payload Estimator Tests
+# ---------------------------------------------------------------------------
+
+def test_response_defect_classification_all_six() -> None:
+    """Classify all six response defect types, content list support, and valid responses."""
+    # 1. Empty body
+    assert classify_response_defect("") == ResponseDefectType.EMPTY_BODY
+    assert classify_response_defect("   \n\t  ") == ResponseDefectType.EMPTY_BODY
+    assert ResponseDefectType.classify("") == ResponseDefectType.EMPTY_BODY
+
+    # 2. Outer JSON malformed / truncated / non-dict
+    assert classify_response_defect("not json") == ResponseDefectType.OUTER_JSON_MALFORMED
+    assert classify_response_defect('{"choices": ') == ResponseDefectType.OUTER_JSON_MALFORMED
+    assert classify_response_defect("[1, 2, 3]") == ResponseDefectType.OUTER_JSON_MALFORMED
+    assert classify_response_defect('"just a string"') == ResponseDefectType.OUTER_JSON_MALFORMED
+    assert classify_response_defect("12345") == ResponseDefectType.OUTER_JSON_MALFORMED
+
+    # 3. Choices absent / empty
+    assert classify_response_defect(json.dumps({"id": "resp-123"})) == ResponseDefectType.CHOICES_MISSING
+    assert classify_response_defect(json.dumps({"choices": []})) == ResponseDefectType.CHOICES_MISSING
+    assert classify_response_defect(json.dumps({"choices": None})) == ResponseDefectType.CHOICES_MISSING
+    assert classify_response_defect(json.dumps({"choices": "not a list"})) == ResponseDefectType.CHOICES_MISSING
+
+    # 4. Message / content absent
+    assert classify_response_defect(json.dumps({"choices": [{}]})) == ResponseDefectType.MESSAGE_CONTENT_MISSING
+    assert classify_response_defect(json.dumps({"choices": [{"message": "not a dict"}]})) == ResponseDefectType.MESSAGE_CONTENT_MISSING
+    assert classify_response_defect(json.dumps({"choices": [{"message": {}}]})) == ResponseDefectType.MESSAGE_CONTENT_MISSING
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"role": "assistant"}}]})) == ResponseDefectType.MESSAGE_CONTENT_MISSING
+
+    # 5. Content empty
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": None}}]})) == ResponseDefectType.CONTENT_EMPTY
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": ""}}]})) == ResponseDefectType.CONTENT_EMPTY
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": "   \n\t  "}}]})) == ResponseDefectType.CONTENT_EMPTY
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": []}}]})) == ResponseDefectType.CONTENT_EMPTY
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": [{"type": "text", "text": "   "}]}}]})) == ResponseDefectType.CONTENT_EMPTY
+
+    # 6. Malformed model JSON
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": "Just conversational text, no json"}}]})) == ResponseDefectType.MALFORMED_MODEL_JSON
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": "```json\n{broken: json\n```"}}]})) == ResponseDefectType.MALFORMED_MODEL_JSON
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": "[1, 2, 3]"}}]})) == ResponseDefectType.MALFORMED_MODEL_JSON
+
+    # 7. Valid responses (string content and content list support)
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": '{"ok": true}'}}]})) is None
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": '```json\n{"ok": true}\n```'}}]})) is None
+    assert classify_response_defect(json.dumps({"choices": [{"message": {"content": [{"type": "text", "text": '{"ok": true}'}]}}]})) is None
+
+
+@pytest.mark.parametrize("defect_body", [
+    "",  # Empty body
+    "<html>502 Bad Gateway</html>",  # Outer JSON malformed
+    json.dumps({"id": "123"}),  # Choices missing
+    json.dumps({"choices": [{}]}),  # Message missing
+    json.dumps({"choices": [{"message": {"content": ""}}]}),  # Content empty
+    json.dumps({"choices": [{"message": {"content": "Not valid JSON output"}}]}),  # Malformed model JSON
+])
+def test_http_200_defect_recovery_all_defects(monkeypatch: pytest.MonkeyPatch, defect_body: str) -> None:
+    """HTTP 200 defect on attempt 1 retries with backoff and succeeds on attempt 2."""
+    attempts = 0
+    delays_called: list[float] = []
+    status_history: list[str] = []
+
+    class MockRawResponse:
+        def __init__(self, raw: str) -> None:
+            self._raw = raw
+
+        def read(self) -> bytes:
+            return self._raw.encode("utf-8")
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return MockRawResponse(defect_body)
+        return MockRawResponse(json.dumps({"choices": [{"message": {"content": '{"recovered": true}'}}]}))
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1")
+    res = client.chat_json(
+        model="sub",
+        system="test",
+        user_text="test",
+        on_status=status_history.append,
+        _sleeper=delays_called.append,
+    )
+
+    assert res == {"recovered": True}
+    assert attempts == 2
+    assert delays_called == [5.0]
+    assert len(status_history) == 1
+    assert "Thử lại 1/3" in status_history[0]
+
+
+@pytest.mark.parametrize("defect_body,expected_defect_name", [
+    ("", "empty_body"),
+    ("Not JSON content at all", "outer_json_malformed"),
+    (json.dumps({"choices": []}), "choices_missing"),
+    (json.dumps({"choices": [{"message": {}}]}), "message_content_missing"),
+    (json.dumps({"choices": [{"message": {"content": "   "}}]}), "content_empty"),
+    (json.dumps({"choices": [{"message": {"content": "invalid { json"}}]}), "malformed_model_json"),
+])
+def test_http_200_defect_exhaustion_all_defects(
+    monkeypatch: pytest.MonkeyPatch, defect_body: str, expected_defect_name: str
+) -> None:
+    """3 consecutive attempts of HTTP 200 defect exhaust retries and raise APIError."""
+    attempts = 0
+    delays_called: list[float] = []
+
+    class MockRawResponse:
+        def __init__(self, raw: str) -> None:
+            self._raw = raw
+
+        def read(self) -> bytes:
+            return self._raw.encode("utf-8")
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        nonlocal attempts
+        attempts += 1
+        return MockRawResponse(defect_body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1")
+    with pytest.raises(APIError) as exc_info:
+        client.chat_json(
+            model="sub",
+            system="test",
+            user_text="test",
+            _sleeper=delays_called.append,
+        )
+
+    assert attempts == 3
+    assert delays_called == [5.0, 15.0]
+    err = str(exc_info.value)
+    assert "thất bại sau 3 lần thử" in err or "failed after 3 attempts" in err
+    assert expected_defect_name in err
+
+
+def test_http_200_defect_retries_same_variant_without_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 200 defect retries the SAME payload variant and does NOT fall back to next variant."""
+    payloads_received: list[dict[str, Any]] = []
+    delays_called: list[float] = []
+
+    class MockRawResponse:
+        def read(self) -> bytes:
+            return b'{"choices": [{"message": {"content": "not json"}}]}'
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        payload = json.loads(req.data.decode("utf-8"))
+        payloads_received.append(payload)
+        return MockRawResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1")
+    with pytest.raises(APIError):
+        client.chat_json(
+            model="sub",
+            thinking="high",
+            system="test",
+            user_text="test",
+            _sleeper=delays_called.append,
+        )
+
+    # Exactly 3 attempts made, all using variant 0 (response_format and reasoning_effort retained)
+    assert len(payloads_received) == 3
+    for p in payloads_received:
+        assert p.get("response_format") == {"type": "json_object"}
+        assert p.get("reasoning_effort") == "high"
+    assert delays_called == [5.0, 15.0]
+
+
+def test_http_200_defect_cancellation_during_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation during defect retry sleeper aborts immediately."""
+    attempts = 0
+    cancel_event = threading.Event()
+
+    class MockRawResponse:
+        def read(self) -> bytes:
+            return b""  # Empty body defect
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def sleeper(delay: float) -> None:
+        cancel_event.set()
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        nonlocal attempts
+        attempts += 1
+        return MockRawResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1")
+    with pytest.raises(APIError, match="đã bị dừng"):
+        client.chat_json(
+            model="sub",
+            system="test",
+            user_text="test",
+            cancel_event=cancel_event,
+            _sleeper=sleeper,
+        )
+
+    assert attempts == 1
+
+
+def test_domain_invalid_syntactic_dict_no_client_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid syntactic JSON dict that is domain-invalid returns once without client retry."""
+    attempts = 0
+
+    class MockRawResponse:
+        def read(self) -> bytes:
+            # Valid JSON object dict, but domain fields (e.g. segments/events) are absent
+            return json.dumps({
+                "choices": [{
+                    "message": {
+                        "content": json.dumps({"unexpected_field": 123, "arbitrary": "data"})
+                    }
+                }]
+            }).encode("utf-8")
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        nonlocal attempts
+        attempts += 1
+        return MockRawResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1")
+    result = client.chat_json(model="sub", system="test", user_text="test")
+
+    # Returned immediately on attempt 1 without retry
+    assert attempts == 1
+    assert result == {"unexpected_field": 123, "arbitrary": "data"}
+
+
+def test_defect_error_sanitization_never_logs_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Secret API key in HTTP 200 defect response is never leaked in status, logs, or exceptions."""
+    secret = "sk-defect-secret-key-12345"
+    defect_raw = f'{{"choices": [{{"message": {{"content": "Error with key {secret} Bearer {secret}"}}}}]}}'
+    status_history: list[str] = []
+    log_history: list[str] = []
+
+    class MockRawResponse:
+        def read(self) -> bytes:
+            return defect_raw.encode("utf-8")
+
+        def __enter__(self) -> "MockRawResponse":
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    def mock_urlopen(req: urllib.request.Request, timeout: float | None = None) -> MockRawResponse:
+        return MockRawResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client = OpenAICompatibleClient("http://localhost:20128/v1", api_key=secret)
+    with pytest.raises(APIError) as exc_info:
+        client.chat_json(
+            model="sub",
+            system="test",
+            user_text="test",
+            on_status=status_history.append,
+            log=log_history.append,
+            _sleeper=lambda d: None,
+        )
+
+    # Exception must not leak secret
+    err_str = str(exc_info.value)
+    assert secret not in err_str
+    assert "***" in err_str
+
+    # Status must not leak secret
+    for st in status_history:
+        assert secret not in st
+
+    # Log must not leak secret
+    for lg in log_history:
+        assert secret not in lg
+
+
+def test_estimator_exact_byte_size_and_build_payload(tmp_path: Path) -> None:
+    """Payload builder and estimator exact byte calculation with Unicode, thinking, 3 variants, images."""
+    # 1. Base test: exact byte match with manual serialization
+    p0 = build_request_payload("sub", system="sys", user="usr", variant=0)
+    expected_bytes0 = len(json.dumps(p0, ensure_ascii=False).encode("utf-8"))
+    assert estimate_request_size("sub", system="sys", user="usr", variant=0) == expected_bytes0
+    assert estimate_request_size(p0) == expected_bytes0
+
+    # 2. Unicode: Vietnamese characters
+    vn_sys = "Bạn là trợ lý AI phân tích phim."
+    vn_user = "Đạo diễn: Trần Anh Hùng. Tóm tắt nội dung tập 1."
+    p_vn = build_request_payload("sub", system=vn_sys, user=vn_user, variant=0)
+    expected_vn_bytes = len(json.dumps(p_vn, ensure_ascii=False).encode("utf-8"))
+    assert estimate_request_size("sub", system=vn_sys, user=vn_user, variant=0) == expected_vn_bytes
+
+    # 3. Thinking levels
+    # "auto" -> no reasoning_effort
+    p_auto = build_request_payload("sub", system="sys", user="usr", thinking="auto", variant=0)
+    assert "reasoning_effort" not in p_auto
+    # "high" -> reasoning_effort="high"
+    p_high = build_request_payload("sub", system="sys", user="usr", thinking="high", variant=0)
+    assert p_high.get("reasoning_effort") == "high"
+    assert estimate_request_size("sub", system="sys", user="usr", thinking="high", variant=0) == len(
+        json.dumps(p_high, ensure_ascii=False).encode("utf-8")
+    )
+
+    # 4. All 3 variants:
+    # Variant 0: response_format and reasoning_effort
+    v0 = build_request_payload("sub", system="sys", user="usr", thinking="max", variant=0)
+    assert "response_format" in v0
+    assert "reasoning_effort" in v0
+    assert estimate_request_size("sub", system="sys", user="usr", thinking="max", variant=0) == len(
+        json.dumps(v0, ensure_ascii=False).encode("utf-8")
+    )
+
+    # Variant 1: reasoning_effort retained, response_format dropped
+    v1 = build_request_payload("sub", system="sys", user="usr", thinking="max", variant=1)
+    assert "response_format" not in v1
+    assert "reasoning_effort" in v1
+    assert estimate_request_size("sub", system="sys", user="usr", thinking="max", variant=1) == len(
+        json.dumps(v1, ensure_ascii=False).encode("utf-8")
+    )
+
+    # Variant 2: both response_format and reasoning_effort dropped
+    v2 = build_request_payload("sub", system="sys", user="usr", thinking="max", variant=2)
+    assert "response_format" not in v2
+    assert "reasoning_effort" not in v2
+    assert estimate_request_size("sub", system="sys", user="usr", thinking="max", variant=2) == len(
+        json.dumps(v2, ensure_ascii=False).encode("utf-8")
+    )
+
+    # 5. Image mocked file
+    img_file = tmp_path / "mock_frame.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 32)
+    p_img = build_request_payload("sub", system="sys", user="usr", images=[img_file], variant=0)
+    user_content = p_img["messages"][1]["content"]
+    assert len(user_content) == 2
+    assert user_content[0]["type"] == "text"
+    assert user_content[1]["type"] == "image_url"
+    assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert user_content[1]["image_url"]["detail"] == "high"
+    assert estimate_request_size("sub", system="sys", user="usr", images=[img_file], variant=0) == len(
+        json.dumps(p_img, ensure_ascii=False).encode("utf-8")
+    )
+
+    # 6. Data URL string directly
+    data_url_str = "data:image/jpeg;base64,aGVsbG8gd29ybGQ="
+    p_url = build_request_payload("sub", system="sys", user="usr", images=[data_url_str], variant=0)
+    assert p_url["messages"][1]["content"][1]["image_url"]["url"] == data_url_str
+    assert estimate_request_size("sub", system="sys", user="usr", images=[data_url_str], variant=0) == len(
+        json.dumps(p_url, ensure_ascii=False).encode("utf-8")
+    )
+
+    # 7. Missing image file raises APIError
+    missing_file = tmp_path / "does_not_exist.png"
+    with pytest.raises(APIError, match="Thiếu file ảnh"):
+        build_request_payload("sub", system="sys", user="usr", images=[missing_file])

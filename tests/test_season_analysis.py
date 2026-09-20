@@ -177,11 +177,17 @@ def test_single_episode_zero_outputs(tmp_path: Path) -> None:
     ep = make_dummy_episode("E01", duration=100.0, tmp_path=tmp_path)
     cache_mgr = EvidenceCacheManager(tmp_path / "cache")
 
-    # Scanner returns evidence, Finalizer returns empty outputs []
+    # Scanner returns evidence, Connector returns batch proposals, Finalizer returns empty outputs []
     scanner_resp = {cat: [] for cat in EVIDENCE_CATEGORIES}
+    conn_resp = {
+        "cross_episode_links": [],
+        "candidate_proposals": [],
+        "supporting_character_arcs": [],
+        "rejected_or_merged": [],
+    }
     finalizer_resp = {"outputs": []}
 
-    mock_client = MockAIClient([scanner_resp, finalizer_resp])
+    mock_client = MockAIClient([scanner_resp, conn_resp, finalizer_resp])
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
 
     engine = AnalysisEngine(settings=settings, client=mock_client, cache_manager=cache_mgr)
@@ -204,6 +210,20 @@ def test_single_episode_one_output(tmp_path: Path) -> None:
     cache_mgr = EvidenceCacheManager(tmp_path / "cache")
 
     scanner_resp = {cat: [] for cat in EVIDENCE_CATEGORIES}
+    conn_resp = {
+        "cross_episode_links": [],
+        "candidate_proposals": [
+            {
+                "proposal_id": "prop_01",
+                "title": "The Awakening",
+                "candidate_scope": "SINGLE_EPISODE",
+                "episodes": ["E01"],
+                "status": "keep",
+            }
+        ],
+        "supporting_character_arcs": [],
+        "rejected_or_merged": [],
+    }
     finalizer_resp = {
         "outputs": [
             {
@@ -224,7 +244,7 @@ def test_single_episode_one_output(tmp_path: Path) -> None:
         ]
     }
 
-    mock_client = MockAIClient([scanner_resp, finalizer_resp])
+    mock_client = MockAIClient([scanner_resp, conn_resp, finalizer_resp])
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
 
     engine = AnalysisEngine(settings=settings, client=mock_client, cache_manager=cache_mgr)
@@ -248,6 +268,21 @@ def test_single_episode_multiple_outputs_no_quota_slicing(tmp_path: Path) -> Non
     cache_mgr = EvidenceCacheManager(tmp_path / "cache")
 
     scanner_resp = {cat: [] for cat in EVIDENCE_CATEGORIES}
+    conn_resp = {
+        "cross_episode_links": [],
+        "candidate_proposals": [
+            {
+                "proposal_id": f"prop_{i:02d}",
+                "title": f"Candidate Story {i}",
+                "candidate_scope": "SINGLE_SCENE" if i % 2 == 0 else "SINGLE_EPISODE",
+                "episodes": ["E01"],
+                "status": "keep",
+            }
+            for i in range(1, 5)
+        ],
+        "supporting_character_arcs": [],
+        "rejected_or_merged": [],
+    }
     finalizer_resp = {
         "outputs": [
             {
@@ -274,7 +309,7 @@ def test_single_episode_multiple_outputs_no_quota_slicing(tmp_path: Path) -> Non
         ]
     }
 
-    mock_client = MockAIClient([scanner_resp, finalizer_resp])
+    mock_client = MockAIClient([scanner_resp, conn_resp, finalizer_resp])
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
 
     engine = AnalysisEngine(settings=settings, client=mock_client, cache_manager=cache_mgr)
@@ -495,7 +530,7 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
     conn_calls = [c for c in mock_client.call_history if "season narrative architect" in c["system"].lower()]
     assert len(conn_calls) == 3  # Batch 1 (E01-E03), Batch 2 (E04-E05), Merge (Round final)
 
-    # Batch 1 call: strictly compact summaries of E01-E03, no raw evidence_categories
+    # Batch 1 call: compact summaries, no raw evidence_categories
     b1_call = conn_calls[0]
     assert "CROSS-EPISODE LINKS" in b1_call["system"]
     assert "SUPPORTING/MINOR CHARACTERS" in b1_call["system"]
@@ -503,13 +538,12 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
     assert "E01" in b1_call["user_text"]
     assert "E02" in b1_call["user_text"]
     assert "E03" in b1_call["user_text"]
-    assert "E04" not in b1_call["user_text"]
+    assert "E05" not in b1_call["user_text"]
     assert "evidence_categories" not in b1_call["user_text"]
     assert "conspiracy" in b1_call["user_text"] or "ledger" in b1_call["user_text"]
 
-    # Batch 2 call: strictly compact summaries of E04-E05
+    # Batch 2 call: remaining episode summary
     b2_call = conn_calls[1]
-    assert "E04" in b2_call["user_text"]
     assert "E05" in b2_call["user_text"]
     assert '"episode_id": "E01"' not in b2_call["user_text"]
     assert "evidence_categories" not in b2_call["user_text"]
@@ -1319,10 +1353,9 @@ def test_cross_batch_merge_finds_e02_setup_e08_payoff_preserves_supporting_arcs(
     merge_calls = [c for c in mock_client.call_history if "cross-batch merge synthesizer" in c["system"].lower()]
     assert len(merge_calls) == 1
     m_text = merge_calls[0]["user_text"]
-    assert "batch_E01_E04" in m_text
-    assert "batch_E05_E08" in m_text
     assert "prop_e02_setup" in m_text
     assert "prop_e08_payoff" in m_text
+    assert "Officer Miller" in m_text
 
     # 2. Verify manifest output spans E02 and E08
     assert len(manifest.outputs) == 1
@@ -1352,7 +1385,7 @@ def test_resume_exact_batch3_failure_reuses_prior_batches_and_evidence(tmp_path:
     client1 = MockAIClient(scanner_responses + [b1_resp, b2_resp, b3_fail])
     engine1 = AnalysisEngine(settings=settings, client=client1, cache_manager=cache_mgr)
 
-    with pytest.raises(AnalysisError, match="season batch batch_E08_E10"):
+    with pytest.raises(AnalysisError, match=r"season batch (node_L0_\d+_\d+|batch_)"):
         engine1.analyze(
             project_id="proj_resume",
             episodes=episodes,
@@ -1408,7 +1441,8 @@ def test_resume_exact_batch3_failure_reuses_prior_batches_and_evidence(tmp_path:
     # Only Batch 3 was called (Batches 1 & 2 hit cache)
     batch_calls_2 = [c for c in client2.call_history if "batch connection analyst" in c["system"].lower()]
     assert len(batch_calls_2) == 1
-    assert "batch_E08_E10" in batch_calls_2[0]["user_text"]
+    assert "E09" in batch_calls_2[0]["user_text"]
+    assert "E10" in batch_calls_2[0]["user_text"]
 
     # Merge was called once
     merge_calls_2 = [c for c in client2.call_history if "cross-batch merge synthesizer" in c["system"].lower()]

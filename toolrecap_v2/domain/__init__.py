@@ -7,15 +7,20 @@ from .cache import (
     compute_batch_cache_key,
     compute_cache_key,
     compute_connection_cache_key,
+    compute_finalizer_cache_key,
     compute_merge_cache_key,
+    compute_source_identity_hash,
     compute_summary_cache_key,
     default_evidence_cache_dir,
     default_hierarchy_cache_dir,
+    validate_finalizer_cache_data,
+    validate_hierarchy_cache_data,
 )
 from .enums import (
     AnalysisScope,
     AudioPolicy,
     CandidateScope,
+    CompactionLevel,
     OutputStatus,
     ProjectPhase,
 )
@@ -33,6 +38,8 @@ from .models import (
     SourceEpisode,
     ValidationError,
     build_compact_summary,
+    compact_summary,
+    split_summary_by_timeline,
 )
 from .title import resolve_unique_titles, sanitize_title
 
@@ -44,6 +51,7 @@ __all__ = [
     "CommentaryOutput",
     "CompactEpisodeSummary",
     "CompactSummaryItem",
+    "CompactionLevel",
     "DomainError",
     "EpisodeEvidence",
     "EvidenceCacheManager",
@@ -57,13 +65,19 @@ __all__ = [
     "SourceEpisode",
     "ValidationError",
     "build_compact_summary",
+    "compact_summary",
+    "split_summary_by_timeline",
     "compute_batch_cache_key",
     "compute_cache_key",
     "compute_connection_cache_key",
+    "compute_finalizer_cache_key",
     "compute_merge_cache_key",
+    "compute_source_identity_hash",
     "compute_summary_cache_key",
     "default_evidence_cache_dir",
     "default_hierarchy_cache_dir",
     "resolve_unique_titles",
     "sanitize_title",
+    "validate_finalizer_cache_data",
+    "validate_hierarchy_cache_data",
 ]

@@ -17,6 +17,12 @@ def default_subtitles_cache_dir() -> Path:
     return cache_dir
 
 
+def compute_source_identity_hash(source_video: str | Path) -> str:
+    """Stable hash of resolved source video path for collision-free cache naming."""
+    path_str = str(Path(source_video).resolve()) if source_video else ""
+    return hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:16]
+
+
 def compute_subtitle_cache_key(
     episode_id: str,
     source_video: str | Path,
@@ -65,7 +71,14 @@ class SubtitleCacheManager:
             return stat.st_size, stat.st_mtime
         return 0, 0.0
 
-    def _cache_file_path(self, episode_id: str) -> Path:
+    def _cache_file_path(self, episode_id: str, source_video: str | Path | None = None) -> Path:
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in episode_id) or "default"
+        if source_video:
+            src_hash = compute_source_identity_hash(source_video)
+            return self.cache_dir / f"{safe_id}_{src_hash}.subtitles.json"
+        return self.cache_dir / f"{safe_id}.subtitles.json"
+
+    def _legacy_cache_file_path(self, episode_id: str) -> Path:
         safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in episode_id) or "default"
         return self.cache_dir / f"{safe_id}.subtitles.json"
 
@@ -99,8 +112,8 @@ class SubtitleCacheManager:
             track_source=track_source,
         )
 
-        target_path = self._cache_file_path(episode_id)
-        tmp_path = target_path.with_suffix(".tmp")
+        target_path = self._cache_file_path(episode_id, source_video)
+        tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}")
 
         payload: dict[str, Any] = {
             "cache_key": key,
@@ -139,12 +152,20 @@ class SubtitleCacheManager:
         track_source: str = "",
     ) -> list[SubtitleCue] | None:
         """Load cached cues for an episode. Returns None on cache miss or fingerprint invalidation."""
-        target_path = self._cache_file_path(episode_id)
-        if not target_path.is_file():
-            return None
+        target_path = self._cache_file_path(episode_id, source_video)
+        target_file = target_path
+        is_legacy = False
+
+        if not target_file.is_file():
+            legacy_path = self._legacy_cache_file_path(episode_id)
+            if legacy_path.is_file():
+                target_file = legacy_path
+                is_legacy = True
+            else:
+                return None
 
         try:
-            raw = json.loads(target_path.read_text(encoding="utf-8"))
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 return None
 
@@ -181,15 +202,59 @@ class SubtitleCacheManager:
                 return None
 
             cues_data = raw.get("cues", [])
-            return [SubtitleCue.from_dict(c) for c in cues_data]
+            cues = [SubtitleCue.from_dict(c) for c in cues_data]
+
+            # Safely migrate legacy cache file to new hashed path if valid
+            if is_legacy and source_video:
+                try:
+                    tmp_target = target_path.with_suffix(f".tmp.{os.getpid()}")
+                    tmp_target.write_text(
+                        json.dumps(raw, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    os.replace(tmp_target, target_path)
+                    try:
+                        legacy_path.unlink()
+                    except OSError:
+                        pass
+                except Exception:
+                    pass
+
+            return cues
         except Exception:
             return None
 
-    def invalidate(self, episode_id: str) -> None:
+    def invalidate(
+        self,
+        episode_id: str,
+        source_video: str | Path | None = None,
+    ) -> None:
         """Invalidate cache for an episode."""
-        target = self._cache_file_path(episode_id)
-        if target.is_file():
-            try:
-                target.unlink()
-            except OSError:
-                pass
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in episode_id) or "default"
+        if source_video:
+            target = self._cache_file_path(episode_id, source_video)
+            if target.is_file():
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            legacy = self._legacy_cache_file_path(episode_id)
+            if legacy.is_file():
+                try:
+                    raw = json.loads(legacy.read_text(encoding="utf-8"))
+                    if raw.get("source_video") == str(Path(source_video).resolve()):
+                        legacy.unlink()
+                except Exception:
+                    pass
+        else:
+            for p in self.cache_dir.glob(f"{safe_id}_*.subtitles.json"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            legacy = self._legacy_cache_file_path(episode_id)
+            if legacy.is_file():
+                try:
+                    legacy.unlink()
+                except OSError:
+                    pass

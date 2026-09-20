@@ -1,4 +1,4 @@
-# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.1)
+# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.2)
 
 ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim, truyền hình, tài liệu) tiếng Anh chất lượng cao chỉ với một cú nhấp chuột: quét nguồn video, phân tích và trích xuất hội thoại thực tế (qua phụ đề companion SRT/VTT/ASS, phụ đề đồ họa bitmap PGS/VobSub qua RapidOCR/AI Vision, hoặc nhận diện giọng nói STT faster-whisper), suy luận kịch bản phân đoạn 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, tổng hợp giọng dẫn thuyết minh chân thực với 12 giọng thiết kế chuẩn, phối trộn âm thanh tự động (Real Audio Mix with Auto-Ducking), nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
 
@@ -96,25 +96,40 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 - **Thư mục xuất video**: Chọn vị trí lưu trữ thành phẩm recap.
 - **Hệ thống phụ & Cập nhật**: Kiểm tra phiên bản và môi trường phụ trợ VoiceStudio.
 
-*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong. Các thông số độ tin cậy AI như phase timeouts, số lượt thử lại 3 attempts, kích thước batching 3-4 cũng được quản lý hoàn toàn nội bộ, không đưa vào giao diện Settings nhằm tránh làm phức tạp trải nghiệm người dùng).*
+*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong. Toàn bộ cơ chế thích ứng tự động và độ tin cậy AI như đo lường byte chính xác, chia nhỏ/cô đọng/hợp nhất đệ quy, khôi phục cache, phase timeouts, số lượt thử lại 3 attempts và phân lô batching được quản lý hoàn toàn tự động ngầm bên trong, không đưa vào giao diện Settings nhằm giữ trải nghiệm người dùng tinh gọn, không cần người dùng phải tự điều chỉnh bất kỳ thông số kỹ thuật nào).*
 
 ---
 
-## 5. Độ Tin Cậy AI Gateway (AI Reliability & Resilience)
+## 5. Độ Tin Cậy AI Gateway & Cơ Chế Thích Ứng Tự Động (AI Reliability & Adaptive Behavior)
 
-Quy trình phân tích kịch bản bằng AI Gateway được thiết kế với cơ chế độ tin cậy công nghiệp:
+Quy trình phân tích kịch bản bằng AI Gateway được thiết kế với cơ chế thích ứng tự động và độ tin cậy chuẩn công nghiệp, hoạt động hoàn toàn ngầm mà **không đòi hỏi người dùng phải cấu hình hay tinh chỉnh thủ công**:
 
-1. **Phase Timeouts nội bộ**: Mỗi giai đoạn phân tích AI (`scanner`, `season_connecting`, `season_mining`, `finalizer`) được ấn định thời hạn chờ (timeout) nội bộ riêng biệt, tối ưu theo khối lượng tính toán. Người dùng không phải bận tâm cấu hình thủ công.
-2. **Tự động thử tối đa 3 lần**: Khi gặp lỗi timeout, mất kết nối, HTTP 429 hoặc lỗi máy chủ tạm thời, hệ thống tự động thử lại với khoảng chờ 5 và 15 giây. Nút Stop ngắt khoảng chờ ngay lập tức.
-3. **Phân tích mùa theo lô 3–4 tập**: Mỗi request Season Connection chỉ nhận compact summaries của tối đa 3–4 tập. Các kết quả lô được hợp nhất phân cấp để kết nối cốt truyện xuyên suốt mùa.
-4. **Tóm tắt cô đọng, Cache & Khôi phục (Compact Summaries, Caching & Resume)**:
-   - Tự động sinh tóm tắt cô đọng cho các đoạn hội thoại dài, giảm thiểu token dư thừa.
-   - Lưu trữ kết quả phân tích theo mã băm định danh nội dung (content hash cache).
-   - Hỗ trợ khôi phục và tiếp tục (resume) xử lý ngay tại giai đoạn dang dở mà không cần quét lại từ đầu.
-5. **Phân định rõ quyền sở hữu tiến trình & lỗi (Progress & Error Ownership)**:
-   - Trạng thái tiến trình được gán rõ ràng theo từng giai đoạn và từng tập phim.
-   - Khi phát sinh lỗi, hệ thống phân định chính xác phạm vi (tập phim đơn lẻ hay toàn mùa) và thông báo lỗi rõ ràng trên hàng đợi, không làm gián đoạn hay làm sai lệch dữ liệu của các tập thành công khác.
-6. **Cài đặt tinh gọn**: Toàn bộ các cơ chế độ tin cậy trên hoạt động ngầm (internal), không đưa các thiết lập kỹ thuật này vào bảng cài đặt.
+1. **Đo lường chính xác kích thước yêu cầu (Exact Request Measurement)**:
+   - Trước khi gửi bất kỳ yêu cầu nào đến AI Gateway, hệ thống tự động tính toán chính xác kích thước byte thực tế của toàn bộ payload JSON đã tuần tự hóa.
+   - Khi kích thước tiệm cận giới hạn ngữ cảnh mô hình hoặc trần dữ liệu (payload ceiling), hệ thống tự động kích hoạt chiến lược chia nhỏ và cô đọng thích ứng, tuyệt đối không để xảy ra lỗi tràn bộ nhớ ngữ cảnh hay bị Gateway từ chối.
+
+2. **Chia nhỏ, cô đọng, hợp nhất đệ quy & Tiếp tục từ bộ nhớ đệm (Split, Compact, Recursive Merge & Cache Resume)**:
+   - **Chia nhỏ thích ứng (Split)**: Dữ liệu transcript hoặc các tập phim dài tự động được phân chia theo mốc thời gian (cues/timeline) thành các phân đoạn nhỏ hơn vừa vặn ngưỡng trần mà không làm đứt gãy mạch sự kiện.
+   - **Cô đọng thông minh (Compact)**: Tự động trích lọc và nén thông tin tóm tắt ở các cấp độ phù hợp, loại bỏ chi tiết trùng lặp và giữ trọn vẹn diễn biến cùng nhân vật chính.
+   - **Hợp nhất đệ quy (Recursive Merge)**: Các kết quả phân tích phân đoạn và các lô tập phim được hợp nhất dần theo cấu trúc cây phân cấp đệ quy, bảo đảm câu chuyện xuyên suốt toàn mùa kết nối mượt mà mà mỗi yêu cầu gửi đi đều nằm trong giới hạn an toàn.
+   - **Tiếp tục từ bộ nhớ đệm (Cache Resume)**: Mọi kết quả phân tích ở từng nút phân cấp đều được lưu cache theo mã băm nội dung (content hash). Khi tiến trình bị dừng hoặc chạy lại, hệ thống lập tức khôi phục và tiếp tục từ cache đã có, không bao giờ gọi lại API trùng lặp, tiết kiệm tối đa thời gian và chi phí.
+
+3. **Cơ chế thử lại phản hồi dùng chung (Shared Response Retry)**:
+   - Mọi giai đoạn phân tích AI (`scanner`, `season_connecting`, `season_mining`, `finalizer`) đều dùng chung một bộ xử lý thử lại chuẩn hóa và thông minh.
+   - Tự động nhận diện và khắc phục lỗi mạng tạm thời, lỗi quá tải tần suất (HTTP 429 với Retry-After), lỗi máy chủ (HTTP 5xx), cũng như **6 dạng khuyết tật phản hồi HTTP 200** (phản hồi rỗng, JSON ngoài không hợp lệ, thiếu choices, thiếu content, nội dung rỗng, hoặc JSON mô hình bị lỗi cú pháp).
+   - Tự động thử lại tối đa 3 lần với khoảng chờ tăng dần (5s, 15s), hỗ trợ ngắt tức thì bằng nút Stop.
+
+4. **Hoàn toàn phổ quát — Không có quy tắc riêng theo từng phim (Explicit No Show-Specific Tuning)**:
+   - Toàn bộ thuật toán thích ứng vận hành tự động dựa trên độ dài dữ liệu, mốc thời gian và giới hạn token/byte thực tế.
+   - Tuyệt đối KHÔNG chứa bất kỳ quy tắc đặc thù hay tham số gán cứng cho một bộ phim hay thể loại cụ thể nào. Mọi tác phẩm từ phim truyền hình dài tập, phim tài liệu, soap opera đến video ngắn đều được xử lý công bằng, ổn định và tự động.
+
+5. **Không để lộ chi tiết byte ra ngoài, chỉ hiển thị ở chẩn đoán (No Overexposure of Bytes Except Diagnostics)**:
+   - Giao diện người dùng được thiết kế trực quan, thân thiện cho mọi đối tượng; các thông số kỹ thuật như số byte, độ lớn payload, số tầng đệ quy hay ID nút không hiển thị lên giao diện chính để tránh gây rối mắt.
+   - Mọi thông số đo lường kích thước byte chỉ được ghi nhận một cách chuẩn xác trong tệp nhật ký chẩn đoán (diagnostics log) phục vụ theo dõi và gỡ lỗi chuyên sâu khi cần.
+
+6. **Phase Timeouts nội bộ & Phân định lỗi rõ ràng**:
+   - Mỗi giai đoạn AI được ấn định thời hạn chờ (timeout) nội bộ riêng biệt, tối ưu theo khối lượng tính toán.
+   - Trạng thái tiến trình và lỗi được phân định chính xác theo từng tập phim và giai đoạn trên hàng đợi, không làm ảnh hưởng đến các tập đã hoàn thành khác.
 
 ---
 
@@ -203,7 +218,7 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
    - Dựng ứng dụng bằng PyInstaller với tệp cấu hình `ToolRecapV2.spec`.
    - Nhúng FFmpeg, FFprobe, giấy phép và tệp hướng dẫn sử dụng vào `release\ToolRecapV2\`.
    - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp thực thi đã dựng.
-   - Nén toàn bộ thành `release\ToolRecapV2-v0.3.1-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.1-windows-portable.zip.sha256.txt`.
+    - Nén toàn bộ thành `release\ToolRecapV2-v0.3.2-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.2-windows-portable.zip.sha256.txt`.
 
 ---
 
