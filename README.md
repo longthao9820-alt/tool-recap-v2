@@ -1,6 +1,6 @@
-# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.3.2)
+# ToolRecap V2 — Ứng Dụng Tự Động Hóa Sản Xuất Video Recap (Portable Windows v0.4.0)
 
-ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim, truyền hình, tài liệu) tiếng Anh chất lượng cao chỉ với một cú nhấp chuột: quét nguồn video, phân tích và trích xuất hội thoại thực tế (qua phụ đề companion SRT/VTT/ASS, phụ đề đồ họa bitmap PGS/VobSub qua RapidOCR/AI Vision, hoặc nhận diện giọng nói STT faster-whisper), suy luận kịch bản phân đoạn 2 giai đoạn (Scanner -> Finalizer) qua AI Gateway chuẩn OpenAI, tổng hợp giọng dẫn thuyết minh chân thực với 12 giọng thiết kế chuẩn, phối trộn âm thanh tự động (Real Audio Mix with Auto-Ducking), nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
+ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Windows giúp tự động hóa 100% quy trình sản xuất video recap (tóm tắt phim, truyền hình, tài liệu) tiếng Anh chất lượng cao chỉ với một cú nhấp chuột: quét nguồn video, phân tích và trích xuất hội thoại thực tế (qua phụ đề companion SRT/VTT/ASS, phụ đề đồ họa bitmap PGS/VobSub qua RapidOCR/AI Vision, hoặc nhận diện giọng nói STT faster-whisper), suy luận kịch bản phân đoạn đa tầng có đối soát độ phủ (Scanner -> Coverage Second Pass -> Connection -> Candidate Discovery & Consolidation -> Finalizer) qua AI Gateway chuẩn OpenAI, tổng hợp giọng dẫn thuyết minh chân thực với 12 giọng thiết kế chuẩn, phối trộn âm thanh tự động (Real Audio Mix with Auto-Ducking), nhúng phụ đề và xuất bản video hoàn chỉnh với tăng tốc phần cứng Hybrid GPU.
 
 ---
 
@@ -35,26 +35,69 @@ ToolRecap V2 là ứng dụng máy tính dành riêng cho hệ điều hành Win
 
 ---
 
-## 3. Các Giai Đoạn Xử Lý (Phases)
+## 3. Các Điểm Cải Tiến Cốt Lõi Trong Phiên Bản v0.4.0
+
+### 3.1. Một Câu Nhắc Điều Khiển Toàn Bộ Chu Trình (One Prompt Controls Full Pipeline)
+- Người dùng chỉ cần nhập một câu nhắc duy nhất tại khung **"Recap Prompt"** trong Cài đặt (Tab 1 - Recap).
+- Hệ thống tự động phân tích và giải mã câu nhắc này thành các chỉ thị biên tập chuyên biệt cho từng giai đoạn độc lập:
+  - *Chỉ thị quét Scanner*: Nhận diện các sự kiện, lời thoại và mâu thuẫn trọng tâm.
+  - *Chỉ thị độ phủ (Coverage)*: Xác định các khoảng thời gian hoặc nhân vật cần kiểm tra bổ sung.
+  - *Chỉ thị liên kết mùa (Connection)*: Hướng dẫn kết nối các tuyến truyện xuyên suốt các tập.
+  - *Chỉ thị ứng viên (Candidate Discovery & Consolidation)*: Định hướng lựa chọn và gom nhóm ý tưởng kịch bản.
+  - *Chỉ thị hoàn thiện (Finalizer)*: Quy định giọng văn và cấu trúc phân đoạn kịch bản cuối cùng.
+- Không cần cấu hình phức tạp ở nhiều nơi; một chỉ dẫn thống nhất điều phối toàn diện chất lượng nội dung.
+
+### 3.2. Quét Phủ Lần Hai (Coverage Second Pass)
+- Hệ thống tự động xây dựng sổ cái theo dõi độ phủ thời gian thực (`Coverage Ledger`) cho từng tập phim, đo lường tỷ lệ bao phủ của lời thoại và các bằng chứng câu chuyện.
+- Khi phát hiện khoảng trống thời gian (`gap`) đáng kể hoặc thiếu hụt bằng chứng cho các nhân vật/danh mục chính, hệ thống tự động kích hoạt **lượt quét thứ hai có mục tiêu** (second-pass) nhắm chính xác vào khoảng thời gian đó.
+- Đảm bảo trích xuất đầy đủ các diễn biến quan trọng mà không bị sót dữ liệu trong các tập phim dài.
+
+### 3.3. Khám Phá & Hợp Nhất Ứng Viên (Candidate Discovery & Consolidation)
+- **Khám phá ứng viên (Discovery)**: Tự động tìm kiếm các ý tưởng kịch bản tiềm năng ở nhiều cấp độ (cảnh đơn lẻ, chuỗi cảnh, hoặc tuyến truyện xuyên suốt cả mùa), gắn chặt với mốc thời gian thực tế.
+- **Hợp nhất ứng viên (Consolidation)**: Tự động gom nhóm các ứng viên trùng lặp hoặc bổ trợ cho nhau theo cấu trúc phân cấp thông minh, giữ lại các góc nhìn độc đáo (kể cả nhân vật phụ) và loại bỏ sự trùng lặp mà không làm đứt gãy mạch truyện.
+
+### 3.4. Phân Định Rõ Ràng Lý Do 0 Output (Genuine Zero Reason Distinctions)
+- Khi một tập phim hoặc mùa phim không tạo ra video recap nào (0 output), hệ thống phân biệt rạch ròi giữa hai trường hợp:
+  1. **Không có kết quả hợp lệ (Genuine Zero)**: Video nguồn không có diễn biến nào khớp với tiêu chí biên tập yêu cầu (ví dụ: tập phim toàn cảnh im lặng, hoặc không có sự kiện nào đạt chuẩn). Trường hợp này được bộ phận kiểm toán độc lập (`verifier`) xác nhận là hợp lệ, báo trạng thái hoàn tất thành công và nêu rõ lý do chính đáng.
+  2. **Lỗi kỹ thuật**: Sự cố mạng, lỗi phân tích cú pháp, thiếu dữ liệu phụ đề hoặc lỗi dịch vụ AI. Hệ thống sẽ báo lỗi rõ ràng kèm mã lỗi chi tiết để xử lý.
+
+### 3.5. Không Áp Đặt Chỉ Tiêu Số Lượng Cứng (No Quota)
+- Hệ thống **tuyệt đối không áp đặt hạn mức hay chỉ tiêu số lượng nhân tạo** (no quota slicing).
+- Nếu nội dung phim có 1, 3 hay nhiều tuyến truyện xuất sắc được chứng minh bằng bằng chứng thực tế, hệ thống sẽ tạo ra bấy nhiêu video recap tương ứng; ngược lại, nếu không có câu chuyện nào đủ chất lượng, hệ thống sẽ thông báo trung thực thay vì cố tình chia nhỏ hay bịa đặt kịch bản để đạt số lượng.
+
+### 3.6. Cơ Chế Hủy & Làm Mới Bộ Nhớ Đệm Thông Minh (Cache Invalidation)
+- Khóa bộ nhớ đệm (`cache key`) được tính toán dựa trên mã băm của chính câu nhắc biên tập (`prompt_hash`), cấu hình phân tích và dấu vết của tệp video nguồn.
+- Khi người dùng chỉnh sửa câu nhắc trong Cài đặt hoặc thay đổi tệp video, bộ nhớ đệm cũ sẽ tự động được làm mới tương ứng cho các phần bị ảnh hưởng.
+- Các tập phim hoặc phân đoạn không thay đổi sẽ tiếp tục tái sử dụng kết quả đã lưu trong bộ nhớ đệm, giúp tiết kiệm thời gian và chi phí API tối đa.
+
+### 3.7. Giới Hạn Thực Tế Về Hình Ảnh & Lời Thoại (Transcript-Only Limitation)
+- **Tính chất trung thực**: Hệ thống phân tích kịch bản căn cứ chủ yếu trên phụ đề và lời thoại bóc tách từ video (Transcript-Only).
+- **Giới hạn hình ảnh**: Những tình tiết điện ảnh diễn ra hoàn toàn bằng hình ảnh im lặng (như ánh mắt, hành động không lời, hoặc cảnh quay không có hội thoại và không có phụ đề miêu tả) sẽ có giới hạn phản ánh trong kịch bản, trừ khi người dùng bật tùy chọn **"Scanner model supports image/Vision input"** trong Cài đặt để gửi hình ảnh lên mô hình Vision hỗ trợ giải mã.
+
+---
+
+## 4. Các Giai Đoạn Xử Lý (Phases)
 
 Mỗi tập phim và mùa phim được xử lý tuần tự qua các giai đoạn nghiêm ngặt:
 
 1. **`media_probe`**: Thăm dò và phân tích thông số kỹ thuật video (độ phân giải, thời lượng, luồng hình ảnh, luồng âm thanh) bằng FFprobe nhúng.
 2. **`subtitles`**: Khám phá và trích xuất phụ đề (ưu tiên tiếng Anh, xử lý tệp phụ đề ngoài hoặc luồng phụ đề nhúng trong container).
 3. **`scanner`**: Quét từng phân đoạn transcript/video qua Scanner AI để trích xuất bằng chứng câu chuyện (narrative evidence) gắn mốc thời gian tuyệt đối.
-4. **`season_barrier`** (Chế độ Season): Điểm đồng bộ hóa bắt buộc — toàn bộ các tập trong mùa phải hoàn thành giai đoạn Scanner trước khi bước vào kết nối mùa.
-5. **`season_connecting`** (Chế độ Season): Phân tích mạng lưới liên kết sự kiện, xung đột và nhân vật xuyên suốt toàn bộ các tập của mùa.
-6. **`season_mining`** (Chế độ Season): Khai phá và tuyển chọn các ứng viên kịch bản hoàn chỉnh (Candidate Mining).
-7. **`output_plan_ready`**: Hoàn thiện kế hoạch phân đoạn và kịch bản recap.
-8. **Giai đoạn Kết xuất (Rendering)**:
-   - Tổng hợp lời dẫn thuyết minh (Timeline narration) bằng mô hình giọng đọc AI.
-   - Phối trộn âm thanh thông minh (Real Audio Mix).
-   - Tạo tệp phụ đề SRT đồng bộ chính xác đến từng mili-giây.
-   - Mã hóa video đầu ra hoàn chỉnh bằng bộ tăng tốc Hybrid GPU hoặc CPU.
+4. **`coverage_check` & `second_pass`**: Đối soát sổ cái độ phủ, phát hiện khoảng trống và quét bổ sung có mục tiêu.
+5. **`season_barrier`** (Chế độ Season): Điểm đồng bộ hóa bắt buộc — toàn bộ các tập trong mùa phải hoàn thành Scanner và kiểm tra độ phủ trước khi kết nối.
+6. **`season_connecting`** (Chế độ Season): Phân tích mạng lưới liên kết sự kiện, xung đột và nhân vật xuyên suốt toàn bộ các tập của mùa.
+7. **`candidate_discovery` & `candidate_consolidation`**: Khám phá các ý tưởng kịch bản tiềm năng và hợp nhất các ứng viên trùng lặp.
+8. **`zero_output_verification`**: Kiểm toán độc lập và xác minh kết quả khi số lượng ứng viên bằng 0 hoặc có độ phủ thấp bất thường.
+9. **`output_plan_ready`**: Hoàn thiện kế hoạch phân đoạn và kịch bản recap.
+10. **Giai đoạn Kết xuất (Rendering)**:
+    - Tổng hợp lời dẫn thuyết minh (Timeline narration) bằng mô hình giọng đọc AI.
+    - Phối trộn âm thanh thông minh (Real Audio Mix).
+    - Tạo tệp phụ đề SRT đồng bộ chính xác đến từng mili-giây.
+    - Mã hóa video đầu ra hoàn chỉnh bằng bộ tăng tốc Hybrid GPU hoặc CPU.
 
 ---
 
-## 4. Cấu Hình Cài Đặt (Chính Xác 4 Tab)
+## 5. Cấu Hình Cài Đặt (Chính Xác 4 Tab)
 
 Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa sổ cấu hình trung tâm với đúng 4 tab:
 
@@ -63,7 +106,7 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 - **Recap mode**: Chế độ recap (`MAIN_STORIES` — tập trung tuyến truyện chính, hoặc `FULL_EPISODE` — tóm tắt toàn diện tập).
 - **Content type**: Phân loại nội dung (`US_TV_SHOW`, `DE_GERMAN_SOAP`, `BODYCAM`, `FEATURE_FILM`, `OTHER`).
 - **Footage rights**: Trạng thái bản quyền tư liệu (`UNVERIFIED`, `OWNED`, `LICENSED`, `FIRST_PUBLICATION_RIGHTS`, `FAIR_USE`).
-- **Recap Prompt**: Khung soạn thảo prompt chỉ dẫn cho AI tạo kịch bản, kèm nút **"Reload Default Prompt"** để khôi phục chỉ dẫn chuẩn của từng thể loại phim.
+- **Recap Prompt**: Khung soạn thảo prompt duy nhất điều khiển toàn bộ pipeline, kèm nút **"Reload Default Prompt"** để khôi phục chỉ dẫn chuẩn của từng thể loại phim.
 
 ### Tab 2: AI Gateway (Kết Nối Mô Hình AI)
 - **Kích hoạt AI Gateway**: Bật/tắt phân tích kịch bản qua API OpenAI-compatible (khi tắt, hệ thống sử dụng thuật toán tóm tắt trích xuất offline nội bộ).
@@ -96,40 +139,7 @@ Nhấn nút **"⚙ Settings"** trên thanh công cụ chính để mở cửa s�
 - **Thư mục xuất video**: Chọn vị trí lưu trữ thành phẩm recap.
 - **Hệ thống phụ & Cập nhật**: Kiểm tra phiên bản và môi trường phụ trợ VoiceStudio.
 
-*(Lưu ý: Hệ thống không để lộ tab STT riêng biệt; tính năng nhận diện giọng nói STT hoạt động tự động ngầm bên trong. Toàn bộ cơ chế thích ứng tự động và độ tin cậy AI như đo lường byte chính xác, chia nhỏ/cô đọng/hợp nhất đệ quy, khôi phục cache, phase timeouts, số lượt thử lại 3 attempts và phân lô batching được quản lý hoàn toàn tự động ngầm bên trong, không đưa vào giao diện Settings nhằm giữ trải nghiệm người dùng tinh gọn, không cần người dùng phải tự điều chỉnh bất kỳ thông số kỹ thuật nào).*
-
----
-
-## 5. Độ Tin Cậy AI Gateway & Cơ Chế Thích Ứng Tự Động (AI Reliability & Adaptive Behavior)
-
-Quy trình phân tích kịch bản bằng AI Gateway được thiết kế với cơ chế thích ứng tự động và độ tin cậy chuẩn công nghiệp, hoạt động hoàn toàn ngầm mà **không đòi hỏi người dùng phải cấu hình hay tinh chỉnh thủ công**:
-
-1. **Đo lường chính xác kích thước yêu cầu (Exact Request Measurement)**:
-   - Trước khi gửi bất kỳ yêu cầu nào đến AI Gateway, hệ thống tự động tính toán chính xác kích thước byte thực tế của toàn bộ payload JSON đã tuần tự hóa.
-   - Khi kích thước tiệm cận giới hạn ngữ cảnh mô hình hoặc trần dữ liệu (payload ceiling), hệ thống tự động kích hoạt chiến lược chia nhỏ và cô đọng thích ứng, tuyệt đối không để xảy ra lỗi tràn bộ nhớ ngữ cảnh hay bị Gateway từ chối.
-
-2. **Chia nhỏ, cô đọng, hợp nhất đệ quy & Tiếp tục từ bộ nhớ đệm (Split, Compact, Recursive Merge & Cache Resume)**:
-   - **Chia nhỏ thích ứng (Split)**: Dữ liệu transcript hoặc các tập phim dài tự động được phân chia theo mốc thời gian (cues/timeline) thành các phân đoạn nhỏ hơn vừa vặn ngưỡng trần mà không làm đứt gãy mạch sự kiện.
-   - **Cô đọng thông minh (Compact)**: Tự động trích lọc và nén thông tin tóm tắt ở các cấp độ phù hợp, loại bỏ chi tiết trùng lặp và giữ trọn vẹn diễn biến cùng nhân vật chính.
-   - **Hợp nhất đệ quy (Recursive Merge)**: Các kết quả phân tích phân đoạn và các lô tập phim được hợp nhất dần theo cấu trúc cây phân cấp đệ quy, bảo đảm câu chuyện xuyên suốt toàn mùa kết nối mượt mà mà mỗi yêu cầu gửi đi đều nằm trong giới hạn an toàn.
-   - **Tiếp tục từ bộ nhớ đệm (Cache Resume)**: Mọi kết quả phân tích ở từng nút phân cấp đều được lưu cache theo mã băm nội dung (content hash). Khi tiến trình bị dừng hoặc chạy lại, hệ thống lập tức khôi phục và tiếp tục từ cache đã có, không bao giờ gọi lại API trùng lặp, tiết kiệm tối đa thời gian và chi phí.
-
-3. **Cơ chế thử lại phản hồi dùng chung (Shared Response Retry)**:
-   - Mọi giai đoạn phân tích AI (`scanner`, `season_connecting`, `season_mining`, `finalizer`) đều dùng chung một bộ xử lý thử lại chuẩn hóa và thông minh.
-   - Tự động nhận diện và khắc phục lỗi mạng tạm thời, lỗi quá tải tần suất (HTTP 429 với Retry-After), lỗi máy chủ (HTTP 5xx), cũng như **6 dạng khuyết tật phản hồi HTTP 200** (phản hồi rỗng, JSON ngoài không hợp lệ, thiếu choices, thiếu content, nội dung rỗng, hoặc JSON mô hình bị lỗi cú pháp).
-   - Tự động thử lại tối đa 3 lần với khoảng chờ tăng dần (5s, 15s), hỗ trợ ngắt tức thì bằng nút Stop.
-
-4. **Hoàn toàn phổ quát — Không có quy tắc riêng theo từng phim (Explicit No Show-Specific Tuning)**:
-   - Toàn bộ thuật toán thích ứng vận hành tự động dựa trên độ dài dữ liệu, mốc thời gian và giới hạn token/byte thực tế.
-   - Tuyệt đối KHÔNG chứa bất kỳ quy tắc đặc thù hay tham số gán cứng cho một bộ phim hay thể loại cụ thể nào. Mọi tác phẩm từ phim truyền hình dài tập, phim tài liệu, soap opera đến video ngắn đều được xử lý công bằng, ổn định và tự động.
-
-5. **Không để lộ chi tiết byte ra ngoài, chỉ hiển thị ở chẩn đoán (No Overexposure of Bytes Except Diagnostics)**:
-   - Giao diện người dùng được thiết kế trực quan, thân thiện cho mọi đối tượng; các thông số kỹ thuật như số byte, độ lớn payload, số tầng đệ quy hay ID nút không hiển thị lên giao diện chính để tránh gây rối mắt.
-   - Mọi thông số đo lường kích thước byte chỉ được ghi nhận một cách chuẩn xác trong tệp nhật ký chẩn đoán (diagnostics log) phục vụ theo dõi và gỡ lỗi chuyên sâu khi cần.
-
-6. **Phase Timeouts nội bộ & Phân định lỗi rõ ràng**:
-   - Mỗi giai đoạn AI được ấn định thời hạn chờ (timeout) nội bộ riêng biệt, tối ưu theo khối lượng tính toán.
-   - Trạng thái tiến trình và lỗi được phân định chính xác theo từng tập phim và giai đoạn trên hàng đợi, không làm ảnh hưởng đến các tập đã hoàn thành khác.
+*(Lưu ý: Toàn bộ cơ chế thích ứng tự động và độ tin cậy AI như đo lường byte chính xác, chia nhỏ/cô đọng/hợp nhất đệ quy, khôi phục cache, phase timeouts, số lượt thử lại 3 attempts và phân lô batching được quản lý hoàn toàn tự động ngầm bên trong, không đưa vào giao diện Settings nhằm giữ trải nghiệm người dùng tinh gọn).*
 
 ---
 
@@ -183,7 +193,40 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
 
 ---
 
-## 10. Cập Nhật & Lưu Trữ Dữ Liệu
+## 10. Kiến Trúc Kỹ Thuật (Engineering Architecture)
+
+### 10.1. Nguyên Nhân Gốc Rễ (Root Cause Analysis)
+Trước phiên bản v0.4.0 (R8), hệ thống gặp phải các vấn đề cốt lõi sau:
+1. **Lỗ hổng độ phủ một lượt quét (Single-pass Coverage Gaps)**: Phân tích Scanner trong một lượt duy nhất dễ bỏ sót các diễn biến quan trọng ở những đoạn hội thoại thưa hoặc cảnh chuyển giao, không có cơ chế đối soát dòng thời gian thực tế.
+2. **Ghép nối chỉ dẫn rời rạc (Fragmented Prompt Coupling)**: Các chỉ thị biên tập cho Scanner, Connection và Finalizer bị phân mảnh, thiếu một cơ chế chuyển hóa thống nhất từ một prompt duy nhất của người dùng.
+3. **Thiếu giai đoạn tuyển chọn ứng viên (Lack of Candidate Discovery & Consolidation)**: Quá trình chuyển từ bằng chứng sự kiện sang kế hoạch kịch bản thiếu bước khám phá ý tưởng đa chiều và gộp nhóm khử trùng lặp, dễ dẫn đến các kịch bản trùng ý hoặc thiên lệch nhân vật chính.
+4. **Không phân định được kết quả 0 output (Ambiguous Zero-Output)**: Khi không có kết quả đầu ra, hệ thống không phân biệt được giữa việc không có câu chuyện phù hợp do nội dung thực tế (Genuine Zero) với các lỗi kỹ thuật hệ thống.
+
+### 10.2. Các Mô-đun Mới Trong Kiến Trúc v0.4.0
+Để giải quyết triệt để các nguyên nhân trên, kiến trúc R8 bổ sung các mô-đun chuyên biệt:
+
+1. **`toolrecap_v2.domain.policy` (Editorial Policy Engine)**:
+   - Tiếp nhận một câu nhắc duy nhất (`raw_prompt`) từ người dùng và phân tích cú pháp ngoại tuyến thành các chỉ thị cấu trúc:
+     - `ScannerDirective`: Quy định danh mục và tiêu chí trích xuất bằng chứng.
+     - `CoverageDirective`: Quy định mức độ bao phủ và các khoảng trống cần quét lại.
+     - `ConnectionDirective`: Quy định cách thức liên kết sự kiện giữa các tập phim.
+     - `CandidateDirective`: Quy định tiêu chí khám phá và lọc ứng viên kịch bản.
+     - `OutputDirective` & `ValidationDirective`: Quy định định dạng và ràng buộc tính xác thực.
+   - Tạo mã băm chính sách (`policy_hash`) phục vụ cơ chế làm mới bộ nhớ đệm chính xác.
+
+2. **`toolrecap_v2.analyzer.coverage` (Coverage Ledger & Gap Auditor)**:
+   - `CoverageLedger`: Theo dõi mốc thời gian chi tiết của từng tập phim, tính toán tỷ lệ bao phủ transcript và bằng chứng.
+   - `detect_coverage_gaps`: Tự động nhận diện các khoảng trống thời gian, danh mục hoặc nhân vật thiếu bằng chứng.
+   - `reconcile_coverage_gaps` & `plan_second_pass_requests`: Lập kế hoạch và thực hiện quét bổ sung lần 2 (second-pass) có mục tiêu.
+
+3. **`toolrecap_v2.analyzer.candidates` (Candidate Discovery, Consolidation & Verification)**:
+   - `discovery.py`: Khám phá ứng viên kịch bản cho tập đơn lẻ (`discover_candidates_single`) và trọn bộ mùa phim (`discover_candidates_season`).
+   - `consolidation.py`: Gộp nhóm các ứng viên tương đồng (`consolidate_candidates`), chấm điểm và loại bỏ trùng lặp thông minh.
+   - `verifier.py`: Kiểm toán độc lập kết quả khi số lượng ứng viên bằng 0 (`verify_zero_or_low_output`), phân định chính xác 9 mã lý do và xác nhận Genuine Zero hợp lệ (`is_genuine_zero_valid`).
+
+---
+
+## 11. Cập Nhật & Lưu Trữ Dữ Liệu
 
 - **Cập nhật ứng dụng ToolRecap V2**: Tự động kiểm tra GitHub Releases chính thức từ `longthao9820-alt/tool-recap-v2`. Bản cập nhật được xác thực mã băm SHA256 trước khi hoán đổi an toàn có cơ chế khôi phục (rollback).
 - **Cập nhật VoiceStudio Subsystem**: Kiểm tra và áp dụng gói cập nhật adapter tách biệt, xác thực mã băm SHA256 và manifest hợp lệ.
@@ -193,20 +236,12 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
   ```
   - `settings.json`: Cấu hình ứng dụng và API Key (lưu văn bản thuần cục bộ).
   - `projects.json`: Lịch sử và hàng đợi dự án (lưu nguyên tử, chống hỏng hóc khi mất điện).
-  - `cache\gateway_analysis\`: Bộ nhớ đệm phân tích AI Gateway theo mã băm video, giúp chạy lại không tốn API call.
+  - `cache\gateway_analysis\`: Bộ nhớ đệm phân tích AI Gateway theo mã băm video và prompt hash.
+  - `cache\episode_evidence\`: Bộ nhớ đệm bằng chứng tập phim và quét phủ lần hai.
   - `cache\subtitles\`: Bộ nhớ đệm phụ đề và kết quả OCR.
   - `voice_subsystem\`: Môi trường runtime Python độc lập cho giọng đọc nâng cao.
   - `models\`: Bộ nhớ đệm trọng số mô hình AI (OCR, STT, TTS).
   - `logs\`: Nhật ký hoạt động và thông báo lỗi.
-
----
-
-## 11. Giới Hạn Của Hệ Thống (Limitations)
-
-- **Mạng Internet lần đầu**: Cần kết nối Internet ổn định ở lần sử dụng đầu tiên để tải các gói runtime và mô hình AI nặng.
-- **Yêu cầu phần cứng**: Để đạt tốc độ mã hóa video cao nhất, khuyến nghị máy tính có card đồ họa hỗ trợ NVIDIA NVENC, AMD AMF hoặc Intel QSV. Nếu không có card rời, ứng dụng tự động dùng CPU với bộ mã hóa `libx264` chất lượng cao nhưng thời gian kết xuất sẽ lâu hơn.
-- **Độ phụ thuộc vào nguồn thoại**: AI Gateway suy luận và tạo kịch bản dựa trên phụ đề và lời thoại nhận dạng được. Đối với video không có bất kỳ lời thoại hay phụ đề nào, kịch bản recap sẽ chỉ dựa trên thông tin dòng thời gian tổng quát.
-- **Giới hạn kết nối mạng HTTP In-Flight**: Yêu cầu mạng HTTP `urlopen` đang gửi nhận trực tiếp trên socket không thể bị ngắt giữa chừng từ bên ngoài Python socket mà phải chờ máy chủ phản hồi hoặc chạm thời gian chờ socket timeout. Nút Stop sẽ ngắt chu kỳ chờ thử lại (backoff) và ngăn không cho các giai đoạn kế tiếp được kích hoạt.
 
 ---
 
@@ -218,7 +253,7 @@ Thư mục xuất bản được tự động dọn dẹp sạch sẽ, không ch
    - Dựng ứng dụng bằng PyInstaller với tệp cấu hình `ToolRecapV2.spec`.
    - Nhúng FFmpeg, FFprobe, giấy phép và tệp hướng dẫn sử dụng vào `release\ToolRecapV2\`.
    - Chạy kiểm tra tự động `--version` và `--self-check` trên tệp thực thi đã dựng.
-    - Nén toàn bộ thành `release\ToolRecapV2-v0.3.2-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.3.2-windows-portable.zip.sha256.txt`.
+   - Nén toàn bộ thành `release\ToolRecapV2-v0.4.0-windows-portable.zip` và tạo tệp mã băm companion `ToolRecapV2-v0.4.0-windows-portable.zip.sha256.txt`.
 
 ---
 

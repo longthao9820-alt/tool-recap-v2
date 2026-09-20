@@ -18,6 +18,19 @@ repo_root = Path(__file__).resolve().parents[1]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
+from toolrecap_v2.analyzer.candidates import consolidate_candidates
+from toolrecap_v2.analyzer.candidates.verifier import (
+    PipelineHealth,
+    ZeroOutputReason,
+    is_genuine_zero_valid,
+    should_trigger_verification,
+)
+from toolrecap_v2.domain.models import (
+    CandidateProposal,
+    CandidateScope,
+    CandidateSourceRange,
+)
+from toolrecap_v2.domain.policy import EditorialPolicy
 from toolrecap_v2.gpu import bundled_binary
 from toolrecap_v2.media import probe_duration, probe_media
 from toolrecap_v2.output_validation import validate_publication_folder
@@ -46,7 +59,7 @@ def run_smoke_test() -> int:
 
     sample_video = test_dir / "episode_01.mp4"
     sample_srt = test_dir / "episode_01.srt"
-    print(f"[1/5] Tạo video kiểm thử và phụ đề sidecar SRT tại: {sample_video.name}...")
+    print(f"[1/7] Tạo video kiểm thử và phụ đề sidecar SRT tại: {sample_video.name}...")
     cmd = [
         str(ffmpeg),
         "-y",
@@ -84,13 +97,13 @@ He uncovers an unexpected secret that changes everything.
         return 1
 
     # 2. Test scanner (direct-only)
-    print("[2/5] Kiểm tra bộ quét video (scanner direct-only)...")
+    print("[2/7] Kiểm tra bộ quét video (scanner direct-only)...")
     scanned = scan_videos(test_dir)
     assert sample_video.resolve() in scanned, "Scanner không tìm thấy video mẫu!"
     print(f"  + Tìm thấy {len(scanned)} video hợp lệ (direct-only non-recursive).")
 
     # 3. Test single episode batch sequential execution
-    print("[3/5] Chạy chu trình sản xuất recap tập đơn lẻ (Single Episode)...")
+    print("[3/7] Chạy chu trình sản xuất recap tập đơn lẻ (Single Episode)...")
     out_dir = test_dir / "output_single"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -126,7 +139,7 @@ He uncovers an unexpected secret that changes everything.
     print(f"  + Phụ đề SRT hoàn thành: {Path(record.output_srt).name}")
 
     # 4. Test season multi-source smoke execution
-    print("[4/5] Chạy chu trình sản xuất recap cả mùa (Season Multi-Source)...")
+    print("[4/7] Chạy chu trình sản xuất recap cả mùa (Season Multi-Source)...")
     season_dir = test_dir / "season_source"
     season_dir.mkdir(parents=True, exist_ok=True)
     ep1_path = season_dir / "ep01.mp4"
@@ -186,8 +199,97 @@ He uncovers an unexpected secret that changes everything.
         assert val_res["narration_srt_path"], "Phụ đề narration.srt không hợp lệ"
         print(f"  + Xuất bản Season Output hợp lệ (Outputs exact three): {out.sanitized_title}")
 
-    # 5. Test UI instantiation and key controls (Main window + 4 Settings Panes)
-    print("[5/5] Kiểm tra khởi tạo giao diện người dùng (GUI & 4 Settings Panes)...")
+    # 5. Editorial stage mock (Policy derivation, candidate discovery & consolidation)
+    print("[5/7] Kiểm tra mô phỏng giai đoạn biên tập (Editorial policy, candidates & consolidation)...")
+    prompt = "Focus on major confrontation and relationships between characters. Prioritize season arc candidates."
+    policy = EditorialPolicy.from_prompt(prompt)
+    assert policy.policy_hash, "EditorialPolicy không tạo được policy_hash!"
+    assert len(policy.scanner_directive.requested_categories) > 0, "ScannerDirective thiếu requested_categories!"
+    assert len(policy.candidate_directive.candidate_rules) > 0, "CandidateDirective thiếu candidate_rules!"
+
+    c1 = CandidateProposal(
+        proposal_id="p1",
+        title="Major Confrontation",
+        candidate_scope=CandidateScope.SINGLE_EPISODE.value,
+        episodes=["ep01"],
+        source_ranges=[CandidateSourceRange(episode_id="ep01", start_seconds=0.5, end_seconds=2.5)],
+        central_thesis="First major confrontation between characters",
+    )
+    c2 = CandidateProposal(
+        proposal_id="p2",
+        title="Major Confrontation Duplicate",
+        candidate_scope=CandidateScope.SINGLE_EPISODE.value,
+        episodes=["ep01"],
+        source_ranges=[CandidateSourceRange(episode_id="ep01", start_seconds=0.5, end_seconds=2.5)],
+        central_thesis="First major confrontation duplicate thesis",
+    )
+    c3 = CandidateProposal(
+        proposal_id="p3",
+        title="Unrelated Supporting Subplot",
+        candidate_scope=CandidateScope.SINGLE_EPISODE.value,
+        episodes=["ep01"],
+        source_ranges=[CandidateSourceRange(episode_id="ep01", start_seconds=3.0, end_seconds=5.5)],
+        central_thesis="Supporting subplot development",
+    )
+
+    class MockConsolidationClient:
+        def chat_json(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "decisions": [
+                    {"candidate_id": "p1", "action": "keep", "editorial_reason": "Central confrontation arc"},
+                    {"candidate_id": "p2", "action": "merge", "target_id": "p1", "editorial_reason": "Duplicate of p1"},
+                    {"candidate_id": "p3", "action": "keep", "editorial_reason": "Supporting subplot"},
+                ],
+                "consolidated_candidates": [
+                    {"proposal_id": "p1", "title": "Major Confrontation", "candidate_scope": "single_episode", "episodes": ["ep01"], "source_ranges": [{"episode_id": "ep01", "start_seconds": 0.5, "end_seconds": 2.5}], "central_thesis": "First major confrontation"},
+                    {"proposal_id": "p3", "title": "Unrelated Supporting Subplot", "candidate_scope": "single_episode", "episodes": ["ep01"], "source_ranges": [{"episode_id": "ep01", "start_seconds": 3.0, "end_seconds": 5.5}], "central_thesis": "Supporting subplot development"},
+                ],
+            }
+
+    mock_client = MockConsolidationClient()
+    consolidated = consolidate_candidates([c1, c2, c3], client=mock_client, settings=settings, policy=policy)
+    assert consolidated is not None, "Consolidate candidates trả về None!"
+    assert len(consolidated.candidates) >= 1, "Consolidate candidates phải giữ lại ít nhất 1 ứng viên!"
+    print(f"  + EditorialPolicy và Hợp nhất ứng viên thành công: {len(consolidated.candidates)} ứng viên.")
+
+    # 6. Valid zero-output verification & reason distinctions
+    print("[6/7] Kiểm tra xác minh kết quả 0 output hợp lệ (Valid zero verification & reason distinctions)...")
+    health_healthy = PipelineHealth(
+        discovery_completed=True,
+        consolidation_completed=True,
+        total_evidence_count=10,
+        coverage_ledgers=[{"coverage_status": "COMPLETE", "actionable_gaps": False}],
+        consolidated_candidates=[],
+    )
+    assert is_genuine_zero_valid(health_healthy) is True, "Pipeline khỏe mạnh với 0 ứng viên phải là Genuine Zero hợp lệ!"
+
+    health_broken = PipelineHealth(
+        discovery_completed=False,
+        discovery_error="Discovery failed",
+        total_evidence_count=10,
+        coverage_ledgers=[{"coverage_status": "COMPLETE", "actionable_gaps": False}],
+        consolidated_candidates=[],
+    )
+    assert is_genuine_zero_valid(health_broken) is False, "Pipeline có lỗi không được coi là Genuine Zero hợp lệ!"
+
+    health_gap = PipelineHealth(
+        discovery_completed=True,
+        consolidation_completed=True,
+        total_evidence_count=10,
+        coverage_ledgers=[{"coverage_status": "INCOMPLETE", "actionable_gaps": True}],
+        consolidated_candidates=[],
+    )
+    assert is_genuine_zero_valid(health_gap) is False, "Pipeline thiếu độ phủ không được coi là Genuine Zero hợp lệ!"
+
+    should_trig_err, reason_err, _ = should_trigger_verification(health_broken, [])
+    assert reason_err == ZeroOutputReason.CANDIDATE_DISCOVERY_FAILED, f"Lý do lỗi không mong đợi: {reason_err}"
+
+    should_trig_ok, reason_ok, _ = should_trigger_verification(health_healthy, [])
+    assert should_trig_ok is True, "Healthy 0-candidates phải kích hoạt xác minh!"
+    print(f"  + Xác minh Genuine Zero và phân định lý do lỗi thành công.")
+
+    # 7. Test UI instantiation and key controls (Main window + 4 Settings Panes)
+    print("[7/7] Kiểm tra khởi tạo giao diện người dùng (GUI & 4 Settings Panes)...")
     try:
         app = ToolRecapV2App()
         app.update()

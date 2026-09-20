@@ -53,7 +53,12 @@ a = Analysis(
         "toolrecap_v2.api_client",
         "toolrecap_v2.audio_mix",
         "toolrecap_v2.analyzer",
+        "toolrecap_v2.analyzer.candidates",
+        "toolrecap_v2.analyzer.candidates.consolidation",
+        "toolrecap_v2.analyzer.candidates.discovery",
+        "toolrecap_v2.analyzer.candidates.verifier",
         "toolrecap_v2.analyzer.connection",
+        "toolrecap_v2.analyzer.coverage",
         "toolrecap_v2.analyzer.engine",
         "toolrecap_v2.analyzer.errors",
         "toolrecap_v2.analyzer.evidence",
@@ -64,6 +69,7 @@ a = Analysis(
         "toolrecap_v2.domain.cache",
         "toolrecap_v2.domain.enums",
         "toolrecap_v2.domain.models",
+        "toolrecap_v2.domain.policy",
         "toolrecap_v2.domain.title",
         "toolrecap_v2.subtitles",
         "toolrecap_v2.subtitles.cache",
@@ -85,6 +91,7 @@ a = Analysis(
         "toolrecap_v2.voice.voice_updater",
     ]
     + collect_submodules("toolrecap_v2.analyzer")
+    + collect_submodules("toolrecap_v2.analyzer.candidates")
     + collect_submodules("toolrecap_v2.domain")
     + collect_submodules("toolrecap_v2.subtitles")
     + collect_submodules("toolrecap_v2.voice")

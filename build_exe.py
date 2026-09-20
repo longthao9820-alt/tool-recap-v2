@@ -160,7 +160,7 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.3.2)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.4.0)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
@@ -176,100 +176,97 @@ def build_portable_package() -> int:
      các định dạng video (.mp4, .mkv, .mov, .avi, .webm, .m4v, .ts) và sắp xếp
      theo thứ tự tập tự nhiên (ep1, ep2, ep10).
 
-3. CÁC GIAI ĐOẠN XỬ LÝ (PHASES):
-   - media_probe: Thăm dò thông số video, âm thanh bằng FFprobe.
-   - subtitles: Tìm và bóc tách phụ đề (ưu tiên tiếng Anh, hỗ trợ SRT/VTT/ASS/PGS/VobSub).
-   - scanner: Quét phân đoạn transcript qua Scanner AI để trích xuất bằng chứng.
-   - season_barrier: Đồng bộ toàn bộ các tập trong mùa trước khi kết nối.
-   - season_connecting: Phân tích liên kết cốt truyện xuyên suốt các tập mùa phim.
-   - season_mining: Khai phá và chọn lọc các ứng viên kịch bản recap toàn mùa.
-   - output_plan_ready: Chốt kế hoạch và phân đoạn xuất bản.
-   - Kết xuất (Rendering): Tạo thuyết minh (timeline), trộn âm thanh (Audio Mix),
-     tạo phụ đề SRT và mã hóa video hoàn chỉnh bằng GPU/CPU.
+3. MỘT CÂU NHẮC ĐIỀU KHIỂN TOÀN BỘ CHU TRÌNH (ONE PROMPT FULL PIPELINE):
+   - Người dùng chỉ cần nhập một câu nhắc duy nhất tại khung "Recap Prompt" trong
+     Cài đặt (Tab 1 - Recap).
+   - Hệ thống tự động phân tích ngoại tuyến câu nhắc này thành các chỉ thị chuyên biệt
+     cho tất cả các khâu: Scanner (quét bằng chứng), Coverage (quét phủ lần hai),
+     Connection (kết nối mùa), Candidate Discovery & Consolidation (khám phá và
+     hợp nhất ứng viên), và Finalizer (hoàn thiện kịch bản). Không cần cấu hình rời rạc.
 
-4. BẢNG CÀI ĐẶT (CHÍNH XÁC 4 TAB):
-   Nhấn "⚙ Settings" trên thanh công cụ để mở cửa sổ cấu hình gồm đúng 4 tab:
-   - Tab 1 - Recap: Ngôn ngữ kịch bản (en-US, en-GB), chế độ recap (MAIN_STORIES,
-     FULL_EPISODE), thể loại (US_TV_SHOW, DE_GERMAN_SOAP, BODYCAM, FEATURE_FILM, OTHER),
-     bản quyền tư liệu và khung nhập Recap Prompt (kèm nút Reload Default Prompt).
-   - Tab 2 - AI Gateway: Kích hoạt AI Gateway, API endpoint (mặc định
-     http://127.0.0.1:20128/v1), API key (lưu an toàn cục bộ), Scanner model
-     (sub - thinking max), checkbox rõ ràng "Scanner model supports image/Vision input",
-     Finalizer model (prime - thinking high), số luồng song song (1-4) và độ dài đoạn (60-900s).
-   - Tab 3 - Voice: Lựa chọn 12 giọng thiết kế chuẩn (Neighbor, Companion...), phong cách
-     giọng đọc, nút "🔊 Nghe thử giọng", nút "🎙 Cập nhật VoiceStudio", và khu vực
-     Audio Mix chuyên nghiệp (âm lượng gốc dB, âm lượng thuyết minh dB, Auto-ducking,
-     Target loudness -14 LUFS, True peak -1 dBTP).
-   - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU
-     (NVENC/AMF/QSV), nhúng phụ đề (Burn subtitles), thư mục xuất và kiểm tra subsystem.
-   * Chú ý: Không có tab STT riêng biệt; STT hoạt động ngầm (internal) hoàn toàn tự động.
-   * Chú ý: Toàn bộ cơ chế thích ứng tự động và độ tin cậy AI (đo lường byte chính xác,
-     chia nhỏ/cô đọng/hợp nhất đệ quy, khôi phục cache, phase timeouts, số lần thử retry)
-     được tối ưu ngầm tự động, không để lộ ra bảng cài đặt nhằm giữ giao diện tinh gọn,
-     không đòi hỏi người dùng phải điều chỉnh bất kỳ thông số kỹ thuật nào.
+4. QUÉT PHỦ LẦN HAI & SỔ CÁI ĐỘ PHỦ (COVERAGE SECOND PASS):
+   - Hệ thống tự động lập sổ cái (Coverage Ledger) theo dõi dòng thời gian và bằng chứng.
+   - Khi phát hiện khoảng trống dữ liệu (gap) hoặc thiếu hụt diễn biến trọng tâm,
+     hệ thống tự động kích hoạt lượt quét thứ hai có mục tiêu (second-pass) nhắm đúng
+     vào khoảng thời gian thiếu, đảm bảo không bỏ sót tình tiết cốt lõi trong tập dài.
 
-5. ĐỘ TIN CẬY AI GATEWAY & CƠ CHẾ THÍCH ỨNG TỰ ĐỘNG (AI RELIABILITY & ADAPTIVE):
-   - Đo lường chính xác kích thước yêu cầu (Exact request measurement): Hệ thống tự đo
-     lường chính xác kích thước byte của mọi request trước khi gửi. Khi tiệm cận giới hạn
-     ngữ cảnh hoặc trần dữ liệu, hệ thống tự động chia nhỏ thích ứng mà không cần người
-     dùng phải tính toán hay tinh chỉnh thủ công.
-   - Chia nhỏ, cô đọng, hợp nhất đệ quy & Cache resume (Split, Compact, Recursive Merge):
-     Tự động chia nhỏ theo mốc thời gian (split), cô đọng các phân đoạn tóm tắt (compact),
-     hợp nhất theo cấu trúc cây phân cấp đệ quy (recursive merge) và lưu cache theo mã băm
-     từng nút. Khi tiếp tục (resume) hoặc chạy lại, hệ thống tái sử dụng ngay kết quả cache
-     mà không tốn công gọi lại API.
-   - Cơ chế thử lại phản hồi dùng chung (Shared response retry): Mọi giai đoạn AI đều dùng
-     chung một bộ xử lý thử lại chuẩn hóa; tự động xử lý khi mất mạng, quá tải tần suất
-     (HTTP 429), lỗi máy chủ, và 6 dạng khuyết tật phản hồi HTTP 200 (rỗng, hỏng JSON,
-     thiếu choices, thiếu content, v.v.) với tối đa 3 lần thử và khoảng chờ ngắt được bằng Stop.
-   - Hoàn toàn phổ quát, không quy tắc riêng theo phim (Explicit no show-specific tuning):
-     Toàn bộ cơ chế thích ứng hoạt động dựa trên kích thước dữ liệu và mốc thời gian thực tế,
-     tuyệt đối không dùng bất kỳ quy tắc hay tham số gán cứng nào theo phim hay thể loại.
-   - Không để lộ chi tiết byte ra giao diện (No overexposure of bytes): Giữ giao diện
-     tinh gọn, dễ dùng; các thông số byte và kích thước gói tin chỉ được ghi nhận trong
-     nhật ký chẩn đoán (diagnostics log) khi cần đối soát kỹ thuật.
-   - Phase timeouts nội bộ & Phân định lỗi rõ ràng: Mỗi giai đoạn có thời hạn chờ tối ưu
-     và lỗi được phân định chính xác theo từng tập phim, không làm gián đoạn các tập khác.
+5. KHÁM PHÁ & HỢP NHẤT ỨNG VIÊN (CANDIDATE DISCOVERY & CONSOLIDATION):
+   - Khám phá ứng viên: Tự động tìm kiếm các ý tưởng kịch bản tiềm năng (cảnh đơn lẻ,
+     chuỗi cảnh liên kết, hoặc toàn bộ tuyến truyện mùa) bám sát mốc thời gian thực tế.
+   - Hợp nhất ứng viên: Tự động gom nhóm các ứng viên trùng lặp hoặc bổ trợ cho nhau,
+     giữ lại các góc nhìn độc đáo (kể cả nhân vật phụ), loại bỏ sự trùng lặp mà không
+     làm mất tính phong phú của nội dung.
 
-6. PHỤ ĐỀ PGS / VOBSUB / RAPIDOCR / AI VISION & INTERNAL STT:
-   - Ưu tiên chọn luồng âm thanh và phụ đề tiếng Anh trong video hoặc sidecar ngoài.
-   - Phụ đề đồ họa Blu-ray (PGS) và DVD (VobSub) được nhận dạng chữ tự động qua RapidOCR ONNX.
-   - Chỉ khi bật checkbox "Scanner model supports image/Vision input" trong Cài đặt,
-     hệ thống mới gửi hình ảnh khó đọc lên AI Vision Gateway để giải mã.
-   - Nếu không có phụ đề hoặc nhận dạng lỗi, hệ thống tự động fallback sang STT nội bộ
-     (faster-whisper CPU) hoặc OpenAI Whisper API.
+6. PHÂN ĐỊNH RÕ RÀNG LÝ DO 0 OUTPUT (GENUINE ZERO REASONS):
+   - Khi một tập hoặc mùa phim không tạo ra video recap nào (0 output), hệ thống phân
+     biệt chính xác:
+     + Genuine Zero (Hợp lệ): Do nội dung nguồn không có sự kiện nào khớp với tiêu chí
+       biên tập yêu cầu. Hệ thống kiểm toán độc lập, xác nhận hợp lệ và báo hoàn tất kèm lý do.
+     + Lỗi kỹ thuật: Sự cố kết nối mạng, lỗi giải mã phụ đề hoặc lỗi dịch vụ AI. Hệ thống
+       báo lỗi chính xác kèm mã lỗi để người dùng dễ nhận biết.
 
-7. 12 GIỌNG THIẾT KẾ & TẢI MÔ HÌNH LẦN ĐẦU:
-   - Danh mục 12 giọng đọc tiếng Anh chính thức từ VoiceStudio/OmniVoice (6 en-US, 6 en-GB).
-   - Lần đầu sử dụng cần kết nối Internet để tải môi trường runtime Python độc lập và
-     mô hình OmniVoice dung lượng lớn (~vài GB) vào bộ nhớ đệm %LOCALAPPDATA%\ToolRecapV2.
-   - Sau khi tải, hệ thống hoạt động hoàn toàn offline. Luôn có Piper TTS nội bộ sẵn sàng.
+7. KHÔNG ÁP ĐẶT CHỈ TIÊU SỐ LƯỢNG CỨNG (NO QUOTA):
+   - Tuyệt đối không áp đặt hạn mức hay chỉ tiêu số lượng video nhân tạo.
+   - Nội dung có bao nhiêu câu chuyện chất lượng được chứng minh bằng bằng chứng thực tế
+     thì tạo bấy nhiêu video recap tương ứng; không bịa đặt thêm để đủ số lượng.
 
-8. ĐẦU RA CHÍNH XÁC 3 TỆP (OUTPUTS EXACT THREE):
-   Mỗi phân đoạn video recap được xuất vào thư mục riêng với ĐÚNG 3 tệp thành phẩm:
-   1. {safe_title}.mp4: Video recap hoàn chỉnh chất lượng cao.
-   2. {safe_title}.original.srt: Phụ đề các đoạn thoại gốc giữ lại trong video.
-   3. {safe_title}.narration.srt: Phụ đề lời dẫn thuyết minh AI chuẩn xác.
-   Tuyệt đối sạch sẽ, không có tệp tạm hay tệp rác.
+8. CƠ CHẾ LÀM MỚI BỘ NHỚ ĐỆM THÔNG MINH (CACHE INVALIDATION):
+   - Mã băm bộ nhớ đệm phụ thuộc trực tiếp vào câu nhắc biên tập (prompt hash), cấu hình
+     và dấu vết tệp video nguồn.
+   - Khi thay đổi câu nhắc hoặc đổi tệp video, bộ nhớ đệm tự động được làm mới chính xác.
+   - Khi chạy lại với cùng câu nhắc và video cũ, hệ thống tái sử dụng ngay kết quả cache
+     mà không tốn thêm bất kỳ cuộc gọi AI nào.
 
-9. DỪNG AN TOÀN (STOP / CANCELLATION):
-   - Nhấn "⏹ Stop" bất kỳ lúc nào để dừng xử lý ngay lập tức.
-   - Hệ thống ngắt chu kỳ chờ thử lại (backoff delay), hủy các giai đoạn kế tiếp,
-     đóng sạch cây tiến trình con FFmpeg, mở khóa lại giao diện và đánh dấu CANCELLED.
-   - Giới hạn kỹ thuật chính xác: Yêu cầu mạng HTTP urlopen đang gửi/nhận dở dang trên
-     socket chỉ có thể kết thúc khi nhận được phản hồi hoặc hết socket timeout; sau đó
-     tiến trình dừng hoàn toàn theo cờ Stop mà không sinh tiến trình mồ côi (orphan).
+9. GIỚI HẠN THỰC TẾ VỀ LỜI THOẠI & HÌNH ẢNH (TRANSCRIPT-ONLY LIMITATION):
+   - Hệ thống vận hành chủ yếu dựa trên phụ đề và lời thoại bóc tách từ video (Transcript-only).
+   - Những diễn biến phim thuần túy bằng hình ảnh im lặng (không có lời thoại và không có
+     phụ đề miêu tả) sẽ có giới hạn phản ánh trong kịch bản, trừ khi người dùng bật checkbox
+     "Scanner model supports image/Vision input" trong Cài đặt để gửi hình ảnh lên mô hình Vision.
 
-10. CẬP NHẬT & DỮ LIỆU:
+10. KIẾN TRÚC KỸ THUẬT (ENGINEERING ARCHITECTURE):
+    - Nguyên nhân gốc rễ (Root Cause): Các phiên bản trước chỉ dùng 1 lượt quét đơn tuyến
+      dễ để lại khoảng trống dữ liệu trên video dài, câu nhắc bị phân mảnh gán cứng, thiếu
+      bước khám phá và gộp nhóm ứng viên độc lập, và không phân định được 0 output hợp lệ.
+    - Các mô-đun mới (New Modules v0.4.0):
+      + toolrecap_v2.domain.policy: Giải mã một câu nhắc duy nhất thành tập hợp chỉ thị cấu trúc.
+      + toolrecap_v2.analyzer.coverage: Sổ cái độ phủ, phát hiện khoảng trống và quét bù lần 2.
+      + toolrecap_v2.analyzer.candidates: Gồm discovery.py (khám phá), consolidation.py (hợp nhất)
+        và verifier.py (kiểm toán độc lập 0 output và xác nhận Genuine Zero).
+
+11. BẢNG CÀI ĐẶT (CHÍNH XÁC 4 TAB):
+    Nhấn "⚙ Settings" trên thanh công cụ để mở cửa sổ cấu hình gồm đúng 4 tab:
+    - Tab 1 - Recap: Ngôn ngữ kịch bản (en-US, en-GB), chế độ recap (MAIN_STORIES,
+      FULL_EPISODE), thể loại (US_TV_SHOW, DE_GERMAN_SOAP, BODYCAM, FEATURE_FILM, OTHER),
+      bản quyền tư liệu và khung nhập Recap Prompt (kèm nút Reload Default Prompt).
+    - Tab 2 - AI Gateway: Kích hoạt AI Gateway, API endpoint (mặc định
+      http://127.0.0.1:20128/v1), API key (lưu an toàn cục bộ), Scanner model
+      (sub - thinking max), checkbox rõ ràng "Scanner model supports image/Vision input",
+      Finalizer model (prime - thinking high), số luồng song song (1-4) và độ dài đoạn (60-900s).
+    - Tab 3 - Voice: Lựa chọn 12 giọng thiết kế chuẩn (Neighbor, Companion...), phong cách
+      giọng đọc, nút "🔊 Nghe thử giọng", nút "🎙 Cập nhật VoiceStudio", và khu vực
+      Audio Mix chuyên nghiệp (âm lượng gốc dB, âm lượng thuyết minh dB, Auto-ducking,
+      Target loudness -14 LUFS, True peak -1 dBTP).
+    - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU
+      (NVENC/AMF/QSV), nhúng phụ đề (Burn subtitles), thư mục xuất và kiểm tra subsystem.
+
+12. ĐẦU RA CHÍNH XÁC 3 TỆP (OUTPUTS EXACT THREE):
+    Mỗi phân đoạn video recap được xuất vào thư mục riêng với ĐÚNG 3 tệp thành phẩm:
+    1. {safe_title}.mp4: Video recap hoàn chỉnh chất lượng cao.
+    2. {safe_title}.original.srt: Phụ đề các đoạn thoại gốc giữ lại trong video.
+    3. {safe_title}.narration.srt: Phụ đề lời dẫn thuyết minh AI chuẩn xác.
+    Tuyệt đối sạch sẽ, không có tệp tạm hay tệp rác.
+
+13. DỪNG AN TOÀN (STOP / CANCELLATION):
+    - Nhấn "⏹ Stop" bất kỳ lúc nào để dừng xử lý ngay lập tức.
+    - Hệ thống ngắt chu kỳ chờ thử lại (backoff delay), hủy các giai đoạn kế tiếp,
+      đóng sạch cây tiến trình con FFmpeg, mở khóa lại giao diện và đánh dấu CANCELLED.
+    - Giới hạn kỹ thuật chính xác: Yêu cầu mạng HTTP urlopen đang gửi/nhận dở dang trên
+      socket chỉ có thể kết thúc khi nhận được phản hồi hoặc hết socket timeout; sau đó
+      tiến trình dừng hoàn toàn theo cờ Stop mà không sinh tiến trình mồ côi (orphan).
+
+14. CẬP NHẬT & DỮ LIỆU:
     - Tự động kiểm tra GitHub Releases chính thức từ longthao9820-alt/tool-recap-v2 kèm SHA256.
     - Dữ liệu lưu ngoài thư mục ứng dụng tại %LOCALAPPDATA%\ToolRecapV2.
-
-11. GIỚI HẠN CỦA HỆ THỐNG:
-    - Cần Internet khi tải mô hình/runtime lớn lần đầu.
-    - Cần card đồ họa tương thích để tăng tốc GPU (nếu không có sẽ dùng CPU libx264).
-    - Chất lượng kịch bản phụ thuộc vào nội dung thoại thực tế của video.
-    - Kết nối HTTP AI Gateway: Yêu cầu urlopen đang in-flight trên socket chỉ kết thúc khi
-      có phản hồi hoặc chạm socket timeout; nút Stop sẽ ngắt các pha kế tiếp và tiến trình kịp thời.
 ========================================================================
 """
     (app_dir / "HUONG_DAN_SU_DUNG.txt").write_text(guide_content, encoding="utf-8")

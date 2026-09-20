@@ -17,16 +17,36 @@ from ..api_client import (
     _is_cancelled,
     estimate_request_size,
 )
-from ..domain.cache import EvidenceCacheManager
+from ..domain.cache import (
+    EvidenceCacheManager,
+    compute_gap_cache_key,
+    compute_source_identity_hash,
+)
 from ..domain.models import EpisodeEvidence, SourceEpisode
+from ..domain.policy import (
+    EditorialPolicy,
+    ScannerDirective,
+    format_evidence_directive,
+)
 from ..media import probe_media
 from ..narration import _chunk_ranges, _format_time, extract_companion_subtitles
 from ..settings import AppSettings
 from ..subtitles.models import MediaProbeResult, SubtitleCue
 from ..subtitles.pipeline import SubtitlePipeline
+from .coverage import (
+    STANDARD_EVIDENCE_CATEGORIES,
+    CoverageGap,
+    CoverageStatus,
+    SecondPassRequest,
+    compute_episode_coverage,
+    detect_coverage_gaps,
+    merge_second_pass_results,
+    plan_second_pass_requests,
+    validate_gap_result_schema,
+)
 from .errors import AnalysisCancelledError, AnalysisError
 from .phases import AnalysisPhase, PhaseCallback
-from .prompts import SCANNER_SYSTEM_PROMPT
+from .prompts import SCANNER_GAP_SYSTEM_PROMPT, SCANNER_SYSTEM_PROMPT
 
 TARGET_PAYLOAD_CEILING: int = 480_000
 HARD_PAYLOAD_CEILING: int = 500_000
@@ -48,22 +68,50 @@ EVIDENCE_CATEGORIES: tuple[str, ...] = (
     "conflicts",
     "subplots",
     "strengths_weaknesses",
+    "contradictions",
+    "dilemmas",
+    "visual_storytelling",
+    "recurring_behavior",
+    "power_shifts",
+    "reactions",
+    "counter_evidence",
 )
 
 
 def compute_scanner_config_version(
     settings: AppSettings,
-    prompt_version: str = "v1",
+    prompt_version: str = "v2",
+    *,
+    scanner_directive: ScannerDirective | None = None,
+    scanner_directive_hash: str | None = None,
+    policy: EditorialPolicy | None = None,
 ) -> str:
     """Deterministic config version for scanner evidence caching.
 
     Excludes any credentials/tokens to prevent leaking secrets into cache keys.
+    Includes scanner directive hash/version so prompt output changes preserve
+    evidence keys while evidence focus changes invalidate them.
     """
+    effective_directive_hash = ""
+    if scanner_directive_hash:
+        effective_directive_hash = scanner_directive_hash
+    elif scanner_directive is not None:
+        effective_directive_hash = scanner_directive.directive_hash or scanner_directive.compute_hash()
+    elif policy is not None:
+        effective_directive_hash = policy.scanner_directive.directive_hash or policy.scanner_directive.compute_hash()
+    elif settings.recap_prompt:
+        p = EditorialPolicy.from_prompt(settings.recap_prompt)
+        effective_directive_hash = p.scanner_directive.directive_hash or p.scanner_directive.compute_hash()
+    else:
+        p = EditorialPolicy.from_prompt("")
+        effective_directive_hash = p.scanner_directive.directive_hash or p.scanner_directive.compute_hash()
+
     payload = {
         "scanner_model": settings.scanner_model,
         "scanner_thinking": settings.scanner_thinking,
         "api_chunk_seconds": settings.api_chunk_seconds,
         "prompt_version": prompt_version,
+        "scanner_directive_hash": effective_directive_hash,
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -160,7 +208,7 @@ def format_scanner_user_text(
     return (
         f"Episode ID: {episode.episode_id}\n"
         f"Source Video: {episode.source_video}\n"
-        f"Absolute Range: {start_ms} to {end_ms} ms ({_format_time(start_sec)} - {_format_time(end_sec)})\n"
+        f"Absolute Range: {start_ms} to {end_ms} ms ({start_sec:.1f}s - {end_sec:.1f}s) ({_format_time(start_sec)} - {_format_time(end_sec)})\n"
         f"Episode Duration: {episode.duration_seconds:.1f}s\n\n"
         f"Timestamped Transcript Excerpt:\n{chunk_transcript}\n"
     )
@@ -439,6 +487,8 @@ class EvidenceScanner:
         subtitle_pipeline: SubtitlePipeline | None = None,
         target_ceiling: int = TARGET_PAYLOAD_CEILING,
         hard_ceiling: int = HARD_PAYLOAD_CEILING,
+        policy: EditorialPolicy | None = None,
+        directive: ScannerDirective | None = None,
     ) -> None:
         self.settings = settings or AppSettings()
         self.client = client
@@ -446,6 +496,31 @@ class EvidenceScanner:
         self.subtitle_pipeline = subtitle_pipeline
         self.target_ceiling = target_ceiling
         self.hard_ceiling = hard_ceiling
+
+        if policy is not None:
+            self.policy = policy
+            self.directive = policy.scanner_directive
+        elif directive is not None:
+            self.directive = directive
+            self.policy = None
+        elif self.settings.recap_prompt:
+            self.policy = EditorialPolicy.from_prompt(self.settings.recap_prompt)
+            self.directive = self.policy.scanner_directive
+        else:
+            self.policy = EditorialPolicy.from_prompt("")
+            self.directive = self.policy.scanner_directive
+
+    @property
+    def scanner_directive(self) -> ScannerDirective | None:
+        return self.directive
+
+    def get_effective_system_prompt(self) -> str:
+        """Combine base scanner prompt with compact evidence directive."""
+        if self.directive is not None:
+            directive_text = format_evidence_directive(self.directive)
+            if directive_text.strip():
+                return f"{SCANNER_SYSTEM_PROMPT}\n\n{directive_text}"
+        return SCANNER_SYSTEM_PROMPT
 
     def scan_episode(
         self,
@@ -462,7 +537,10 @@ class EvidenceScanner:
         if cancel_event and cancel_event.is_set():
             raise AnalysisCancelledError(f"Phân tích tập {episode.episode_id} đã bị hủy.")
 
-        config_version = compute_scanner_config_version(self.settings)
+        config_version = compute_scanner_config_version(
+            self.settings,
+            scanner_directive=self.directive,
+        )
 
         # 1. Check atomic independent cache
         cached_evidence = self.cache_manager.load_evidence(episode, config_version)
@@ -527,6 +605,7 @@ class EvidenceScanner:
             and self.client is not None
         )
 
+        effective_system_prompt = self.get_effective_system_prompt()
         if is_gateway_enabled and self.client is not None:
             plans = plan_scanner_chunks(
                 episode=episode,
@@ -537,7 +616,7 @@ class EvidenceScanner:
                 thinking=self.settings.scanner_thinking,
                 target_ceiling=self.target_ceiling,
                 hard_ceiling=self.hard_ceiling,
-                system_prompt=SCANNER_SYSTEM_PROMPT,
+                system_prompt=effective_system_prompt,
                 cancel_event=cancel_event,
             )
             total_chunks = len(plans)
@@ -593,6 +672,7 @@ class EvidenceScanner:
                         on_status=on_chunk_status,
                         user_text=plan.user_text,
                         estimated_bytes=plan.estimated_bytes,
+                        system_prompt=effective_system_prompt,
                     ): idx
                     for idx, plan in enumerate(plans)
                 }
@@ -667,19 +747,149 @@ class EvidenceScanner:
                 evidence_data=evidence_data,
             )
 
-        # 5. Build EpisodeEvidence
+        # 5. Verify coverage and target only actionable transcript-grounded gaps.
+        if on_phase:
+            on_phase(AnalysisPhase.SCANNER, episode.episode_id, {"status": "coverage_check"})
+
+        ledger = compute_episode_coverage(
+            episode_id=episode.episode_id,
+            duration_sec=duration_sec,
+            cues=cues,
+            evidence_data=evidence_data,
+            visual_spans=[],
+            directive=self.scanner_directive,
+            planned_chunks=plans,
+        )
+
+        if is_gateway_enabled and self.client is not None:
+            gap_requests = plan_second_pass_requests(
+                episode_id=episode.episode_id,
+                source_video=str(episode.source_video),
+                duration_seconds=duration_sec,
+                gaps=ledger.gaps,
+                cues=cues,
+                existing_evidence=evidence_data,
+                model=self.settings.scanner_model,
+                thinking=self.settings.scanner_thinking,
+                target_ceiling=self.target_ceiling,
+                system_prompt=SCANNER_GAP_SYSTEM_PROMPT + format_evidence_directive(self.scanner_directive),
+            )
+            first_pass_hash = hashlib.sha256(
+                json.dumps(evidence_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            source_fingerprint = compute_source_identity_hash(episode.source_video)
+            second_pass_results: list[dict[str, Any]] = []
+            gap_item_counts: dict[str, int] = {gap.gap_id: 0 for gap in ledger.gaps}
+            gap_addressed: set[str] = set()
+
+            for request in gap_requests:
+                if _is_cancelled(cancel_event):
+                    raise AnalysisCancelledError(f"Kiểm tra coverage tập {episode.episode_id} đã bị hủy.")
+                if on_phase:
+                    on_phase(
+                        AnalysisPhase.SCANNER,
+                        episode.episode_id,
+                        {"status": "second_pass", "gap_id": request.gap_id},
+                    )
+                user_hash = hashlib.sha256(request.user_text.encode("utf-8")).hexdigest()
+                gap_key = compute_gap_cache_key(
+                    source_fingerprint=source_fingerprint,
+                    first_pass_hash=first_pass_hash,
+                    gap_start_sec=request.start_sec,
+                    gap_end_sec=request.end_sec,
+                    target_categories=request.target_categories,
+                    target_characters=request.target_characters,
+                    scanner_directive_hash=self.scanner_directive.directive_hash if self.scanner_directive else "",
+                    model=self.settings.scanner_model,
+                    thinking=self.settings.scanner_thinking,
+                    request_hash=user_hash,
+                )
+                cached_gap = self.cache_manager.load_gap(episode.episode_id, gap_key)
+                if cached_gap is not None:
+                    gap_result = cached_gap
+                else:
+                    call_kwargs = {
+                        "model": self.settings.scanner_model,
+                        "thinking": self.settings.scanner_thinking,
+                        "system": SCANNER_GAP_SYSTEM_PROMPT + format_evidence_directive(self.scanner_directive),
+                        "user_text": request.user_text,
+                        "cancel_event": cancel_event,
+                        "phase": "scanner",
+                        "timeout": SCANNER_TIMEOUT,
+                        "log": log,
+                        "max_payload_bytes": self.hard_ceiling,
+                    }
+                    try:
+                        gap_result = self.client.chat_json(**call_kwargs)
+                    except TypeError as exc:
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        gap_result = self.client.chat_json(**{
+                            key: value for key, value in call_kwargs.items()
+                            if key not in ("phase", "timeout", "log", "max_payload_bytes")
+                        })
+                    if not isinstance(gap_result, dict):
+                        raise AnalysisError(f"Second-pass coverage trả về dữ liệu không hợp lệ cho {request.gap_id}.")
+
+                    validate_gap_result_schema(gap_result, raise_error=True)
+
+                    if gap_result:
+                        known_fields = STANDARD_EVIDENCE_CATEGORIES | {
+                            "episode_id", "range_start_ms", "range_end_ms", "gap_id", "metadata"
+                        } | set(EVIDENCE_CATEGORIES)
+                        if not any(k in known_fields for k in gap_result):
+                            raise AnalysisError(
+                                f"Second-pass coverage phản hồi chỉ chứa trường không xác định cho {request.gap_id}."
+                            )
+
+                    self.cache_manager.save_gap(episode.episode_id, gap_key, gap_result)
+                    if _is_cancelled(cancel_event):
+                        raise AnalysisCancelledError(f"Kiểm tra coverage tập {episode.episode_id} đã bị hủy.")
+
+                second_pass_results.append(gap_result)
+                returned_items = sum(
+                    len(gap_result.get(category, []))
+                    for category in (request.target_categories or STANDARD_EVIDENCE_CATEGORIES)
+                    if isinstance(gap_result.get(category), list)
+                )
+                for gid in request.gap_ids:
+                    gap_addressed.add(gid)
+                    gap_item_counts[gid] = gap_item_counts.get(gid, 0) + returned_items
+
+            for gap in ledger.gaps:
+                if gap.gap_id in gap_addressed:
+                    gap.status = "RESOLVED" if gap_item_counts.get(gap.gap_id, 0) > 0 else "PERSISTENT_EMPTY"
+
+            if second_pass_results:
+                evidence_data, _ = merge_second_pass_results(
+                    evidence_data,
+                    second_pass_results,
+                    episode.episode_id,
+                    duration_sec,
+                )
+                ledger = compute_episode_coverage(
+                    episode_id=episode.episode_id,
+                    duration_sec=duration_sec,
+                    cues=cues,
+                    evidence_data=evidence_data,
+                    visual_spans=[],
+                    directive=self.scanner_directive,
+                    planned_chunks=plans,
+                    gaps=ledger.gaps,
+                )
+
         size, mtime = self._get_file_stats(episode.source_video)
+        missing_reasons = [
+            f"{g.gap_id}: {g.gap_type.value if hasattr(g.gap_type, 'value') else g.gap_type} ({g.start_sec:.1f}s - {g.end_sec:.1f}s)"
+            for g in ledger.gaps
+            if g.is_actionable and g.status != "RESOLVED"
+        ]
         evidence = EpisodeEvidence(
             episode_id=episode.episode_id,
             source_video=str(episode.source_video),
             duration_seconds=duration_sec,
-            coverage={
-                "status": "complete",
-                "chunks_count": total_chunks,
-                "has_speech": has_speech,
-                "cues_count": len(cues),
-            },
-            missing_reasons=[],
+            coverage=ledger.to_dict(),
+            missing_reasons=missing_reasons,
             source_mtime=mtime,
             source_size=size,
             data=evidence_data,
@@ -701,6 +911,9 @@ class EvidenceScanner:
                     "categories_count": len(evidence_data),
                     "total_chunks": total_chunks,
                     "completed_chunks": total_chunks,
+                    "coverage_status": ledger.status.value if hasattr(ledger.status, "value") else str(ledger.status),
+                    "coverage_ratio": ledger.timeline.evidence_coverage_ratio,
+                    "gaps": [g.to_dict() if hasattr(g, "to_dict") else g for g in ledger.gaps],
                 },
             )
 
@@ -718,12 +931,14 @@ class EvidenceScanner:
         *,
         user_text: str | None = None,
         estimated_bytes: int | None = None,
+        system_prompt: str | None = None,
     ) -> dict[str, Any]:
         """Perform AI scanner call for a single chunk of an episode."""
         if _is_cancelled(cancel_event):
             raise AnalysisCancelledError("Phân tích đã bị hủy.")
 
         assert self.client is not None
+        effective_system = system_prompt or self.get_effective_system_prompt()
 
         if user_text is None:
             matching_lines = [
@@ -741,7 +956,7 @@ class EvidenceScanner:
             user_text = (
                 f"Episode ID: {episode.episode_id}\n"
                 f"Source Video: {episode.source_video}\n"
-                f"Absolute Range: {start_ms} to {end_ms} ms ({_format_time(start_sec)} - {_format_time(end_sec)})\n"
+                f"Absolute Range: {start_ms} to {end_ms} ms ({start_sec:.1f}s - {end_sec:.1f}s) ({_format_time(start_sec)} - {_format_time(end_sec)})\n"
                 f"Episode Duration: {episode.duration_seconds:.1f}s\n\n"
                 f"Timestamped Transcript Excerpt:\n{chunk_transcript}\n"
             )
@@ -749,7 +964,7 @@ class EvidenceScanner:
                 model=self.settings.scanner_model,
                 user_text=user_text,
                 thinking=self.settings.scanner_thinking,
-                system_prompt=SCANNER_SYSTEM_PROMPT,
+                system_prompt=effective_system,
             )
 
         if estimated_bytes is not None and estimated_bytes > self.hard_ceiling:
@@ -760,7 +975,7 @@ class EvidenceScanner:
         call_kwargs: dict[str, Any] = {
             "model": self.settings.scanner_model,
             "thinking": self.settings.scanner_thinking,
-            "system": SCANNER_SYSTEM_PROMPT,
+            "system": effective_system,
             "user_text": user_text,
             "cancel_event": cancel_event,
             "phase": "scanner",
@@ -781,12 +996,6 @@ class EvidenceScanner:
                     }
                     return self.client.chat_json(**filtered)
                 raise
-        except APIError as exc:
-            if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
-                raise AnalysisCancelledError("Scanner đã bị hủy.") from exc
-            raise AnalysisError(
-                f"Không thể kết nối đến AI Gateway ({self.settings.api_endpoint}): API Scanner lỗi ({self.settings.scanner_model}): {exc}"
-            ) from exc
         except APIError as exc:
             if _is_cancelled(cancel_event) or "đã bị dừng" in str(exc) or "bị hủy" in str(exc):
                 raise AnalysisCancelledError("Scanner đã bị hủy.") from exc
@@ -863,7 +1072,7 @@ class EvidenceScanner:
         duration_sec: float,
         evidence_data: dict[str, list[dict[str, Any]]],
     ) -> None:
-        """Deterministic offline population of all 16 evidence categories."""
+        """Deterministic truthful offline population of evidence: dialogue only."""
         if cues:
             for s, e, text in cues:
                 item = {
@@ -875,57 +1084,13 @@ class EvidenceScanner:
                     "summary": text[:200],
                     "dialogue_evidence": [text],
                     "characters": [],
+                    "source_modality": "transcript",
                 }
                 evidence_data["dialogue"].append(item)
-                evidence_data["major_scenes"].append(item)
-                evidence_data["character_decisions"].append(item)
-                evidence_data["supporting_developments"].append(item)
-                evidence_data["relationships"].append(item)
-                evidence_data["reveals"].append(item)
-                evidence_data["reversals"].append(item)
-                evidence_data["failures"].append(item)
-                evidence_data["consequences"].append(item)
-                evidence_data["performance_moments"].append(item)
-                evidence_data["setup_payoff"].append(item)
-                evidence_data["unresolved"].append(item)
-                evidence_data["conflicts"].append(item)
-                evidence_data["subplots"].append(item)
-                evidence_data["strengths_weaknesses"].append(item)
-                evidence_data["strengths"].append(item)
-                evidence_data["weaknesses"].append(item)
         else:
-            # No speech: record visual timeline events without inventing spoken lines
-            num_scenes = 3 if duration_sec >= 15.0 else 2
-            scene_len = duration_sec / num_scenes
-            for i in range(num_scenes):
-                s = i * scene_len
-                e = min(duration_sec, (i + 1) * scene_len)
-                item = {
-                    "episode_id": episode.episode_id,
-                    "start_sec": s,
-                    "end_sec": e,
-                    "start_ms": round(s * 1000),
-                    "end_ms": round(e * 1000),
-                    "summary": f"Visual timeline sequence {i + 1} ({s:.1f}s - {e:.1f}s)",
-                    "dialogue_evidence": [],
-                    "characters": [],
-                }
-                evidence_data["major_scenes"].append(item)
-                evidence_data["supporting_developments"].append(item)
-                evidence_data["relationships"].append(item)
-                evidence_data["reveals"].append(item)
-                evidence_data["reversals"].append(item)
-                evidence_data["failures"].append(item)
-                evidence_data["consequences"].append(item)
-                evidence_data["performance_moments"].append(item)
-                evidence_data["setup_payoff"].append(item)
-                evidence_data["unresolved"].append(item)
-                evidence_data["conflicts"].append(item)
-                evidence_data["subplots"].append(item)
-                evidence_data["character_decisions"].append(item)
-                evidence_data["strengths_weaknesses"].append(item)
-                evidence_data["strengths"].append(item)
-                evidence_data["weaknesses"].append(item)
+            # Transcript-only pipeline has no verified visual observations. Keep all
+            # evidence lists empty; coverage records the span as unobserved silence.
+            return
 
     @staticmethod
     def _get_file_stats(video_path: str | Path) -> tuple[int, float]:

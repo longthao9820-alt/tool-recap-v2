@@ -16,7 +16,39 @@ from .api_client import API_TEST_TIMEOUT, OpenAICompatibleClient
 from .gpu import EncoderStatus, detect_gpu_encoder, get_acceleration_plan
 from .notifications import DesktopNotification, NotificationBanner, show_desktop_notification
 from .paths import default_data_directory, set_window_icon
-from .projects import ProjectQueue, ProjectRecord, ProjectStore
+from .projects import ProjectQueue, ProjectRecord, ProjectStore, ZERO_OUTPUT_MESSAGES
+
+SEASON_STAGE_TRANSLATIONS: dict[str, str] = {
+    "CANDIDATE_DISCOVERY": "Khám phá ứng viên",
+    "candidate_discovery": "Khám phá ứng viên",
+    "Candidate Discovery": "Khám phá ứng viên",
+    "CANDIDATE_CONSOLIDATION": "Hợp nhất ứng viên",
+    "candidate_consolidation": "Hợp nhất ứng viên",
+    "Candidate Consolidation": "Hợp nhất ứng viên",
+    "CANDIDATE_VERIFYING": "Xác minh kết quả 0 output",
+    "candidate_verifying": "Xác minh kết quả 0 output",
+    "Candidate Verifying": "Xác minh kết quả 0 output",
+    "ZERO_OUTPUT_VERIFICATION": "Xác minh kết quả 0 output",
+    "zero_output_verification": "Xác minh kết quả 0 output",
+    "Zero Output Verification": "Xác minh kết quả 0 output",
+    "Season Mining": "Khai thác cốt truyện",
+    "season_mining": "Khai thác cốt truyện",
+    "finalizer": "Khai thác cốt truyện",
+    "Finalizer": "Khai thác cốt truyện",
+    "Season Batch": "Phân tích nhóm mùa",
+    "season_batch": "Phân tích nhóm mùa",
+    "Episode Summarizing": "Tóm tắt tập",
+    "episode_summarizing": "Tóm tắt tập",
+    "Season Merging": "Hợp nhất cốt truyện",
+    "season_merging": "Hợp nhất cốt truyện",
+}
+
+
+def translate_season_stage(stage: str) -> str:
+    if not stage:
+        return "Sẵn sàng"
+    return SEASON_STAGE_TRANSLATIONS.get(stage, stage)
+
 from .scanner import scan_videos
 from .settings import AppSettings, SettingsStore
 from .updater import (
@@ -461,17 +493,17 @@ class ToolRecapV2App(tk.Tk):
                 elif s_stat == "COMPLETED":
                     s_stage = "Hoàn thành"
                     s_prog = "100%"
-                    s_msg = "Hoàn tất"
+                    s_msg = p.current_message if not p.outputs and ("0 output" in (p.current_message or "") or getattr(p, "zero_output_reason", None)) else "Hoàn tất"
                 elif s_stat == "RUNNING":
-                    s_stage = p.season_stage or "Season Analysis"
+                    s_stage = translate_season_stage(p.season_stage or "Season Analysis")
                     s_prog = f"{p.season_progress}%"
                     s_msg = p.current_message or "Đang phân tích mùa phim"
                 elif s_stat == "PAUSED":
-                    s_stage = p.season_stage or "Đã dừng"
+                    s_stage = translate_season_stage(p.season_stage or "Đã dừng")
                     s_prog = f"{p.season_progress}%"
                     s_msg = "Đã dừng"
                 else:
-                    s_stage = p.season_stage or "Sẵn sàng"
+                    s_stage = translate_season_stage(p.season_stage or "Sẵn sàng")
                     s_prog = f"{p.season_progress}%"
                     s_msg = "Sẵn sàng"
 
@@ -571,17 +603,23 @@ class ToolRecapV2App(tk.Tk):
             elif s_stat == "COMPLETED":
                 s_stage = "Hoàn thành"
                 s_prog = "100%"
-                s_msg = "Hoàn tất"
-            elif s_stat == "RUNNING" or phase in {"SEASON_BARRIER", "SEASON_CONNECTING", "SEASON_MINING", "SEASON_BATCH", "SEASON_MERGING", "EPISODE_SUMMARIZING", "season_barrier", "season_connecting", "season_mining", "season_batch", "season_merging", "episode_summarizing"} or "Season Analysis" in msg:
-                s_stage = record.season_stage if record.season_stage != "Sẵn sàng" else "Season Analysis"
+                s_msg = record.current_message if not record.outputs and ("0 output" in (record.current_message or "") or getattr(record, "zero_output_reason", None)) else "Hoàn tất"
+            elif s_stat == "RUNNING" or phase in {
+                "SEASON_BARRIER", "SEASON_CONNECTING", "SEASON_MINING", "SEASON_BATCH", "SEASON_MERGING", "EPISODE_SUMMARIZING",
+                "CANDIDATE_DISCOVERY", "CANDIDATE_CONSOLIDATION", "CANDIDATE_VERIFYING", "ZERO_OUTPUT_VERIFICATION",
+                "season_barrier", "season_connecting", "season_mining", "season_batch", "season_merging", "episode_summarizing",
+                "candidate_discovery", "candidate_consolidation", "candidate_verifying", "zero_output_verification",
+            } or "Season Analysis" in msg:
+                raw_stage = record.season_stage if record.season_stage != "Sẵn sàng" else "Season Analysis"
+                s_stage = translate_season_stage(raw_stage)
                 s_prog = f"{record.progress}%"
                 s_msg = msg
             elif s_stat == "PAUSED":
-                s_stage = record.season_stage or "Đã dừng"
+                s_stage = translate_season_stage(record.season_stage or "Đã dừng")
                 s_prog = f"{record.season_progress}%"
                 s_msg = "Đã dừng"
             else:
-                s_stage = record.season_stage or "Sẵn sàng"
+                s_stage = translate_season_stage(record.season_stage or "Sẵn sàng")
                 s_prog = f"{record.season_progress}%"
                 s_msg = "Sẵn sàng"
 
@@ -698,8 +736,19 @@ class ToolRecapV2App(tk.Tk):
         )
 
         if completed == total and total > 0:
-            if has_zero_outputs and not any(p.outputs for p in getattr(self, "projects", [])):
-                msg = "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs)."
+            projects_list = getattr(self, "projects", [])
+            all_zero = has_zero_outputs and not any(p.outputs for p in projects_list)
+            if all_zero:
+                first_p = projects_list[0] if projects_list else None
+                reason = getattr(first_p, "zero_output_reason", None) if first_p else None
+                msg = ZERO_OUTPUT_MESSAGES.get(
+                    reason or "",
+                    "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs).",
+                )
+                level = "info"
+            elif has_zero_outputs:
+                zero_count = sum(1 for p in projects_list if p.status == "COMPLETED" and not p.outputs)
+                msg = f"Đã hoàn thành toàn bộ {total} dự án ({zero_count} dự án không có ứng viên đạt yêu cầu)."
                 level = "info"
             else:
                 msg = f"Đã hoàn thành toàn bộ {total} dự án video recap thành công!"

@@ -23,6 +23,8 @@ from ..domain.cache import (
 )
 from ..domain.enums import CandidateScope, CompactionLevel
 from ..domain.models import (
+    CandidateProposal,
+    CandidateSourceRange,
     CompactEpisodeSummary,
     CompactSummaryItem,
     EpisodeEvidence,
@@ -30,6 +32,11 @@ from ..domain.models import (
     build_compact_summary,
     compact_summary,
     split_summary_by_timeline,
+)
+from ..domain.policy import (
+    ConnectionDirective,
+    EditorialPolicy,
+    format_connection_directive,
 )
 from ..settings import AppSettings
 from .errors import AnalysisCancelledError, AnalysisError, CoverageIncompleteError
@@ -42,7 +49,7 @@ from .prompts import (
 
 HARD_PAYLOAD_CEILING = 500_000
 TARGET_PAYLOAD_CEILING = 480_000
-HIERARCHY_ALGO_VERSION = "v3"
+HIERARCHY_ALGO_VERSION = "v5"
 MAX_ITEMS_PER_BATCH_HINT = 4
 MAX_PAYLOAD_BYTES = HARD_PAYLOAD_CEILING
 
@@ -135,8 +142,23 @@ def format_batch_user_text(
     node_id: str,
     summaries: list[CompactEpisodeSummary],
     coverage_notice: str,
-    recap_prompt: str,
+    recap_prompt: str = "",
+    *,
+    connection_directive: ConnectionDirective | str | None = None,
 ) -> str:
+    if connection_directive is not None:
+        if isinstance(connection_directive, ConnectionDirective):
+            effective_instructions = format_connection_directive(connection_directive)
+        else:
+            effective_instructions = str(connection_directive)
+    elif isinstance(recap_prompt, ConnectionDirective):
+        effective_instructions = format_connection_directive(recap_prompt)
+    else:
+        effective_instructions = recap_prompt or "Standard video recap"
+
+    if not effective_instructions.strip():
+        effective_instructions = "Standard video recap"
+
     batch_payload = {
         "node_id": node_id,
         "batch_id": node_id,
@@ -145,7 +167,7 @@ def format_batch_user_text(
     return (
         f"Analyze batch connections for {node_id} across {len(summaries)} episodes.\n"
         f"{coverage_notice}\n"
-        f"Recap instructions:\n{recap_prompt or 'Standard video recap'}\n\n"
+        f"Recap instructions:\n{effective_instructions}\n\n"
         f"Batch Compact Summaries:\n{json.dumps(batch_payload, ensure_ascii=False, indent=2)}\n"
     )
 
@@ -170,8 +192,23 @@ def format_merge_user_text(
     node_id: str,
     group: list[dict[str, Any]],
     coverage_notice: str,
-    recap_prompt: str,
+    recap_prompt: str = "",
+    *,
+    connection_directive: ConnectionDirective | str | None = None,
 ) -> str:
+    if connection_directive is not None:
+        if isinstance(connection_directive, ConnectionDirective):
+            effective_instructions = format_connection_directive(connection_directive)
+        else:
+            effective_instructions = str(connection_directive)
+    elif isinstance(recap_prompt, ConnectionDirective):
+        effective_instructions = format_connection_directive(recap_prompt)
+    else:
+        effective_instructions = recap_prompt or "Standard video recap"
+
+    if not effective_instructions.strip():
+        effective_instructions = "Standard video recap"
+
     merge_payload = {
         "node_id": node_id,
         "merge_id": node_id,
@@ -180,7 +217,7 @@ def format_merge_user_text(
     return (
         f"Merge and synthesize {len(group)} batch results into unified season connections for {node_id}.\n"
         f"{coverage_notice}\n"
-        f"Recap instructions:\n{recap_prompt or 'Standard video recap'}\n\n"
+        f"Recap instructions:\n{effective_instructions}\n\n"
         f"Batch Results:\n{json.dumps(merge_payload, ensure_ascii=False, indent=2)}\n"
     )
 
@@ -515,13 +552,28 @@ def plan_adaptive_batches(
     target_ceiling: int = TARGET_PAYLOAD_CEILING,
     hard_ceiling: int = HARD_PAYLOAD_CEILING,
     max_items_hint: int = MAX_ITEMS_PER_BATCH_HINT,
+    *,
+    connection_directive: ConnectionDirective | None = None,
 ) -> list[AdaptiveBatchPlanItem]:
     """Plan adaptive batches greedily bounded by request body size <= target_ceiling."""
     if not ordered_summaries:
         return []
 
+    conn_dir_hash = (
+        connection_directive.directive_hash or connection_directive.compute_hash()
+        if connection_directive is not None
+        else ""
+    )
+    effective_prompt = "" if connection_directive is not None else recap_prompt
+
     # 1. Baseline envelope check
-    empty_text = format_batch_user_text("node_L0_baseline", [], coverage_notice, recap_prompt)
+    empty_text = format_batch_user_text(
+        "node_L0_baseline",
+        [],
+        coverage_notice,
+        effective_prompt,
+        connection_directive=connection_directive,
+    )
     empty_size = estimate_batch_request_size(model, empty_text, thinking)
     if empty_size >= target_ceiling:
         raise AnalysisError(
@@ -537,7 +589,13 @@ def plan_adaptive_batches(
 
     for ord_idx, summ in enumerate(ordered_summaries):
         def _fits(s: CompactEpisodeSummary) -> bool:
-            txt = format_batch_user_text(f"node_L0_{ord_idx}_{ord_idx}_test", [s], coverage_notice, recap_prompt)
+            txt = format_batch_user_text(
+                f"node_L0_{ord_idx}_{ord_idx}_test",
+                [s],
+                coverage_notice,
+                effective_prompt,
+                connection_directive=connection_directive,
+            )
             return estimate_batch_request_size(model, txt, thinking) <= target_ceiling
 
         if _fits(summ):
@@ -581,7 +639,13 @@ def plan_adaptive_batches(
                 break
 
         node_id = format_node_id("L0", span_start, span_end, content_hash, frag_label)
-        user_text = format_batch_user_text(node_id, group_summs, coverage_notice, recap_prompt)
+        user_text = format_batch_user_text(
+            node_id,
+            group_summs,
+            coverage_notice,
+            effective_prompt,
+            connection_directive=connection_directive,
+        )
         est_size = estimate_batch_request_size(model, user_text, thinking)
 
         if est_size > hard_ceiling:
@@ -592,13 +656,16 @@ def plan_adaptive_batches(
 
         child_hashes = [s.canonical_hash() for s in group_summs]
         cache_key = compute_batch_cache_key(
-            node_id=node_id,
+            batch_id=node_id,
             ordered_summary_hashes=child_hashes,
             model=model,
             thinking=thinking,
-            recap_prompt=recap_prompt,
+            recap_prompt=effective_prompt,
+            prompt_version="v1",
             algo=HIERARCHY_ALGO_VERSION,
             compaction_level=compaction_level.value,
+            node_id=node_id,
+            connection_directive_hash=conn_dir_hash,
         )
         return AdaptiveBatchPlanItem(
             node_id=node_id,
@@ -611,19 +678,24 @@ def plan_adaptive_batches(
             estimated_bytes=est_size,
         )
 
-    for unit in units:
-        if not current_group:
-            current_group.append(unit)
+    for item in units:
+        test_group = current_group + [item]
+        test_summs = [u[2] for u in test_group]
+        test_text = format_batch_user_text(
+            "test_node",
+            test_summs,
+            coverage_notice,
+            effective_prompt,
+            connection_directive=connection_directive,
+        )
+        est = estimate_batch_request_size(model, test_text, thinking)
+
+        if est <= target_ceiling and len(test_group) <= max_items_hint:
+            current_group.append(item)
         else:
-            if len(current_group) < max_items_hint:
-                test_group = current_group + [unit]
-                test_summs = [u[2] for u in test_group]
-                test_text = format_batch_user_text("test_node", test_summs, coverage_notice, recap_prompt)
-                if estimate_batch_request_size(model, test_text, thinking) <= target_ceiling:
-                    current_group.append(unit)
-                    continue
-            batch_plans.append(_build_plan(current_group))
-            current_group = [unit]
+            if current_group:
+                batch_plans.append(_build_plan(current_group))
+            current_group = [item]
 
     if current_group:
         batch_plans.append(_build_plan(current_group))
@@ -692,43 +764,6 @@ def partition_season_batches(items: list[Any]) -> list[tuple[str, list[Any]]]:
 
 
 @dataclass
-class CandidateProposal:
-    proposal_id: str
-    title: str
-    candidate_scope: str = CandidateScope.CROSS_EPISODE.value
-    episodes: list[str] = field(default_factory=list)
-    characters: list[str] = field(default_factory=list)
-    description: str = ""
-    editorial_reason: str = ""
-    status: str = "keep"  # keep, reject, merged
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "proposal_id": self.proposal_id,
-            "title": self.title,
-            "candidate_scope": self.candidate_scope,
-            "episodes": self.episodes,
-            "characters": self.characters,
-            "description": self.description,
-            "editorial_reason": self.editorial_reason,
-            "status": self.status,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CandidateProposal":
-        return cls(
-            proposal_id=str(data.get("proposal_id", "")),
-            title=str(data.get("title", "")),
-            candidate_scope=str(data.get("candidate_scope", CandidateScope.CROSS_EPISODE.value)),
-            episodes=list(data.get("episodes", [])),
-            characters=list(data.get("characters", [])),
-            description=str(data.get("description", "")),
-            editorial_reason=str(data.get("editorial_reason", "")),
-            status=str(data.get("status", "keep")),
-        )
-
-
-@dataclass
 class SeasonConnectionResult:
     cross_episode_links: list[dict[str, Any]] = field(default_factory=list)
     candidate_proposals: list[CandidateProposal] = field(default_factory=list)
@@ -794,12 +829,27 @@ class SeasonConnector:
         *,
         target_ceiling: int | None = None,
         hard_ceiling: int | None = None,
+        policy: EditorialPolicy | None = None,
+        connection_directive: ConnectionDirective | None = None,
     ) -> None:
         self.settings = settings or AppSettings()
         self.client = client
         self.hierarchy_cache = hierarchy_cache or HierarchyCacheManager()
         self._target_ceiling = target_ceiling
         self._hard_ceiling = hard_ceiling
+
+        if policy is not None:
+            self.policy = policy
+            self.connection_directive = policy.connection_directive
+        elif connection_directive is not None:
+            self.connection_directive = connection_directive
+            self.policy = None
+        elif self.settings.recap_prompt:
+            self.policy = EditorialPolicy.from_prompt(self.settings.recap_prompt)
+            self.connection_directive = self.policy.connection_directive
+        else:
+            self.policy = EditorialPolicy.from_prompt("")
+            self.connection_directive = self.policy.connection_directive
 
     @property
     def target_ceiling(self) -> int:
@@ -814,7 +864,7 @@ class SeasonConnector:
         episodes: list[SourceEpisode],
         evidence_map: dict[str, EpisodeEvidence],
     ) -> str:
-        """Deterministic cache key for season connection identity (algo v3)."""
+        """Deterministic cache key for season connection identity (algo v4)."""
         available = [ep for ep in episodes if ep.episode_id in evidence_map and evidence_map[ep.episode_id] is not None]
         sorted_eps = sorted(available, key=lambda x: x.episode_id)
         hashes: list[str] = []
@@ -822,12 +872,17 @@ class SeasonConnector:
             ev = evidence_map[ep.episode_id]
             h = hashlib.sha256(json.dumps(ev.to_dict(), sort_keys=True).encode("utf-8")).hexdigest()[:16]
             hashes.append(f"{h}")
+        conn_dir_hash = (
+            self.connection_directive.directive_hash or self.connection_directive.compute_hash()
+            if self.connection_directive is not None
+            else ""
+        )
         return compute_connection_cache_key(
             ordered_evidence_hashes=hashes,
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
-            recap_prompt=self.settings.recap_prompt or "",
             algo=HIERARCHY_ALGO_VERSION,
+            connection_directive_hash=conn_dir_hash,
         )
 
     def connect_season(
@@ -979,11 +1034,12 @@ class SeasonConnector:
             ordered_summaries=[compact_summaries[ep.episode_id] for ep in available_episodes],
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
-            recap_prompt=self.settings.recap_prompt or "",
+            recap_prompt="" if self.connection_directive is not None else (self.settings.recap_prompt or ""),
             coverage_notice=coverage_notice,
             target_ceiling=self.target_ceiling,
             hard_ceiling=self.hard_ceiling,
             max_items_hint=MAX_ITEMS_PER_BATCH_HINT,
+            connection_directive=self.connection_directive,
         )
         total_batches = len(batch_plans)
 
@@ -1147,7 +1203,13 @@ class SeasonConnector:
         log: Callable[[str], None] | None,
     ) -> dict[str, Any]:
         """Merge batch results hierarchically using adaptive byte packing until 1 unified result remains."""
-        empty_text = format_merge_user_text("node_L1_baseline", [], coverage_notice, self.settings.recap_prompt or "")
+        empty_text = format_merge_user_text(
+            "node_L1_baseline",
+            [],
+            coverage_notice,
+            "" if self.connection_directive is not None else (self.settings.recap_prompt or ""),
+            connection_directive=self.connection_directive,
+        )
         empty_size = estimate_merge_request_size(self.settings.finalizer_model, empty_text, self.settings.finalizer_thinking)
         if empty_size >= self.target_ceiling:
             raise AnalysisError(
@@ -1203,14 +1265,26 @@ class SeasonConnector:
         coverage_notice: str,
     ) -> list[dict[str, Any]]:
         ceiling = self.target_ceiling
-        txt = format_merge_user_text("test_node", [item], coverage_notice, self.settings.recap_prompt or "")
+        txt = format_merge_user_text(
+            "test_node",
+            [item],
+            coverage_notice,
+            "" if self.connection_directive else (self.settings.recap_prompt or ""),
+            connection_directive=self.connection_directive,
+        )
         est = estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking)
         if est <= ceiling:
             return [item]
 
         for lvl in (CompactionLevel.TRIMMED, CompactionLevel.PRIORITY, CompactionLevel.SKELETON):
             compacted = compact_merge_result(item, lvl)
-            txt = format_merge_user_text("test_node", [compacted], coverage_notice, self.settings.recap_prompt or "")
+            txt = format_merge_user_text(
+                "test_node",
+                [compacted],
+                coverage_notice,
+                self.settings.recap_prompt or "",
+                connection_directive=self.connection_directive,
+            )
             if estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking) <= ceiling:
                 return [compacted]
 
@@ -1225,7 +1299,13 @@ class SeasonConnector:
         # Cannot split further: indivisible strings exist. Deterministic cap fields.
         for cap in (80, 40, 20):
             capped = deterministic_cap_merge_item(skeleton_item, cap=cap)
-            txt = format_merge_user_text("test_node", [capped], coverage_notice, self.settings.recap_prompt or "")
+            txt = format_merge_user_text(
+                "test_node",
+                [capped],
+                coverage_notice,
+                self.settings.recap_prompt or "",
+                connection_directive=self.connection_directive,
+            )
             if estimate_merge_request_size(self.settings.finalizer_model, txt, self.settings.finalizer_thinking) <= ceiling:
                 return [capped]
 
@@ -1248,7 +1328,13 @@ class SeasonConnector:
             else:
                 if len(current_group) < MAX_ITEMS_PER_BATCH_HINT:
                     test_group = current_group + [item]
-                    test_txt = format_merge_user_text("test_group", test_group, coverage_notice, self.settings.recap_prompt or "")
+                    test_txt = format_merge_user_text(
+                        "test_group",
+                        test_group,
+                        coverage_notice,
+                        self.settings.recap_prompt or "",
+                        connection_directive=self.connection_directive,
+                    )
                     if estimate_merge_request_size(self.settings.finalizer_model, test_txt, self.settings.finalizer_thinking) <= self.target_ceiling:
                         current_group.append(item)
                         continue
@@ -1270,7 +1356,13 @@ class SeasonConnector:
             if i + 1 < len(items):
                 p1 = compact_merge_result(items[i], CompactionLevel.SKELETON)
                 p2 = compact_merge_result(items[i + 1], CompactionLevel.SKELETON)
-                test_txt = format_merge_user_text("pair_test", [p1, p2], coverage_notice, self.settings.recap_prompt or "")
+                test_txt = format_merge_user_text(
+                    "pair_test",
+                    [p1, p2],
+                    coverage_notice,
+                    self.settings.recap_prompt or "",
+                    connection_directive=self.connection_directive,
+                )
                 if estimate_merge_request_size(self.settings.finalizer_model, test_txt, self.settings.finalizer_thinking) > self.target_ceiling:
                     p1 = deterministic_cap_merge_item(p1, cap=50)
                     p2 = deterministic_cap_merge_item(p2, cap=50)
@@ -1297,14 +1389,19 @@ class SeasonConnector:
             hashlib.sha256(json.dumps(r, sort_keys=True).encode("utf-8")).hexdigest()
             for r in group
         ]
+        conn_dir_hash = (
+            self.connection_directive.directive_hash or self.connection_directive.compute_hash()
+            if self.connection_directive is not None
+            else ""
+        )
         merge_key = compute_merge_cache_key(
             node_id=merge_id,
             ordered_batch_hashes=input_hashes,
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
-            recap_prompt=self.settings.recap_prompt or "",
             algo=HIERARCHY_ALGO_VERSION,
-            merge_version="v3",
+            merge_version="v4",
+            connection_directive_hash=conn_dir_hash,
         )
 
         cached_merge, m_meta = self.hierarchy_cache.load_merge_result(merge_id, merge_key)
@@ -1330,7 +1427,8 @@ class SeasonConnector:
             node_id=merge_id,
             group=group,
             coverage_notice=coverage_notice,
-            recap_prompt=self.settings.recap_prompt or "Standard video recap",
+            recap_prompt="" if self.connection_directive else (self.settings.recap_prompt or "Standard video recap"),
+            connection_directive=self.connection_directive,
         )
 
         # Invariant assertion
@@ -1515,7 +1613,7 @@ class SeasonConnector:
 
         return SeasonConnectionResult(
             cross_episode_links=links,
-            candidate_proposals=proposals,
+            candidate_proposals=[],
             supporting_character_arcs=arcs,
             rejected_or_merged=rejected,
             is_complete=is_complete,
@@ -1564,7 +1662,7 @@ class SeasonConnector:
 
         return SeasonConnectionResult(
             cross_episode_links=links,
-            candidate_proposals=proposals,
+            candidate_proposals=[],
             supporting_character_arcs=[
                 {
                     "character": "Supporting Character",
@@ -1577,3 +1675,6 @@ class SeasonConnector:
             is_complete=is_complete,
             missing_episodes=missing_episodes,
         )
+
+
+SeasonConnectionPass = SeasonConnector

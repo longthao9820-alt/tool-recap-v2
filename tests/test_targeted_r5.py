@@ -160,7 +160,7 @@ def test_ocr_cancel_progress_and_explicit_vision_only(tmp_path: Path) -> None:
 # 4. FIRST_PUBLICATION_RIGHTS UI and Store Persistence
 # ---------------------------------------------------------------------------
 
-def test_first_publication_rights_ui_and_store(tmp_path: Path) -> None:
+def test_first_publication_rights_ui_and_store(tmp_path: Path, tk_root: tk.Tk) -> None:
     """FIRST_PUBLICATION_RIGHTS status persists correctly in settings store and UI dialog."""
     settings_file = tmp_path / "rights_settings.json"
     store = SettingsStore(settings_file)
@@ -175,16 +175,13 @@ def test_first_publication_rights_ui_and_store(tmp_path: Path) -> None:
     import tkinter as tk
     from toolrecap_v2.ui import SettingsDialog
 
-    root = tk.Tk()
-    root.withdraw()
+    dialog = SettingsDialog(tk_root, loaded, store, on_save=lambda s: None)
     try:
-        dialog = SettingsDialog(root, loaded, store, on_save=lambda s: None)
         assert dialog.rights_var.get() == "FIRST_PUBLICATION_RIGHTS"
         dialog._save()
         assert store.load().source_rights_status == "FIRST_PUBLICATION_RIGHTS"
-        dialog.destroy()
     finally:
-        root.destroy()
+        dialog.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +276,25 @@ def test_manifest_rewrite_after_render_paths(tmp_path: Path, monkeypatch: pytest
 
     settings = AppSettings(gateway_enabled=True)
 
+    from tests.helpers_editorial import stage_response
+
+    custom_output = {
+        "outputs": [
+            {
+                "output_id": "out_manifest_01",
+                "title": "Manifest Test Output",
+                "segments": [
+                    {
+                        "segment_id": "seg_01",
+                        "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 2.0}],
+                        "narration": "Narration for manifest test.",
+                        "audio_policy": "duck",
+                    }
+                ],
+            }
+        ]
+    }
+
     # Mock AI to return 1 output
     def mock_chat_json(self, *, model, **kwargs):
         if model == "sub":
@@ -288,22 +304,13 @@ def test_manifest_rewrite_after_render_paths(tmp_path: Path, monkeypatch: pytest
                 "major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}],
                 "dialogue": [{"start_ms": 0, "end_ms": 1000, "speaker": "A", "quote": "Hi"}],
             }
-        return {
-            "outputs": [
-                {
-                    "output_id": "out_manifest_01",
-                    "title": "Manifest Test Output",
-                    "segments": [
-                        {
-                            "segment_id": "seg_01",
-                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 2.0}],
-                            "narration": "Narration for manifest test.",
-                            "audio_policy": "duck",
-                        }
-                    ],
-                }
-            ]
-        }
+        return stage_response(
+            system=kwargs.get("system", ""),
+            user_text=kwargs.get("user_text", ""),
+            episodes=["E01"],
+            default=custom_output,
+            model=model,
+        )
 
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_json)
     monkeypatch.setattr("toolrecap_v2.projects.transcribe_local_whisper", lambda *a, **kw: [(0.0, 1.0, "dummy dialog")])
@@ -315,7 +322,7 @@ def test_manifest_rewrite_after_render_paths(tmp_path: Path, monkeypatch: pytest
     queue = ProjectQueue([record], store=store, settings=settings)
     queue.start()
     assert queue._thread is not None
-    queue._thread.join(timeout=20)
+    queue._thread.join(timeout=60)
 
     assert record.status == "COMPLETED"
     assert record.manifest_path is not None

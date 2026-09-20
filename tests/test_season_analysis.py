@@ -82,6 +82,7 @@ class MockAIClient:
         self.call_history: list[dict[str, Any]] = []
         self.endpoint = "http://mock-ai:20128/v1"
         self.api_key = "mock-key"
+        self.last_connection_response: dict[str, Any] = {}
 
     def chat_json(
         self,
@@ -104,11 +105,54 @@ class MockAIClient:
             "thinking": thinking,
         }
         self.call_history.append(call_record)
+        system_lower = system.lower()
+
+        if "targeted evidence gap scanner" in system_lower:
+            return {}
+        if "candidate discoverer" in system_lower:
+            if self.responses and isinstance(self.responses[0], dict) and "discovered_candidates" in self.responses[0]:
+                return self.responses.pop(0)
+            seeds = []
+            for index, raw_seed in enumerate(self.last_connection_response.get("candidate_proposals", []), start=1):
+                seed = dict(raw_seed)
+                episode_ids = list(seed.get("episodes", [])) or ["E01"]
+                seed.setdefault("proposal_id", f"legacy_seed_{index}")
+                seed.setdefault("candidate_scope", "SINGLE_EPISODE" if len(episode_ids) == 1 else "CROSS_EPISODE")
+                seed.setdefault("description", seed.get("editorial_reason", seed.get("title", "Grounded candidate")))
+                seed.setdefault("editorial_reason", seed["description"])
+                seed.setdefault("source_ranges", [
+                    {"episode_id": episode_ids[0], "start_sec": 0.0, "end_sec": 10.0}
+                ])
+                seed["episodes"] = episode_ids
+                seeds.append(seed)
+            return {"discovered_candidates": seeds}
+        if "candidate consolidator" in system_lower:
+            marker = "INPUT PROPOSALS TO CONSOLIDATE:"
+            proposals: list[dict[str, Any]] = []
+            if marker in user_text:
+                try:
+                    proposals = json.loads(user_text.split(marker, 1)[1].split("MANDATES:", 1)[0].strip())
+                except Exception:
+                    proposals = []
+            return {
+                "consolidated_candidates": proposals,
+                "decisions": [
+                    {"candidate_id": p.get("proposal_id", ""), "action": "KEEP", "reason_code": "distinct_thesis", "reason": "Kept"}
+                    for p in proposals
+                ],
+            }
+        if "verification" in system_lower and "candidate" in system_lower:
+            if self.responses and isinstance(self.responses[0], dict) and "confirm_no_eligible" in self.responses[0]:
+                return self.responses.pop(0)
+            return {"confirm_no_eligible": True, "recovered_candidates": [], "rationale": "No eligible grounded candidate."}
 
         if self.responses:
             resp = self.responses.pop(0)
             if isinstance(resp, Exception):
                 raise resp
+            if "season" in system_lower or "batch connection" in system_lower or "hierarchical" in system_lower:
+                if isinstance(resp, dict):
+                    self.last_connection_response = resp
             return resp
 
         # Default fallback response depending on prompt
@@ -131,7 +175,7 @@ class MockAIClient:
                 "strengths_weaknesses": [],
             }
         elif "season narrative architect" in system.lower():
-            return {
+            response = {
                 "cross_episode_links": [{"thread_id": "t1", "episodes": ["E01", "E02"]}],
                 "candidate_proposals": [
                     {
@@ -145,6 +189,8 @@ class MockAIClient:
                 "supporting_character_arcs": [],
                 "rejected_or_merged": [],
             }
+            self.last_connection_response = response
+            return response
         else:
             return {"outputs": []}
 
@@ -172,29 +218,47 @@ def make_dummy_episode(ep_id: str, duration: float = 60.0, tmp_path: Path | None
 # Test 1: Single Episode 0 / 1 / Multiple Outputs (No Quota Slicing)
 # ---------------------------------------------------------------------------
 
-def test_single_episode_zero_outputs(tmp_path: Path) -> None:
-    """Empty outputs [] is valid when no candidate meets quality."""
+def test_single_episode_zero_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty outputs [] is valid only after healthy evidence coverage and verification."""
     ep = make_dummy_episode("E01", duration=100.0, tmp_path=tmp_path)
     cache_mgr = EvidenceCacheManager(tmp_path / "cache")
+    zero_cues = [
+        SubtitleCue(start_ms=0, end_ms=10_000, text="A quiet scene establishes context.", source_type="sidecar", source_format="srt")
+    ]
 
-    # Scanner returns evidence, Connector returns batch proposals, Finalizer returns empty outputs []
+    # Scanner returns grounded dialogue, then the editorial pipeline verifies a genuine zero.
     scanner_resp = {cat: [] for cat in EVIDENCE_CATEGORIES}
+    scanner_resp["dialogue"] = [{"start_ms": 0, "end_ms": 10_000, "speaker": "A", "quote": "A quiet scene establishes context."}]
     conn_resp = {
         "cross_episode_links": [],
         "candidate_proposals": [],
         "supporting_character_arcs": [],
         "rejected_or_merged": [],
     }
-    finalizer_resp = {"outputs": []}
+    verification_resp = {
+        "confirm_no_eligible": True,
+        "recovered_candidates": [],
+        "rationale": "No grounded candidate after complete verification.",
+    }
 
-    mock_client = MockAIClient([scanner_resp, conn_resp, finalizer_resp])
+    mock_client = MockAIClient([scanner_resp, conn_resp, verification_resp])
     settings = AppSettings(gateway_enabled=True, api_endpoint="http://mock:1234")
 
     engine = AnalysisEngine(settings=settings, client=mock_client, cache_manager=cache_mgr)
+    original_scan = engine.scanner.scan_episode
+
+    def scan_with_verified_coverage(*args: Any, **kwargs: Any) -> EpisodeEvidence:
+        evidence = original_scan(*args, **kwargs)
+        evidence.coverage["status"] = "COMPLETE_TRANSCRIPT_ONLY"
+        evidence.coverage["gaps"] = []
+        return evidence
+
+    monkeypatch.setattr(engine.scanner, "scan_episode", scan_with_verified_coverage)
     manifest = engine.analyze(
         project_id="test_proj",
         episodes=[ep],
         scope=AnalysisScope.SINGLE_EPISODE,
+        injected_transcripts={"E01": zero_cues},
     )
 
     assert manifest.project_id == "test_proj"
@@ -534,7 +598,7 @@ def test_simulated_e01_to_e05_season_connection_prompt(tmp_path: Path) -> None:
     b1_call = conn_calls[0]
     assert "CROSS-EPISODE LINKS" in b1_call["system"]
     assert "SUPPORTING/MINOR CHARACTERS" in b1_call["system"]
-    assert "NO QUOTA" in b1_call["system"]
+    assert "candidate_proposals" not in b1_call["system"]
     assert "E01" in b1_call["user_text"]
     assert "E02" in b1_call["user_text"]
     assert "E03" in b1_call["user_text"]
@@ -814,6 +878,20 @@ def test_incomplete_coverage_allowed_informs_ai(tmp_path: Path) -> None:
             raise RuntimeError("Missing subtitle stream in E03")
         if "scanner" in system.lower():
             return {cat: [] for cat in EVIDENCE_CATEGORIES}
+        if "candidate discoverer" in system.lower():
+            return {"discovered_candidates": [{
+                "proposal_id": "prop_partial", "title": "Partial Season Story",
+                "candidate_scope": "CROSS_EPISODE", "episodes": ["E01", "E02"],
+                "description": "Partial grounded story", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }]}
+        if "candidate consolidator" in system.lower():
+            return {"consolidated_candidates": [{
+                "proposal_id": "prop_partial", "title": "Partial Season Story",
+                "candidate_scope": "CROSS_EPISODE", "episodes": ["E01", "E02"],
+                "description": "Partial grounded story", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }], "decisions": [{"candidate_id": "prop_partial", "action": "KEEP", "reason_code": "distinct_thesis", "reason": "Kept"}]}
         if "season narrative architect" in system.lower():
             return {
                 "cross_episode_links": [],
@@ -890,19 +968,20 @@ def test_selective_cache_invalidation_reuses_e01_to_e04(tmp_path: Path) -> None:
                     scanner_calls.append(ep.episode_id)
                     break
             return {cat: [] for cat in EVIDENCE_CATEGORIES}
+        if "candidate discoverer" in system.lower():
+            return {"discovered_candidates": [{
+                "proposal_id": "prop_1", "title": "Season Arc", "candidate_scope": "SEASON_ARC",
+                "episodes": ["E01"], "description": "Season evidence", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }]}
+        if "candidate consolidator" in system.lower():
+            return {"consolidated_candidates": [{
+                "proposal_id": "prop_1", "title": "Season Arc", "candidate_scope": "SEASON_ARC",
+                "episodes": ["E01"], "description": "Season evidence", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }], "decisions": [{"candidate_id": "prop_1", "action": "KEEP", "reason_code": "distinct_thesis", "reason": "Kept"}]}
         if "season narrative architect" in system.lower():
-            return {
-                "cross_episode_links": [],
-                "candidate_proposals": [
-                    {
-                        "proposal_id": "prop_1",
-                        "title": "Season Arc",
-                        "candidate_scope": "SEASON_ARC",
-                        "episodes": ["E01"],
-                        "status": "keep",
-                    }
-                ],
-            }
+            return {"cross_episode_links": [], "candidate_proposals": []}
         return {
             "outputs": [
                 {
@@ -1019,6 +1098,18 @@ def test_cancellation_during_finalizer(tmp_path: Path) -> None:
             return {cat: [] for cat in EVIDENCE_CATEGORIES}
         if "season narrative architect" in system.lower():
             return {"candidate_proposals": []}
+        if "candidate discoverer" in system.lower():
+            return {"discovered_candidates": [{
+                "proposal_id": "cancel_prop", "title": "Cancel candidate", "candidate_scope": "SINGLE_EPISODE",
+                "episodes": ["E01"], "description": "Grounded", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }]}
+        if "candidate consolidator" in system.lower():
+            return {"consolidated_candidates": [{
+                "proposal_id": "cancel_prop", "title": "Cancel candidate", "candidate_scope": "SINGLE_EPISODE",
+                "episodes": ["E01"], "description": "Grounded", "editorial_reason": "Grounded",
+                "source_ranges": [{"episode_id": "E01", "start_sec": 0.0, "end_sec": 10.0}],
+            }], "decisions": [{"candidate_id": "cancel_prop", "action": "KEEP", "reason_code": "distinct_thesis", "reason": "Kept"}]}
         if "lead editor" in system.lower():
             cancel_event.set()
             raise AnalysisCancelledError("Cancelled in finalizer")

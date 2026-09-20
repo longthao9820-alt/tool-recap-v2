@@ -665,6 +665,26 @@ def test_queue_season_phase_ordering_no_perepisode_finalization(
         if r.phase not in phases_recorded:
             phases_recorded.append(r.phase)
 
+    from tests.helpers_editorial import stage_response
+
+    custom_output = {
+        "outputs": [
+            {
+                "output_id": "season_out_1",
+                "title": "Season Finale Arc",
+                "candidate_scope": "SEASON_ARC",
+                "segments": [
+                    {
+                        "segment_id": "seg_1",
+                        "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.5}],
+                        "narration": "Toàn cảnh mùa phim bắt đầu.",
+                        "audio_policy": "duck",
+                    }
+                ],
+            }
+        ]
+    }
+
     # Mock AI client to return 1 season arc output
     def mock_chat_json(self, *, model, **kwargs):
         if model == "sub":
@@ -674,36 +694,13 @@ def test_queue_season_phase_ordering_no_perepisode_finalization(
                 "major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}],
                 "dialogue": [{"start_ms": 0, "end_ms": 1000, "speaker": "A", "quote": "Hi"}],
             }
-        elif "season narrative architect" in kwargs.get("system", "").lower():
-            return {
-                "cross_episode_links": [],
-                "candidate_proposals": [
-                    {
-                        "proposal_id": "p1",
-                        "title": "Season Finale Arc",
-                        "candidate_scope": "SEASON_ARC",
-                        "episodes": ["E01", "E02"],
-                        "status": "keep",
-                    }
-                ],
-            }
-        return {
-            "outputs": [
-                {
-                    "output_id": "season_out_1",
-                    "title": "Season Finale Arc",
-                    "candidate_scope": "SEASON_ARC",
-                    "segments": [
-                        {
-                            "segment_id": "seg_1",
-                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.5}],
-                            "narration": "Toàn cảnh mùa phim bắt đầu.",
-                            "audio_policy": "duck",
-                        }
-                    ],
-                }
-            ]
-        }
+        return stage_response(
+            system=kwargs.get("system", ""),
+            user_text=kwargs.get("user_text", ""),
+            episodes=["E01", "E02"],
+            default=custom_output,
+            model=model,
+        )
 
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_json)
 
@@ -765,16 +762,32 @@ def test_zero_outputs_completes_with_no_publication_files(
     record = ProjectRecord.from_video_path(vid, tmp_path / "out_zero")
     store.save([record])
 
+    from tests.helpers_editorial import stage_response
+
     # AI returns 0 outputs
     def mock_chat_zero(self, *, model, **kwargs):
         if model == "sub":
-            return {"major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Scene"}]}
-        return {"outputs": []}
+            return {
+                "range_start_ms": 0,
+                "range_end_ms": 2000,
+                "events": [{"start_ms": 0, "end_ms": 1000, "summary": "Scene"}],
+                "major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Scene"}],
+                "dialogue": [{"start_ms": 0, "end_ms": 1000, "speaker": "A", "quote": "Dialogue"}],
+            }
+        return stage_response(
+            system=kwargs.get("system", ""),
+            user_text=kwargs.get("user_text", ""),
+            episodes=["E01"],
+            default={"outputs": []},
+            model=model,
+        )
 
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_zero)
     monkeypatch.setattr(
         "toolrecap_v2.subtitles.pipeline.SubtitlePipeline.get_episode_subtitles",
-        lambda *args, **kwargs: [],
+        lambda *args, **kwargs: [
+            SubtitleCue(start_ms=0, end_ms=1000, text="Dialogue", source_type="embedded", source_format="srt", episode_id="E01")
+        ],
     )
 
     queue = ProjectQueue([record], store=store, settings=settings)
@@ -1227,25 +1240,40 @@ def test_queue_state_recovery_on_cancellation_during_render(
 
     ui_states: list[bool] = []
 
+    from tests.helpers_editorial import stage_response
+
+    custom_output = {
+        "outputs": [
+            {
+                "output_id": "out_01",
+                "title": "Recap Video",
+                "segments": [
+                    {
+                        "segment_id": "seg_01",
+                        "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.5}],
+                        "narration": "Lời bình cho queue cancel test.",
+                        "audio_policy": "duck",
+                    }
+                ],
+            }
+        ]
+    }
+
     def mock_chat_json(self, *, model, **kwargs):
         if model == "sub":
-            return {"major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Scene"}]}
-        return {
-            "outputs": [
-                {
-                    "output_id": "out_01",
-                    "title": "Recap Video",
-                    "segments": [
-                        {
-                            "segment_id": "seg_01",
-                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.5}],
-                            "narration": "Lời bình cho queue cancel test.",
-                            "audio_policy": "duck",
-                        }
-                    ],
-                }
-            ]
-        }
+            return {
+                "range_start_ms": 0, "range_end_ms": 2000,
+                "events": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}],
+                "major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Scene"}],
+                "dialogue": [{"start_ms": 0, "end_ms": 1000, "speaker": "A", "quote": "Thoại"}],
+            }
+        return stage_response(
+            system=kwargs.get("system", ""),
+            user_text=kwargs.get("user_text", ""),
+            episodes=["E01"],
+            default=custom_output,
+            model=model,
+        )
 
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_json)
     monkeypatch.setattr(

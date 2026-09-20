@@ -601,32 +601,43 @@ def test_plan_cache_hit_zero_calls_and_invalidation(tmp_path: Path, monkeypatch:
     cache_mgr.save_evidence(ep, "e1_hash", ev)
     monkeypatch.setattr(engine.scanner, "scan_episode", lambda *a, **kw: ev)
 
+    from tests.helpers_editorial import stage_response
+
+    custom_output = {
+        "outputs": [
+            {
+                "output_id": "out_01",
+                "title": "Recap 1",
+                "segments": [
+                    {
+                        "segment_id": "seg_01",
+                        "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 10.0}],
+                        "narration": "Narration 1",
+                    }
+                ],
+            }
+        ]
+    }
+
     call_count = 0
 
     def mock_chat(*a, **kw):
         nonlocal call_count
         call_count += 1
-        return {
-            "outputs": [
-                {
-                    "output_id": "out_01",
-                    "title": "Recap 1",
-                    "segments": [
-                        {
-                            "segment_id": "seg_01",
-                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 10.0}],
-                            "narration": "Narration 1",
-                        }
-                    ],
-                }
-            ]
-        }
+        return stage_response(
+            system=kw.get("system", ""),
+            user_text=kw.get("user_text", ""),
+            episodes=[ep],
+            default=custom_output,
+            model=kw.get("model", ""),
+        )
 
     monkeypatch.setattr(client, "chat_json", mock_chat)
 
-    # 1. Cold cache: calls chat_json (1 connector + 1 finalizer = 2 calls)
+    # 1. Cold cache: calls chat_json (1 discovery + 1 consolidation + 1 finalizer = 3 calls)
     m1 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 2
+    cold_calls = call_count
+    assert cold_calls == 3
     assert len(m1.outputs) == 1
 
     # 2. Warm cache hit: zero calls made!
@@ -635,14 +646,14 @@ def test_plan_cache_hit_zero_calls_and_invalidation(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(client, "chat_json", fail_chat)
     m2 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 2
+    assert call_count == cold_calls
     assert m2.outputs[0].title == m1.outputs[0].title
 
-    # 3. Invalidation: change config -> cache miss, reuses cached batch and re-runs finalizer (+1 call = 3)
+    # 3. Invalidation: change config -> cache miss, reuses cached batch and re-runs finalizer (+1 call = 4)
     engine.settings.recap_mode = "DIFFERENT_MODE"
     monkeypatch.setattr(client, "chat_json", mock_chat)
     m3 = engine.analyze(project_id="proj1", episodes=[ep], use_final_plan_cache=True)
-    assert call_count == 3
+    assert call_count == cold_calls + 1
     assert len(m3.outputs) == 1
 
 

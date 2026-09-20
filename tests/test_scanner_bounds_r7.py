@@ -88,36 +88,73 @@ class MockScannerAIClient:
             return resp
 
         # Default valid scanner chunk response
+        import re
+        m = re.search(r"\(([\d\.]+)s\s*-\s*([\d\.]+)s\)", user_text)
+        s_sec = float(m.group(1)) if m else 0.0
+        e_sec = float(m.group(2)) if m else 10.0
+
         return {
             "major_scenes": [
                 {
-                    "start_sec": 0.0,
-                    "end_sec": 10.0,
-                    "summary": "Key scene detected in chunk",
+                    "start_sec": s_sec,
+                    "end_sec": e_sec,
+                    "summary": f"Key scene detected in chunk {s_sec}s-{e_sec}s",
                     "dialogue_evidence": ["Line from chunk"],
                     "characters": ["Alice"],
                 }
             ],
             "dialogue": [
                 {
-                    "start_sec": 0.0,
-                    "end_sec": 5.0,
+                    "start_sec": s_sec,
+                    "end_sec": min(e_sec, s_sec + 5.0),
                     "summary": "Important spoken dialogue",
                     "dialogue_evidence": ["Line from chunk"],
                     "characters": ["Alice"],
                 }
             ],
-            "character_decisions": [],
+            "character_decisions": [
+                {
+                    "start_sec": s_sec,
+                    "end_sec": min(e_sec, s_sec + 5.0),
+                    "summary": "Decision in chunk",
+                    "dialogue_evidence": ["Line from chunk"],
+                    "characters": ["Alice"],
+                }
+            ],
             "supporting_developments": [],
             "relationships": [],
-            "reveals": [],
+            "reveals": [
+                {
+                    "start_sec": s_sec,
+                    "end_sec": min(e_sec, s_sec + 5.0),
+                    "summary": "Reveal in chunk",
+                    "dialogue_evidence": ["Line from chunk"],
+                    "characters": ["Alice"],
+                }
+            ],
             "reversals": [],
             "failures": [],
             "consequences": [],
             "performance_moments": [],
-            "setup_payoff": [],
+            "setup_payoff": [
+                {
+                    "start_sec": s_sec,
+                    "end_sec": min(e_sec, s_sec + 5.0),
+                    "summary": "Setup payoff in chunk",
+                    "dialogue_evidence": ["Line from chunk"],
+                    "characters": ["Alice"],
+                }
+            ],
             "unresolved": [],
-            "conflicts": [],
+            "conflicts": [
+                {
+                    "start_sec": s_sec,
+                    "end_sec": min(e_sec, s_sec + 5.0),
+                    "summary": "Conflict in chunk",
+                    "dialogue_evidence": ["Line from chunk"],
+                    "characters": ["Alice"],
+                }
+            ],
             "subplots": [],
             "strengths_weaknesses": [],
         }
@@ -505,7 +542,7 @@ def test_merge_category_results_across_split_chunks(tmp_path: Path) -> None:
         settings=settings,
         client=mock_client,
         cache_manager=cache_mgr,
-        target_ceiling=5_000,
+        target_ceiling=5_500,
         hard_ceiling=6_000,
     )
 

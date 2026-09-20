@@ -11,12 +11,24 @@ from typing import Any, Callable
 from ..api_client import OpenAICompatibleClient
 from ..domain.cache import EvidenceCacheManager, HierarchyCacheManager
 from ..domain.enums import AnalysisScope, CandidateScope
-from ..domain.models import AnalysisManifest, CommentaryOutput, EpisodeEvidence, SourceEpisode
+from ..domain.models import (
+    AnalysisManifest,
+    CommentaryOutput,
+    EpisodeEvidence,
+    PipelineHealth,
+    SourceEpisode,
+    build_compact_summary,
+)
+from ..domain.policy import EditorialPolicy, OutputDirective
 from ..paths import default_data_directory
 from ..settings import AppSettings
 from ..subtitles.models import MediaProbeResult, SubtitleCue
 from ..subtitles.pipeline import SubtitlePipeline
-from .connection import SeasonConnectionResult, SeasonConnector
+from .candidates import CandidateConsolidator, CandidateDiscoverer, CandidateVerifier
+from .candidates.consolidation import CONSOLIDATION_ALGO_VERSION
+from .candidates.discovery import DISCOVERY_ALGO_VERSION
+from .candidates.verifier import VERIFIER_ALGO_VERSION
+from .connection import HIERARCHY_ALGO_VERSION, SeasonConnectionResult, SeasonConnector
 from .errors import AnalysisCancelledError, AnalysisError, CoverageIncompleteError
 from .evidence import EvidenceScanner
 from .finalizer import CandidateFinalizer
@@ -34,10 +46,15 @@ def compute_final_plan_cache_key(
     recap_prompt: str | None = None,
     legacy_wrapper: bool = False,
     connection_key: str | None = None,
+    *,
+    policy: EditorialPolicy | None = None,
+    output_directive: OutputDirective | None = None,
+    policy_hash: str | None = None,
+    output_directive_hash: str | None = None,
 ) -> str:
     """Compute deterministic cache key for final CommentaryOutput plans.
 
-    Keyed by hashes of all episode evidence payloads + finalizer config + connection identity.
+    Keyed by hashes of all episode evidence payloads + finalizer config + connection identity + policy/output directive hashes.
     Excludes all API credentials or secrets.
     """
     sorted_items = sorted(evidence_map.items(), key=lambda x: x[0])
@@ -47,18 +64,44 @@ def compute_final_plan_cache_key(
         h = hashlib.sha256(ev_raw.encode("utf-8")).hexdigest()[:16]
         ev_hashes.append(f"{ep_id}:{h}")
 
+    effective_prompt = recap_prompt if recap_prompt is not None else getattr(settings, "recap_prompt", "")
+    if policy is not None:
+        eff_policy_hash = policy_hash or policy.policy_hash or policy.compute_policy_hash()
+        eff_output_hash = output_directive_hash or policy.output_directive.directive_hash or policy.output_directive.compute_hash()
+    elif policy_hash or output_directive_hash:
+        eff_policy_hash = policy_hash or ""
+        eff_output_hash = output_directive_hash or ""
+    elif output_directive is not None:
+        eff_policy_hash = ""
+        eff_output_hash = output_directive.directive_hash or output_directive.compute_hash()
+    elif effective_prompt:
+        pol = EditorialPolicy.from_prompt(effective_prompt)
+        eff_policy_hash = pol.policy_hash or pol.compute_policy_hash()
+        eff_output_hash = pol.output_directive.directive_hash or pol.output_directive.compute_hash()
+    else:
+        pol = EditorialPolicy.from_prompt("")
+        eff_policy_hash = pol.policy_hash or pol.compute_policy_hash()
+        eff_output_hash = pol.output_directive.directive_hash or pol.output_directive.compute_hash()
+
     payload = {
+        "analysis_plan_version": "v5",
+        "hierarchy_algo_version": HIERARCHY_ALGO_VERSION,
+        "discovery_algo_version": DISCOVERY_ALGO_VERSION,
+        "consolidation_algo_version": CONSOLIDATION_ALGO_VERSION,
+        "verifier_algo_version": VERIFIER_ALGO_VERSION,
         "scope": scope,
         "evidence_hashes": ev_hashes,
         "finalizer_model": settings.finalizer_model,
         "finalizer_thinking": settings.finalizer_thinking,
-        "recap_prompt": recap_prompt if recap_prompt is not None else settings.recap_prompt,
+        "recap_prompt": effective_prompt,
         "recap_language": language or getattr(settings, "recap_language", "en-US"),
         "recap_mode": mode or getattr(settings, "recap_mode", "MAIN_STORIES"),
         "content_type": content_type or getattr(settings, "content_type", "US_TV_SHOW"),
         "rights": rights or getattr(settings, "source_rights_status", "UNVERIFIED"),
         "legacy_wrapper": legacy_wrapper,
         "connection_key": connection_key or "",
+        "policy_hash": str(eff_policy_hash),
+        "output_directive_hash": str(eff_output_hash),
     }
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -74,6 +117,8 @@ class AnalysisEngine:
         cache_manager: EvidenceCacheManager | None = None,
         subtitle_pipeline: SubtitlePipeline | None = None,
         hierarchy_cache: HierarchyCacheManager | None = None,
+        *,
+        policy: EditorialPolicy | None = None,
     ) -> None:
         self.settings = settings or AppSettings()
         self.client = client
@@ -84,21 +129,41 @@ class AnalysisEngine:
             hierarchy_dir = self.cache_manager.cache_dir.parent / "season_hierarchy"
             self.hierarchy_cache = HierarchyCacheManager(base_dir=hierarchy_dir)
         self.subtitle_pipeline = subtitle_pipeline
+
+        if policy is not None:
+            self.policy = policy
+        elif self.settings.recap_prompt:
+            self.policy = EditorialPolicy.from_prompt(self.settings.recap_prompt)
+        else:
+            self.policy = EditorialPolicy.from_prompt("")
+
         self.scanner = EvidenceScanner(
             settings=self.settings,
             client=self.client,
             cache_manager=self.cache_manager,
             subtitle_pipeline=self.subtitle_pipeline,
+            policy=self.policy,
         )
         self.connector = SeasonConnector(
             settings=self.settings,
             client=self.client,
             hierarchy_cache=self.hierarchy_cache,
+            policy=self.policy,
+        )
+        self.discoverer = CandidateDiscoverer(
+            settings=self.settings, client=self.client, policy=self.policy, cache=self.hierarchy_cache
+        )
+        self.consolidator = CandidateConsolidator(
+            settings=self.settings, client=self.client, policy=self.policy, cache=self.hierarchy_cache
+        )
+        self.verifier = CandidateVerifier(
+            settings=self.settings, client=self.client, cache=self.hierarchy_cache, policy=self.policy
         )
         self.finalizer = CandidateFinalizer(
             settings=self.settings,
             client=self.client,
             hierarchy_cache=self.hierarchy_cache,
+            policy=self.policy,
         )
 
     def analyze(
@@ -116,6 +181,7 @@ class AnalysisEngine:
         log: Callable[[str], None] | None = None,
         use_final_plan_cache: bool = True,
         legacy_wrapper: bool = False,
+        policy: EditorialPolicy | None = None,
     ) -> AnalysisManifest:
         """Execute end-to-end analysis workflow returning a strictly validated AnalysisManifest."""
         if cancel_event and cancel_event.is_set():
@@ -127,6 +193,19 @@ class AnalysisEngine:
         scope_str = scope.value if isinstance(scope, AnalysisScope) else str(scope)
         transcripts = injected_transcripts or {}
         probes = injected_probes or {}
+
+        effective_policy = policy if policy is not None else self.policy
+        if policy is not None and policy is not self.policy:
+            self.policy = policy
+            self.scanner.policy = policy
+            self.scanner.directive = policy.scanner_directive
+            self.connector.policy = policy
+            self.connector.connection_directive = policy.connection_directive
+            self.discoverer.policy = policy
+            self.consolidator.policy = policy
+            self.verifier.policy = policy
+            self.finalizer.policy = policy
+            self.finalizer.output_directive = policy.output_directive
 
         # 1. Episode Evidence Phase: Scan all episodes
         evidence_map: dict[str, EpisodeEvidence] = {}
@@ -176,6 +255,7 @@ class AnalysisEngine:
                 recap_prompt=self.settings.recap_prompt,
                 legacy_wrapper=legacy_wrapper,
                 connection_key=conn_key,
+                policy=effective_policy,
             )
             cached_manifest = self._load_final_plan_cache(plan_cache_key, project_id)
             if cached_manifest is not None:
@@ -185,82 +265,165 @@ class AnalysisEngine:
                     on_phase(AnalysisPhase.OUTPUT_PLAN_READY, project_id, {"cached": True, "count": len(cached_manifest.outputs)})
                 return cached_manifest
 
-        # 3. Execution by scope
-        outputs: list[CommentaryOutput] = []
+        # 3. Editorial pipeline: topology -> discovery -> consolidation -> verification -> finalizer.
+        if scope_str not in (AnalysisScope.SINGLE_EPISODE.value, AnalysisScope.SEASON.value):
+            raise AnalysisError(f"Phạm vi phân tích không được hỗ trợ: {scope_str}")
+        if on_phase and scope_str == AnalysisScope.SEASON.value:
+            on_phase(AnalysisPhase.SEASON_BARRIER, "season", {
+                "total_episodes": len(episodes), "scanned_episodes": len(evidence_map)
+            })
 
-        if scope_str == AnalysisScope.SINGLE_EPISODE.value:
-            ep = episodes[0]
-            ev = evidence_map.get(ep.episode_id)
-            if ev is None:
-                raise AnalysisError(f"Không có evidence cho tập {ep.episode_id}.")
-
-            is_gateway_enabled = (
-                self.settings.gateway_enabled
-                and bool(self.settings.api_endpoint.strip())
-                and self.settings.api_endpoint.strip().lower() != "offline"
-                and self.client is not None
-            )
-
-            if is_gateway_enabled:
-                connection_result = self.connector.connect_season(
-                    episodes=[ep],
+        gateway_enabled = (
+            self.settings.gateway_enabled
+            and bool(self.settings.api_endpoint.strip())
+            and self.settings.api_endpoint.strip().lower() != "offline"
+            and self.client is not None
+        )
+        if not gateway_enabled:
+            # Preserve deterministic offline behavior; no unavailable AI stages are invoked.
+            outputs = []
+            if scope_str == AnalysisScope.SEASON.value:
+                outputs = self.finalizer.finalize_season(
+                    episodes=episodes,
                     evidence_map=evidence_map,
-                    allow_incomplete=allow_incomplete,
-                    cancel_event=cancel_event,
-                    on_phase=on_phase,
-                    log=log,
-                )
-                outputs = self.finalizer.finalize_from_connection(
-                    episodes=[ep],
-                    connection_result=connection_result,
+                    connection_result=SeasonConnectionResult(),
                     cancel_event=cancel_event,
                     on_phase=on_phase,
                     log=log,
                     legacy_wrapper=legacy_wrapper,
-                    scope_hint=CandidateScope.SINGLE_EPISODE.value,
                 )
             else:
-                outputs = self.finalizer.finalize_single(
-                    ep,
-                    ev,
-                    cancel_event=cancel_event,
-                    on_phase=on_phase,
-                    log=log,
-                    legacy_wrapper=legacy_wrapper,
-                )
-        elif scope_str == AnalysisScope.SEASON.value:
-            # Explicit Barrier: All episodes must complete evidence phase before season connection starts!
-            if on_phase:
-                on_phase(
-                    AnalysisPhase.SEASON_BARRIER,
-                    "season",
-                    {
-                        "total_episodes": len(episodes),
-                        "scanned_episodes": len(evidence_map),
-                    },
-                )
-
-            # Season Connection Pass
-            connection_result = self.connector.connect_season(
-                episodes=episodes,
-                evidence_map=evidence_map,
-                allow_incomplete=allow_incomplete,
-                cancel_event=cancel_event,
-                on_phase=on_phase,
-                log=log,
+                for ep in episodes:
+                    ev = evidence_map.get(ep.episode_id)
+                    if ev is not None:
+                        outputs.extend(self.finalizer.finalize_single(
+                            ep, ev, cancel_event=cancel_event, on_phase=on_phase,
+                            log=log, legacy_wrapper=legacy_wrapper,
+                        ))
+            verification = self.verifier.verify(
+                scope_id=project_id,
+                health=PipelineHealth(
+                    coverage_ledgers={key: ev.coverage for key, ev in evidence_map.items()},
+                    discovered_count=len(outputs),
+                    consolidated_candidates=[],
+                    finalizer_attempted=True,
+                    finalizer_completed=True,
+                    finalizer_results=[out.to_dict() for out in outputs],
+                    total_evidence_count=sum(
+                        len(items) for ev in evidence_map.values() for items in ev.data.values() if isinstance(items, list)
+                    ),
+                ),
+                candidates=[],
+                cancellation_token=cancel_event,
+                phase_callback=on_phase,
+            ) if not outputs else self.verifier.verify(
+                scope_id=project_id,
+                health=PipelineHealth(discovered_count=len(outputs), finalizer_attempted=True, finalizer_completed=True,
+                                      finalizer_results=[out.to_dict() for out in outputs]),
+                candidates=[], cancellation_token=cancel_event,
             )
+            manifest = AnalysisManifest(
+                project_id=project_id,
+                analysis_scope=scope_str,
+                source_episodes=episodes,
+                outputs=outputs,
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                recap_language=self.settings.recap_language,
+                recap_mode=self.settings.recap_mode,
+                content_type=self.settings.content_type,
+                source_rights_status=self.settings.source_rights_status,
+                zero_output_reason=(str(verification.reason) if not outputs else None),
+                zero_output_status=("OFFLINE_ZERO" if not outputs else None),
+                verification=verification.to_dict(),
+            )
+            manifest.validate()
+            if on_phase:
+                on_phase(AnalysisPhase.OUTPUT_PLAN_READY, project_id, {"output_count": len(outputs)})
+            return manifest
 
-            # Candidate Mining & Finalization
-            outputs = self.finalizer.finalize_from_connection(
-                episodes=episodes,
-                connection_result=connection_result,
-                cancel_event=cancel_event,
-                on_phase=on_phase,
-                log=log,
-                legacy_wrapper=legacy_wrapper,
+        connection_result = self.connector.connect_season(
+            episodes=episodes,
+            evidence_map=evidence_map,
+            allow_incomplete=allow_incomplete,
+            cancel_event=cancel_event,
+            on_phase=on_phase,
+            log=log,
+        )
+        topology = SeasonConnectionResult(
+            cross_episode_links=list(connection_result.cross_episode_links),
+            candidate_proposals=[],
+            supporting_character_arcs=list(connection_result.supporting_character_arcs),
+            rejected_or_merged=list(connection_result.rejected_or_merged),
+            is_complete=connection_result.is_complete,
+            missing_episodes=list(connection_result.missing_episodes),
+        )
+        summaries = [
+            build_compact_summary(ep, evidence_map[ep.episode_id], coverage_ledger=evidence_map[ep.episode_id].coverage)
+            for ep in episodes if ep.episode_id in evidence_map
+        ]
+        coverage_ledgers = {ep_id: ev.coverage for ep_id, ev in evidence_map.items()}
+        if scope_str == AnalysisScope.SINGLE_EPISODE.value:
+            discovered = self.discoverer.discover_single(
+                summaries[0], topology, coverage_ledgers, episode=episodes[0],
+                phase_callback=on_phase, cancellation_token=cancel_event,
             )
         else:
-            raise AnalysisError(f"Phạm vi phân tích không được hỗ trợ: {scope_str}")
+            discovered = self.discoverer.discover_season(
+                summaries, topology, coverage_ledgers, episodes=episodes,
+                phase_callback=on_phase, cancellation_token=cancel_event,
+            )
+        consolidated = self.consolidator.consolidate(
+            discovered, phase_callback=on_phase, cancellation_token=cancel_event
+        )
+        health = PipelineHealth(
+            coverage_ledgers=coverage_ledgers,
+            discovery_completed=True,
+            discovered_count=len(discovered),
+            consolidation_completed=True,
+            consolidation_decisions=consolidated.decisions,
+            consolidated_candidates=consolidated.candidates,
+            total_evidence_count=sum(
+                len(items) for ev in evidence_map.values() for items in ev.data.values() if isinstance(items, list)
+            ),
+        )
+        verification = self.verifier.verify(
+            scope_id=project_id,
+            health=health,
+            candidates=consolidated.candidates,
+            allowed_episode_ids={ep.episode_id for ep in episodes},
+            existing_evidence_refs={
+                str(item.get("evidence_ref", item.get("id", "")))
+                for ev in evidence_map.values() for items in ev.data.values() if isinstance(items, list)
+                for item in items if isinstance(item, dict) and item.get("evidence_ref", item.get("id"))
+            },
+            episode_durations={ep.episode_id: ep.duration_seconds for ep in episodes},
+            cancellation_token=cancel_event,
+            phase_callback=on_phase,
+        )
+        if verification.recovered_candidates:
+            consolidated = self.consolidator.consolidate(
+                list(consolidated.candidates) + list(verification.recovered_candidates),
+                phase_callback=on_phase, cancellation_token=cancel_event,
+            )
+        candidates = list(consolidated.candidates)
+        if not candidates:
+            if not (verification.completed and verification.is_valid_zero):
+                reason = verification.reason.value if hasattr(verification.reason, "value") else str(verification.reason)
+                raise AnalysisError(f"Không thể xác nhận kết quả 0 output: {reason}")
+            outputs: list[CommentaryOutput] = []
+            finalization = None
+        else:
+            finalization = self.finalizer.finalize_candidates(
+                candidates, episodes, scope_str, topology=topology,
+                cancel_event=cancel_event, on_phase=on_phase, log=log,
+                legacy_wrapper=legacy_wrapper,
+            )
+            outputs = list(finalization.outputs)
+            if not outputs:
+                raise AnalysisError(
+                    "Finalizer không tạo được output hợp lệ từ các ứng viên đã xác minh; "
+                    "các ứng viên bị loại ở bước validation."
+                )
 
         # 4. Construct & Validate AnalysisManifest
         manifest = AnalysisManifest(
@@ -273,6 +436,12 @@ class AnalysisEngine:
             recap_mode=self.settings.recap_mode,
             content_type=self.settings.content_type,
             source_rights_status=self.settings.source_rights_status,
+            zero_output_reason=(
+                verification.reason.value if not outputs and hasattr(verification.reason, "value")
+                else (str(verification.reason) if not outputs else None)
+            ),
+            zero_output_status=("VERIFIED_GENUINE_ZERO" if not outputs else None),
+            verification=verification.to_dict(),
         )
         manifest.validate()
 
@@ -336,6 +505,7 @@ def run_analysis(
     on_phase: PhaseCallback | None = None,
     log: Callable[[str], None] | None = None,
     legacy_wrapper: bool = False,
+    policy: EditorialPolicy | None = None,
 ) -> AnalysisManifest:
     """Convenience functional API for running single or season analysis."""
     engine = AnalysisEngine(
@@ -344,6 +514,7 @@ def run_analysis(
         cache_manager=cache_manager,
         subtitle_pipeline=subtitle_pipeline,
         hierarchy_cache=hierarchy_cache,
+        policy=policy,
     )
     return engine.analyze(
         project_id=project_id,
@@ -357,4 +528,5 @@ def run_analysis(
         on_phase=on_phase,
         log=log,
         legacy_wrapper=legacy_wrapper,
+        policy=policy,
     )

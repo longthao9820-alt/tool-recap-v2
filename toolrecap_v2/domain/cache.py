@@ -52,12 +52,44 @@ def compute_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def compute_gap_cache_key(
+    source_fingerprint: str,
+    first_pass_hash: str,
+    gap_start_sec: float,
+    gap_end_sec: float,
+    target_categories: list[str],
+    target_characters: list[str],
+    scanner_directive_hash: str,
+    model: str,
+    thinking: str,
+    prompt_version: str = "v2",
+    request_hash: str = "",
+) -> str:
+    """Deterministic cache key for second-pass gap analysis."""
+    payload = {
+        "source_fingerprint": source_fingerprint,
+        "first_pass_hash": first_pass_hash,
+        "gap_start": round(gap_start_sec, 3),
+        "gap_end": round(gap_end_sec, 3),
+        "target_categories": sorted(target_categories),
+        "target_characters": sorted(target_characters),
+        "scanner_directive_hash": scanner_directive_hash,
+        "model": model,
+        "thinking": thinking,
+        "prompt_version": prompt_version,
+        "request_hash": request_hash,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 class EvidenceCacheManager:
     """Manages independent caching of EpisodeEvidence records with atomic disk writes."""
 
     def __init__(self, cache_dir: Path | None = None) -> None:
         self.cache_dir = cache_dir or default_evidence_cache_dir()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.gap_dir = self.cache_dir / "gaps"
+        self.gap_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _get_source_stats(source_video: str | Path) -> tuple[int, float]:
@@ -243,6 +275,60 @@ class EvidenceCacheManager:
                 except OSError:
                     pass
 
+        # Invalidate gap cache entries for this episode
+        for gp in self.gap_dir.glob(f"{safe_id}_*.gap.json"):
+            try:
+                gp.unlink()
+            except OSError:
+                pass
+
+    def _gap_cache_file_path(self, episode_id: str, gap_key: str) -> Path:
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in episode_id) or "ep"
+        return self.gap_dir / f"{safe_id}_{gap_key[:24]}.gap.json"
+
+    def save_gap(
+        self,
+        episode_id: str,
+        gap_key: str,
+        result: dict[str, Any],
+    ) -> Path:
+        """Atomically cache validated second-pass gap result."""
+        target_path = self._gap_cache_file_path(episode_id, gap_key)
+        tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}")
+        payload = {
+            "gap_key": gap_key,
+            "episode_id": episode_id,
+            "result": result,
+        }
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, target_path)
+        return target_path
+
+    def load_gap(
+        self,
+        episode_id: str,
+        gap_key: str,
+    ) -> dict[str, Any] | None:
+        """Load cached second-pass gap result if matching gap key exists."""
+        target_path = self._gap_cache_file_path(episode_id, gap_key)
+        if not target_path.is_file():
+            return None
+        try:
+            raw = json.loads(target_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            if raw.get("gap_key") != gap_key:
+                return None
+            res = raw.get("result")
+            if isinstance(res, dict):
+                return res
+            return None
+        except Exception:
+            return None
+
 
 def default_hierarchy_cache_dir() -> Path:
     base = default_data_directory() / "cache" / "season_hierarchy"
@@ -325,18 +411,22 @@ def compute_batch_cache_key(
     compaction_level: str = "FULL",
     settings_sig: str = "",
     node_id: str = "",
+    connection_directive_hash: str = "",
 ) -> str:
-    """Deterministic cache key for season batch analysis (hierarchy algo v3).
+    """Deterministic cache key for season batch analysis (hierarchy algo v3/v4).
     Strictly excludes API keys, tokens, or endpoints.
+    Uses connection_directive_hash instead of raw recap_prompt when provided.
     """
     effective_id = node_id or batch_id
+    effective_prompt = "" if connection_directive_hash else str(recap_prompt)
     payload = {
         "algo": algo,
         "node_id": effective_id,
         "summary_hashes": list(ordered_summary_hashes or []),
         "model": str(model),
         "thinking": str(thinking),
-        "recap_prompt": str(recap_prompt),
+        "recap_prompt": effective_prompt,
+        "connection_directive_hash": str(connection_directive_hash),
         "prompt_version": str(prompt_version),
         "compaction_level": str(compaction_level),
         "settings": str(settings_sig),
@@ -357,18 +447,22 @@ def compute_merge_cache_key(
     compaction_level: str = "FULL",
     settings_sig: str = "",
     node_id: str = "",
+    connection_directive_hash: str = "",
 ) -> str:
-    """Deterministic cache key for season cross-batch merge analysis (hierarchy algo v3).
+    """Deterministic cache key for season cross-batch merge analysis (hierarchy algo v3/v4).
     Strictly excludes API keys, tokens, or endpoints.
+    Uses connection_directive_hash instead of raw recap_prompt when provided.
     """
     effective_id = node_id or merge_id
+    effective_prompt = "" if connection_directive_hash else str(recap_prompt)
     payload = {
         "algo": algo,
         "node_id": effective_id,
         "batch_hashes": list(ordered_batch_hashes or []),
         "model": str(model),
         "thinking": str(thinking),
-        "recap_prompt": str(recap_prompt),
+        "recap_prompt": effective_prompt,
+        "connection_directive_hash": str(connection_directive_hash),
         "merge_version": str(merge_version),
         "compaction_level": str(compaction_level),
         "settings": str(settings_sig),
@@ -387,16 +481,20 @@ def compute_connection_cache_key(
     algo: str = "v3",
     compaction_level: str = "FULL",
     settings_sig: str = "",
+    connection_directive_hash: str = "",
 ) -> str:
-    """Deterministic cache key for full season connection result (algo v3).
+    """Deterministic cache key for full season connection result (algo v3/v4).
     Connection key content/order based; source identity remains evidence hash/order.
+    Uses connection_directive_hash instead of raw recap_prompt when provided.
     """
+    effective_prompt = "" if connection_directive_hash else str(recap_prompt)
     payload = {
         "algo": algo,
         "evidence_hashes": list(ordered_evidence_hashes or []),
         "model": str(model),
         "thinking": str(thinking),
-        "recap_prompt": str(recap_prompt),
+        "recap_prompt": effective_prompt,
+        "connection_directive_hash": str(connection_directive_hash),
         "config_version": str(config_version),
         "compaction_level": str(compaction_level),
         "settings": str(settings_sig),
@@ -419,18 +517,23 @@ def compute_finalizer_cache_key(
     source_rights_status: str = "",
     voice_style: str = "",
     recap_settings: dict[str, Any] | None = None,
+    *,
+    output_directive_hash: str = "",
 ) -> str:
     """Deterministic cache key for finalizer group analysis.
     Keyed by group payload hash + model + thinking + prompt + scope + algo + recap settings.
     Strictly excludes API keys, tokens, endpoints, or credentials.
+    Uses output_directive_hash instead of raw recap_prompt when provided.
     """
+    effective_prompt = "" if output_directive_hash else str(recap_prompt)
     payload: dict[str, Any] = {
         "algo": str(algo),
         "group_payload_hash": str(group_payload_hash),
         "model": str(model),
         "thinking": str(thinking),
         "prompt_version": str(prompt_version),
-        "recap_prompt": str(recap_prompt),
+        "recap_prompt": effective_prompt,
+        "output_directive_hash": str(output_directive_hash),
         "scope": str(scope),
         "recap_language": str(recap_language),
         "recap_mode": str(recap_mode),
@@ -450,6 +553,198 @@ def compute_finalizer_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+DISCOVERY_SCHEMA_VERSION: str = "v1"
+
+
+def compute_discovery_cache_key(
+    node_id: str,
+    child_hashes: list[str],
+    candidate_directive_hash: str,
+    coverage_hash: str,
+    model: str,
+    thinking: str = "auto",
+    prompt_version: str = "v1",
+    algo: str = "v1",
+    compaction_level: str = "FULL",
+) -> str:
+    """Deterministic cache key for candidate discovery nodes.
+
+    Strictly excludes API keys, tokens, endpoints, or credentials.
+    Keyed by:
+    - node_id
+    - child content hashes in exact order
+    - candidate directive hash from policy
+    - coverage hash
+    - model and thinking
+    - prompt version and algo version
+    - compaction level
+    """
+    payload: dict[str, Any] = {
+        "algo": str(algo),
+        "candidate_directive_hash": str(candidate_directive_hash),
+        "child_hashes": [str(h) for h in child_hashes],
+        "compaction_level": str(compaction_level),
+        "coverage_hash": str(coverage_hash),
+        "model": str(model),
+        "node_id": str(node_id),
+        "prompt_version": str(prompt_version),
+        "thinking": str(thinking),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def validate_discovery_cache_data(data: Any) -> bool:
+    """Validate candidate discovery cache data structure.
+
+    Requirements:
+    - Must be a dictionary.
+    - Must contain 'discovered_candidates' (or 'candidate_proposals' or 'candidates').
+    - That value must be a list of dicts.
+    """
+    if not isinstance(data, dict):
+        return False
+    candidates = None
+    for key in ("discovered_candidates", "candidate_proposals", "candidates"):
+        if key in data:
+            candidates = data[key]
+            break
+    if candidates is None or not isinstance(candidates, list):
+        return False
+    for item in candidates:
+        if not isinstance(item, dict):
+            return False
+    return True
+
+
+CONSOLIDATION_SCHEMA_VERSION: str = "v1"
+VERIFICATION_SCHEMA_VERSION: str = "v1"
+
+
+def compute_verification_cache_key(
+    scope_id: str,
+    health_hash: str,
+    candidate_directive_hash: str,
+    model: str,
+    thinking: str = "auto",
+    prompt_version: str = "v1",
+    algo: str = "v1",
+    compaction_level: str = "FULL",
+) -> str:
+    """Deterministic cache key for zero-output / low-coverage candidate verification.
+
+    Strictly excludes API keys, tokens, endpoints, or credentials.
+    Keyed by:
+    - scope_id (e.g. project_id or season/single scope)
+    - health_hash (hash of pipeline health state, coverage ledgers, decisions)
+    - candidate_directive_hash from policy
+    - model and thinking
+    - prompt version and algo version
+    - compaction level
+    """
+    payload: dict[str, Any] = {
+        "algo": str(algo),
+        "candidate_directive_hash": str(candidate_directive_hash),
+        "compaction_level": str(compaction_level),
+        "health_hash": str(health_hash),
+        "model": str(model),
+        "prompt_version": str(prompt_version),
+        "scope_id": str(scope_id),
+        "thinking": str(thinking),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def validate_verification_cache_data(data: Any) -> bool:
+    """Validate candidate verification cache data structure.
+
+    Requirements:
+    - Must be a dictionary.
+    - Must contain either:
+      - Non-empty 'recovered_candidates' (or 'candidates') as a list of dicts,
+      - OR explicit 'confirm_no_eligible' as a boolean.
+    """
+    if not isinstance(data, dict):
+        return False
+    has_recovered = False
+    for key in ("recovered_candidates", "candidates"):
+        if key in data:
+            cands = data[key]
+            if isinstance(cands, list) and len(cands) > 0 and all(isinstance(c, dict) for c in cands):
+                has_recovered = True
+            break
+    has_confirm = "confirm_no_eligible" in data and isinstance(data["confirm_no_eligible"], bool)
+    return has_recovered or has_confirm
+
+
+
+def compute_consolidation_cache_key(
+    node_id: str,
+    candidate_directive_hash: str,
+    input_payload_hash: str,
+    model: str,
+    thinking: str = "auto",
+    prompt_version: str = "v1",
+    algo: str = "v1",
+    compaction_level: str = "FULL",
+) -> str:
+    """Deterministic cache key for candidate consolidation nodes / root.
+
+    Strictly excludes API keys, tokens, endpoints, or credentials.
+    Keyed by:
+    - node_id
+    - candidate directive hash from policy
+    - input payload hash (SHA256 of deterministic input candidate representations)
+    - model and thinking
+    - prompt version and algo version
+    - compaction level
+    """
+    payload: dict[str, Any] = {
+        "algo": str(algo),
+        "candidate_directive_hash": str(candidate_directive_hash),
+        "compaction_level": str(compaction_level),
+        "input_payload_hash": str(input_payload_hash),
+        "model": str(model),
+        "node_id": str(node_id),
+        "prompt_version": str(prompt_version),
+        "thinking": str(thinking),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def validate_consolidation_cache_data(data: Any) -> bool:
+    """Validate candidate consolidation cache data structure.
+
+    Requirements:
+    - Must be a dictionary.
+    - Must contain 'consolidated_candidates' (or 'candidates') as a list of dicts.
+    - Must contain 'decisions' as a list of dicts.
+    """
+    if not isinstance(data, dict):
+        return False
+    candidates = None
+    for key in ("consolidated_candidates", "candidates"):
+        if key in data:
+            candidates = data[key]
+            break
+    if candidates is None or not isinstance(candidates, list):
+        return False
+    for item in candidates:
+        if not isinstance(item, dict):
+            return False
+
+    decisions = data.get("decisions")
+    if decisions is None or not isinstance(decisions, list):
+        return False
+    for dec in decisions:
+        if not isinstance(dec, dict):
+            return False
+    return True
+
+
+
 class HierarchyCacheManager:
     """Manages hierarchical caching of compact summaries, batches, and cross-batch merges.
 
@@ -463,12 +758,18 @@ class HierarchyCacheManager:
         self.merge_dir = self.base_dir / "merges"
         self.connection_dir = self.base_dir / "connections"
         self.finalizer_dir = self.base_dir / "finalizers"
+        self.discovery_dir = self.base_dir / "candidates"
+        self.consolidation_dir = self.base_dir / "consolidation"
+        self.verification_dir = self.base_dir / "verification"
 
         self.summary_dir.mkdir(parents=True, exist_ok=True)
         self.batch_dir.mkdir(parents=True, exist_ok=True)
         self.merge_dir.mkdir(parents=True, exist_ok=True)
         self.connection_dir.mkdir(parents=True, exist_ok=True)
         self.finalizer_dir.mkdir(parents=True, exist_ok=True)
+        self.discovery_dir.mkdir(parents=True, exist_ok=True)
+        self.consolidation_dir.mkdir(parents=True, exist_ok=True)
+        self.verification_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _safe_id(val: str) -> str:
@@ -817,6 +1118,207 @@ class HierarchyCacheManager:
                 meta["node_id"] = raw["node_id"]
             if "created_at" in raw:
                 meta["created_at"] = raw["created_at"]
+            return res, meta
+        except Exception:
+            return None, meta
+
+    # 6. Candidate Discovery Nodes
+    def save_discovery_result(
+        self,
+        node_id: str,
+        cache_key: str,
+        data: dict[str, Any],
+        *,
+        algo: str = "v1",
+        schema_version: str = DISCOVERY_SCHEMA_VERSION,
+        compaction_level: str = "FULL",
+        created_at: str | None = None,
+    ) -> Path:
+        if not validate_discovery_cache_data(data):
+            raise ValueError("Invalid discovery cache data: 'discovered_candidates' must be a list of dicts.")
+        safe_id = self._safe_id(node_id)
+        target = self.discovery_dir / f"{safe_id}_{cache_key[:24]}.discovery.json"
+        ts = created_at or datetime.now(timezone.utc).isoformat()
+        payload = {
+            "algo": algo,
+            "schema": schema_version,
+            "node_id": node_id,
+            "created_at": ts,
+            "cache_key": cache_key,
+            "compaction_level": compaction_level,
+            "result": data,
+        }
+        self._write_atomic(target, payload)
+        return target
+
+    def load_discovery_result(
+        self,
+        node_id: str,
+        cache_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        safe_id = self._safe_id(node_id)
+        target = self.discovery_dir / f"{safe_id}_{cache_key[:24]}.discovery.json"
+        meta: dict[str, Any] = {"hit": False, "cache_key": cache_key, "path": str(target)}
+
+        target_file = target
+        if not target_file.is_file():
+            matches = list(self.discovery_dir.glob(f"*{cache_key[:24]}.discovery.json"))
+            if matches:
+                target_file = matches[0]
+                meta["path"] = str(target_file)
+            else:
+                return None, meta
+
+        try:
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("cache_key") != cache_key:
+                return None, meta
+            res = raw.get("result")
+            if not isinstance(res, dict) or not validate_discovery_cache_data(res):
+                return None, meta
+            meta["hit"] = True
+            if "algo" in raw:
+                meta["algo"] = raw["algo"]
+            if "node_id" in raw:
+                meta["node_id"] = raw["node_id"]
+            if "created_at" in raw:
+                meta["created_at"] = raw["created_at"]
+            if "schema" in raw:
+                meta["schema"] = raw["schema"]
+            return res, meta
+        except Exception:
+            return None, meta
+
+    # 7. Candidate Consolidation Nodes
+    def save_consolidation_result(
+        self,
+        node_id: str,
+        cache_key: str,
+        data: dict[str, Any],
+        *,
+        algo: str = "v1",
+        schema_version: str = CONSOLIDATION_SCHEMA_VERSION,
+        compaction_level: str = "FULL",
+        created_at: str | None = None,
+    ) -> Path:
+        if not validate_consolidation_cache_data(data):
+            raise ValueError("Invalid consolidation cache data: must contain 'consolidated_candidates' and 'decisions' lists.")
+        safe_id = self._safe_id(node_id)
+        target = self.consolidation_dir / f"{safe_id}_{cache_key[:24]}.consolidation.json"
+        ts = created_at or datetime.now(timezone.utc).isoformat()
+        payload = {
+            "algo": algo,
+            "schema": schema_version,
+            "node_id": node_id,
+            "created_at": ts,
+            "cache_key": cache_key,
+            "compaction_level": compaction_level,
+            "result": data,
+        }
+        self._write_atomic(target, payload)
+        return target
+
+    def load_consolidation_result(
+        self,
+        node_id: str,
+        cache_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        safe_id = self._safe_id(node_id)
+        target = self.consolidation_dir / f"{safe_id}_{cache_key[:24]}.consolidation.json"
+        meta: dict[str, Any] = {"hit": False, "cache_key": cache_key, "path": str(target)}
+
+        target_file = target
+        if not target_file.is_file():
+            matches = list(self.consolidation_dir.glob(f"*{cache_key[:24]}.consolidation.json"))
+            if matches:
+                target_file = matches[0]
+                meta["path"] = str(target_file)
+            else:
+                return None, meta
+
+        try:
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("cache_key") != cache_key:
+                return None, meta
+            res = raw.get("result")
+            if not isinstance(res, dict) or not validate_consolidation_cache_data(res):
+                return None, meta
+            meta["hit"] = True
+            if "algo" in raw:
+                meta["algo"] = raw["algo"]
+            if "node_id" in raw:
+                meta["node_id"] = raw["node_id"]
+            if "created_at" in raw:
+                meta["created_at"] = raw["created_at"]
+            if "schema" in raw:
+                meta["schema"] = raw["schema"]
+            return res, meta
+        except Exception:
+            return None, meta
+
+    # 8. Candidate Verification
+    def save_verification_result(
+        self,
+        scope_id: str,
+        cache_key: str,
+        data: dict[str, Any],
+        *,
+        algo: str = "v1",
+        schema_version: str = VERIFICATION_SCHEMA_VERSION,
+        compaction_level: str = "FULL",
+        created_at: str | None = None,
+    ) -> Path:
+        if not validate_verification_cache_data(data):
+            raise ValueError("Invalid verification cache data: must contain 'recovered_candidates' list or 'confirm_no_eligible' bool.")
+        safe_id = self._safe_id(scope_id)
+        target = self.verification_dir / f"{safe_id}_{cache_key[:24]}.verification.json"
+        ts = created_at or datetime.now(timezone.utc).isoformat()
+        payload = {
+            "algo": algo,
+            "schema": schema_version,
+            "scope_id": scope_id,
+            "created_at": ts,
+            "cache_key": cache_key,
+            "compaction_level": compaction_level,
+            "result": data,
+        }
+        self._write_atomic(target, payload)
+        return target
+
+    def load_verification_result(
+        self,
+        scope_id: str,
+        cache_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        safe_id = self._safe_id(scope_id)
+        target = self.verification_dir / f"{safe_id}_{cache_key[:24]}.verification.json"
+        meta: dict[str, Any] = {"hit": False, "cache_key": cache_key, "path": str(target)}
+
+        target_file = target
+        if not target_file.is_file():
+            matches = list(self.verification_dir.glob(f"*{cache_key[:24]}.verification.json"))
+            if matches:
+                target_file = matches[0]
+                meta["path"] = str(target_file)
+            else:
+                return None, meta
+
+        try:
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("cache_key") != cache_key:
+                return None, meta
+            res = raw.get("result")
+            if not isinstance(res, dict) or not validate_verification_cache_data(res):
+                return None, meta
+            meta["hit"] = True
+            if "algo" in raw:
+                meta["algo"] = raw["algo"]
+            if "scope_id" in raw:
+                meta["scope_id"] = raw["scope_id"]
+            if "created_at" in raw:
+                meta["created_at"] = raw["created_at"]
+            if "schema" in raw:
+                meta["schema"] = raw["schema"]
             return res, meta
         except Exception:
             return None, meta

@@ -8,7 +8,17 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .enums import AnalysisScope, AudioPolicy, CandidateScope, CompactionLevel, OutputStatus
+from .enums import (
+    AnalysisScope,
+    AudioPolicy,
+    CandidateScope,
+    CandidateStatus,
+    CompactionLevel,
+    ConsolidationAction,
+    ConsolidationReason,
+    OutputStatus,
+    ZeroOutputReason,
+)
 from .title import resolve_unique_titles, sanitize_title
 
 
@@ -163,6 +173,8 @@ class CommentaryOutput:
     publication_narration_srt_path: str | None = None
     error: str | None = None
     progress: int = 0
+    candidate_id: str = ""
+    source_candidate_id: str = ""
 
     @property
     def video_path(self) -> str | None:
@@ -189,7 +201,7 @@ class CommentaryOutput:
         self.publication_narration_srt_path = val
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "output_id": self.output_id,
             "title": self.title,
             "sanitized_title": self.sanitized_title,
@@ -202,6 +214,14 @@ class CommentaryOutput:
             "error": self.error,
             "progress": self.progress,
         }
+        cid = getattr(self, "source_candidate_id", "") or getattr(self, "candidate_id", "")
+        if cid:
+            d["source_candidate_id"] = cid
+            d["candidate_id"] = cid
+        return d
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommentaryOutput":
@@ -213,6 +233,7 @@ class CommentaryOutput:
         ]
         title = str(data.get("title", ""))
         sanitized = str(data.get("sanitized_title", "")) or sanitize_title(title)
+        cid = str(data.get("source_candidate_id") or data.get("candidate_id") or "").strip()
         return cls(
             output_id=str(data.get("output_id", "")),
             title=title,
@@ -225,7 +246,527 @@ class CommentaryOutput:
             publication_narration_srt_path=data.get("publication_narration_srt_path") or data.get("narration_srt_path"),
             error=data.get("error"),
             progress=int(data.get("progress", 0)),
+            candidate_id=cid,
+            source_candidate_id=cid,
         )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "CommentaryOutput":
+        data = json.loads(json_str)
+        if not isinstance(data, dict):
+            raise ValidationError("JSON root must be an object.")
+        return cls.from_dict(data)
+
+
+@dataclass
+class CandidateSourceRange:
+    episode_id: str = ""
+    start_seconds: float = 0.0
+    end_seconds: float = 0.0
+    evidence_ref: str = ""
+
+    @property
+    def ref(self) -> str:
+        return self.evidence_ref
+
+    @property
+    def start(self) -> float:
+        return self.start_seconds
+
+    @property
+    def end(self) -> float:
+        return self.end_seconds
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, float(self.end_seconds) - float(self.start_seconds))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode_id": self.episode_id,
+            "start_seconds": round(float(self.start_seconds), 3),
+            "end_seconds": round(float(self.end_seconds), 3),
+            "evidence_ref": self.evidence_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CandidateSourceRange":
+        if not isinstance(data, dict):
+            return cls()
+        ep_id = str(data.get("episode_id", ""))
+        start = float(data.get("start_seconds", data.get("start", 0.0)))
+        end = float(data.get("end_seconds", data.get("end", 0.0)))
+        ref = str(data.get("evidence_ref", data.get("ref", "")))
+        return cls(
+            episode_id=ep_id,
+            start_seconds=start,
+            end_seconds=end,
+            evidence_ref=ref,
+        )
+
+
+@dataclass
+class CandidateProposal:
+    proposal_id: str = ""
+    title: str = ""
+    candidate_scope: str = CandidateScope.CROSS_EPISODE.value
+    episodes: list[str] = field(default_factory=list)
+    characters: list[str] = field(default_factory=list)
+    description: str = ""
+    editorial_reason: str = ""
+    status: str = "keep"  # keep, reject, merged
+    subject: str = ""
+    central_thesis: str = ""
+    primary_character: str = ""
+    supporting_characters: list[str] = field(default_factory=list)
+    source_ranges: list[CandidateSourceRange] = field(default_factory=list)
+    setup: str = ""
+    development: str = ""
+    turning: str = ""
+    payoff: str = ""
+    consequence: str = ""
+    observed_facts: list[str] = field(default_factory=list)
+    supporting_evidence: list[str] = field(default_factory=list)
+    counter_evidence: list[str] = field(default_factory=list)
+    praise: str = ""
+    criticism: str = ""
+    alternative: str = ""
+    why: str = ""
+    hooks: list[str] = field(default_factory=list)
+    estimated_duration: float = 0.0
+    overlap_tags: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "title": self.title,
+            "candidate_scope": self.candidate_scope,
+            "episodes": list(self.episodes),
+            "characters": list(self.characters),
+            "description": self.description,
+            "editorial_reason": self.editorial_reason,
+            "status": self.status,
+            "subject": self.subject,
+            "central_thesis": self.central_thesis,
+            "primary_character": self.primary_character,
+            "supporting_characters": list(self.supporting_characters),
+            "source_ranges": [r.to_dict() for r in self.source_ranges],
+            "setup": self.setup,
+            "development": self.development,
+            "turning": self.turning,
+            "payoff": self.payoff,
+            "consequence": self.consequence,
+            "observed_facts": list(self.observed_facts),
+            "supporting_evidence": list(self.supporting_evidence),
+            "counter_evidence": list(self.counter_evidence),
+            "praise": self.praise,
+            "criticism": self.criticism,
+            "alternative": self.alternative,
+            "why": self.why,
+            "hooks": list(self.hooks),
+            "estimated_duration": float(self.estimated_duration),
+            "overlap_tags": list(self.overlap_tags),
+            "confidence": float(self.confidence),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CandidateProposal":
+        if not isinstance(data, dict):
+            return cls()
+
+        raw_ranges = data.get("source_ranges", [])
+        ranges = [
+            r if isinstance(r, CandidateSourceRange) else CandidateSourceRange.from_dict(r)
+            for r in raw_ranges
+            if isinstance(r, (dict, CandidateSourceRange))
+        ]
+
+        raw_hooks = data.get("hooks", [])
+        if isinstance(raw_hooks, str):
+            hooks = [raw_hooks] if raw_hooks.strip() else []
+        elif isinstance(raw_hooks, list):
+            hooks = [str(h) for h in raw_hooks]
+        else:
+            hooks = []
+
+        supp = data.get("supporting_evidence", data.get("supporting_evidence_refs", []))
+        if isinstance(supp, list):
+            supp_evidence = [str(x) for x in supp]
+        elif isinstance(supp, str):
+            supp_evidence = [supp] if supp.strip() else []
+        else:
+            supp_evidence = []
+
+        counter = data.get("counter_evidence", data.get("counter_evidence_refs", []))
+        if isinstance(counter, list):
+            counter_evidence = [str(x) for x in counter]
+        elif isinstance(counter, str):
+            counter_evidence = [counter] if counter.strip() else []
+        else:
+            counter_evidence = []
+
+        obs = data.get("observed_facts", [])
+        if isinstance(obs, list):
+            obs_facts = [str(x) for x in obs]
+        elif isinstance(obs, str):
+            obs_facts = [obs] if obs.strip() else []
+        else:
+            obs_facts = []
+
+        tags = data.get("overlap_tags", [])
+        if isinstance(tags, list):
+            overlap_tags = [str(x) for x in tags]
+        elif isinstance(tags, str):
+            overlap_tags = [tags] if tags.strip() else []
+        else:
+            overlap_tags = []
+
+        turning = str(data.get("turning", data.get("turning_point", "")))
+
+        raw_dur = data.get("estimated_duration", data.get("estimated_duration_seconds", data.get("duration", 0.0)))
+        try:
+            duration = float(raw_dur or 0.0)
+        except (ValueError, TypeError):
+            duration = 0.0
+
+        def _to_str(val: Any) -> str:
+            if isinstance(val, list):
+                return "\n".join(str(v) for v in val)
+            return str(val or "")
+
+        raw_conf = data.get("confidence", 1.0)
+        try:
+            confidence = float(raw_conf if raw_conf is not None else 1.0)
+        except (ValueError, TypeError):
+            confidence = 1.0
+
+        return cls(
+            proposal_id=str(data.get("proposal_id", "")),
+            title=str(data.get("title", "")),
+            candidate_scope=str(data.get("candidate_scope", CandidateScope.CROSS_EPISODE.value)),
+            episodes=[str(e) for e in data.get("episodes", [])],
+            characters=[str(c) for c in data.get("characters", [])],
+            description=str(data.get("description", "")),
+            editorial_reason=str(data.get("editorial_reason", "")),
+            status=str(data.get("status", "keep")),
+            subject=str(data.get("subject", "")),
+            central_thesis=str(data.get("central_thesis", "")),
+            primary_character=str(data.get("primary_character", "")),
+            supporting_characters=[str(c) for c in data.get("supporting_characters", [])],
+            source_ranges=ranges,
+            setup=str(data.get("setup", "")),
+            development=str(data.get("development", "")),
+            turning=turning,
+            payoff=str(data.get("payoff", "")),
+            consequence=str(data.get("consequence", "")),
+            observed_facts=obs_facts,
+            supporting_evidence=supp_evidence,
+            counter_evidence=counter_evidence,
+            praise=_to_str(data.get("praise")),
+            criticism=_to_str(data.get("criticism")),
+            alternative=_to_str(data.get("alternative")),
+            why=str(data.get("why", "")),
+            hooks=hooks,
+            estimated_duration=duration,
+            overlap_tags=overlap_tags,
+            confidence=confidence,
+        )
+
+
+CONSOLIDATION_SCHEMA_VERSION: str = "v1"
+
+
+@dataclass
+class ConsolidationDecision:
+    candidate_id: str = ""
+    action: str = ConsolidationAction.KEEP.value
+    reason_code: str = ""
+    reason: str = ""
+    target_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "action": self.action,
+            "reason_code": self.reason_code,
+            "reason": self.reason,
+            "target_id": self.target_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ConsolidationDecision:
+        if not isinstance(data, dict):
+            return cls()
+        cid = str(data.get("candidate_id") or data.get("proposal_id") or data.get("id", "")).strip()
+        raw_action = str(data.get("action", ConsolidationAction.KEEP.value)).strip().upper()
+        if raw_action not in (
+            ConsolidationAction.KEEP.value,
+            ConsolidationAction.MERGE.value,
+            ConsolidationAction.REJECT.value,
+        ):
+            raw_action = ConsolidationAction.KEEP.value
+        rcode = str(data.get("reason_code", "")).strip()
+        reason = str(data.get("reason") or data.get("explanation") or "").strip()
+        target = str(data.get("target_id") or data.get("into_id") or data.get("merged_into") or "").strip()
+        return cls(
+            candidate_id=cid,
+            action=raw_action,
+            reason_code=rcode,
+            reason=reason,
+            target_id=target,
+        )
+
+
+@dataclass
+class ConsolidatedCandidateSet:
+    candidates: list[CandidateProposal] = field(default_factory=list)
+    decisions: list[ConsolidationDecision] = field(default_factory=list)
+    schema_version: str = CONSOLIDATION_SCHEMA_VERSION
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def merged_count(self) -> int:
+        return sum(1 for d in self.decisions if d.action == ConsolidationAction.MERGE.value)
+
+    @property
+    def rejected_count(self) -> int:
+        return sum(1 for d in self.decisions if d.action == ConsolidationAction.REJECT.value)
+
+    @property
+    def kept_count(self) -> int:
+        return sum(1 for d in self.decisions if d.action == ConsolidationAction.KEEP.value)
+
+    @property
+    def eligible_count(self) -> int:
+        return len(self.candidates)
+
+    def get_decision(self, candidate_id: str) -> ConsolidationDecision | None:
+        cid = str(candidate_id).strip()
+        for d in self.decisions:
+            if d.candidate_id == cid:
+                return d
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "consolidated_candidates": [c.to_dict() for c in self.candidates],
+            "decisions": [d.to_dict() for d in self.decisions],
+            "schema_version": self.schema_version,
+            "metadata": dict(self.metadata),
+        }
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ConsolidatedCandidateSet:
+        if not isinstance(data, dict):
+            return cls()
+        raw_cands = data.get("consolidated_candidates", data.get("candidates", []))
+        cands = [
+            c if isinstance(c, CandidateProposal) else CandidateProposal.from_dict(c)
+            for c in raw_cands
+            if isinstance(c, (dict, CandidateProposal))
+        ]
+        raw_decs = data.get("decisions", [])
+        decs = [
+            d if isinstance(d, ConsolidationDecision) else ConsolidationDecision.from_dict(d)
+            for d in raw_decs
+            if isinstance(d, (dict, ConsolidationDecision))
+        ]
+        meta = data.get("metadata", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        sver = str(data.get("schema_version", data.get("schema", CONSOLIDATION_SCHEMA_VERSION)))
+        return cls(
+            candidates=cands,
+            decisions=decs,
+            schema_version=sver,
+            metadata=meta,
+        )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> ConsolidatedCandidateSet:
+        data = json.loads(json_str)
+        if not isinstance(data, dict):
+            raise ValidationError("JSON root must be an object.")
+        return cls.from_dict(data)
+
+
+@dataclass
+class PipelineHealth:
+    coverage_ledgers: list[Any] | dict[str, Any] = field(default_factory=list)
+    discovery_completed: bool = True
+    discovery_error: str | None = None
+    discovery_schema_valid: bool = True
+    discovered_count: int = 0
+    consolidation_completed: bool = True
+    consolidation_error: str | None = None
+    consolidation_schema_valid: bool = True
+    consolidation_decisions: list[ConsolidationDecision] | list[dict[str, Any]] = field(default_factory=list)
+    consolidated_candidates: list[CandidateProposal] | list[dict[str, Any]] = field(default_factory=list)
+    finalizer_attempted: bool = False
+    finalizer_completed: bool = False
+    finalizer_results: list[Any] = field(default_factory=list)
+    finalizer_error: str | None = None
+    parser_failed: bool = False
+    parser_error: str | None = None
+    schema_rejected: bool = False
+    schema_error: str | None = None
+    total_evidence_count: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        cands_serialized = []
+        for c in self.consolidated_candidates:
+            if hasattr(c, "to_dict"):
+                cands_serialized.append(c.to_dict())
+            elif isinstance(c, dict):
+                cands_serialized.append(dict(c))
+            else:
+                cands_serialized.append(str(c))
+
+        decs_serialized = []
+        for d in self.consolidation_decisions:
+            if hasattr(d, "to_dict"):
+                decs_serialized.append(d.to_dict())
+            elif isinstance(d, dict):
+                decs_serialized.append(dict(d))
+            else:
+                decs_serialized.append(str(d))
+
+        ledgers_serialized = []
+        if isinstance(self.coverage_ledgers, dict):
+            ledgers_serialized = {
+                k: v.to_dict() if hasattr(v, "to_dict") else v
+                for k, v in self.coverage_ledgers.items()
+            }
+        elif isinstance(self.coverage_ledgers, list):
+            ledgers_serialized = [
+                x.to_dict() if hasattr(x, "to_dict") else x
+                for x in self.coverage_ledgers
+            ]
+
+        return {
+            "coverage_ledgers": ledgers_serialized,
+            "discovery_completed": self.discovery_completed,
+            "discovery_error": self.discovery_error,
+            "discovery_schema_valid": self.discovery_schema_valid,
+            "discovered_count": self.discovered_count,
+            "consolidation_completed": self.consolidation_completed,
+            "consolidation_error": self.consolidation_error,
+            "consolidation_schema_valid": self.consolidation_schema_valid,
+            "consolidation_decisions": decs_serialized,
+            "consolidated_candidates": cands_serialized,
+            "finalizer_attempted": self.finalizer_attempted,
+            "finalizer_completed": self.finalizer_completed,
+            "finalizer_results": list(self.finalizer_results),
+            "finalizer_error": self.finalizer_error,
+            "parser_failed": self.parser_failed,
+            "parser_error": self.parser_error,
+            "schema_rejected": self.schema_rejected,
+            "schema_error": self.schema_error,
+            "total_evidence_count": self.total_evidence_count,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PipelineHealth:
+        if not isinstance(data, dict):
+            return cls()
+        cands_raw = data.get("consolidated_candidates", [])
+        cands = [
+            c if isinstance(c, CandidateProposal) else CandidateProposal.from_dict(c)
+            for c in cands_raw
+            if isinstance(c, (dict, CandidateProposal))
+        ]
+        decs_raw = data.get("consolidation_decisions", [])
+        decs = [
+            d if isinstance(d, ConsolidationDecision) else ConsolidationDecision.from_dict(d)
+            for d in decs_raw
+            if isinstance(d, (dict, ConsolidationDecision))
+        ]
+        return cls(
+            coverage_ledgers=data.get("coverage_ledgers", []),
+            discovery_completed=bool(data.get("discovery_completed", True)),
+            discovery_error=data.get("discovery_error"),
+            discovery_schema_valid=bool(data.get("discovery_schema_valid", True)),
+            discovered_count=int(data.get("discovered_count", 0)),
+            consolidation_completed=bool(data.get("consolidation_completed", True)),
+            consolidation_error=data.get("consolidation_error"),
+            consolidation_schema_valid=bool(data.get("consolidation_schema_valid", True)),
+            consolidation_decisions=decs,
+            consolidated_candidates=cands,
+            finalizer_attempted=bool(data.get("finalizer_attempted", False)),
+            finalizer_completed=bool(data.get("finalizer_completed", False)),
+            finalizer_results=list(data.get("finalizer_results", [])),
+            finalizer_error=data.get("finalizer_error"),
+            parser_failed=bool(data.get("parser_failed", False)),
+            parser_error=data.get("parser_error"),
+            schema_rejected=bool(data.get("schema_rejected", False)),
+            schema_error=data.get("schema_error"),
+            total_evidence_count=int(data.get("total_evidence_count", 0)),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class VerificationResult:
+    reason: ZeroOutputReason | str = ZeroOutputReason.NO_ELIGIBLE_CANDIDATES.value
+    is_valid_zero: bool = False
+    recovered_candidates: list[CandidateProposal] = field(default_factory=list)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    completed: bool = False
+    rationale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason.value if isinstance(self.reason, ZeroOutputReason) else str(self.reason),
+            "is_valid_zero": self.is_valid_zero,
+            "recovered_candidates": [c.to_dict() for c in self.recovered_candidates],
+            "diagnostics": dict(self.diagnostics),
+            "completed": self.completed,
+            "rationale": self.rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> VerificationResult:
+        if not isinstance(data, dict):
+            return cls()
+        raw_cands = data.get("recovered_candidates", data.get("candidates", []))
+        cands = [
+            c if isinstance(c, CandidateProposal) else CandidateProposal.from_dict(c)
+            for c in raw_cands
+            if isinstance(c, (dict, CandidateProposal))
+        ]
+        reason_val = data.get("reason", ZeroOutputReason.NO_ELIGIBLE_CANDIDATES.value)
+        if isinstance(reason_val, str):
+            try:
+                reason_obj = ZeroOutputReason(reason_val)
+            except ValueError:
+                reason_obj = reason_val
+        else:
+            reason_obj = reason_val
+        return cls(
+            reason=reason_obj,
+            is_valid_zero=bool(data.get("is_valid_zero", False)),
+            recovered_candidates=cands,
+            diagnostics=dict(data.get("diagnostics", {})),
+            completed=bool(data.get("completed", False)),
+            rationale=str(data.get("rationale", "")),
+        )
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> VerificationResult:
+        data = json.loads(json_str)
+        if not isinstance(data, dict):
+            raise ValidationError("JSON root must be an object.")
+        return cls.from_dict(data)
+
 
 
 @dataclass
@@ -515,6 +1056,41 @@ def _extract_item_info(category: str, raw: dict[str, Any]) -> tuple[str, list[st
         if parts:
             summary = f"{char} ({', '.join(parts)})" if char else ", ".join(parts)
         item_type = "trait"
+    elif category == "contradictions":
+        c_text = str(raw.get("contradiction", "")).strip() or fallback_text
+        if c_text:
+            summary = f"Contradiction: {c_text}"
+        item_type = "contradiction"
+    elif category == "dilemmas":
+        d_text = str(raw.get("dilemma", "")).strip() or fallback_text
+        if d_text:
+            summary = f"Dilemma: {d_text}"
+        item_type = "dilemma"
+    elif category == "visual_storytelling":
+        v_text = str(raw.get("visual", raw.get("description", ""))).strip() or fallback_text
+        if v_text:
+            summary = f"Visual: {v_text}"
+        item_type = "visual_storytelling"
+    elif category == "recurring_behavior":
+        b_text = str(raw.get("behavior", raw.get("recurring_behavior", ""))).strip() or fallback_text
+        if b_text:
+            summary = f"Behavior: {b_text}"
+        item_type = "recurring_behavior"
+    elif category == "power_shifts":
+        ps_text = str(raw.get("power_shift", raw.get("shift", ""))).strip() or fallback_text
+        if ps_text:
+            summary = f"Power shift: {ps_text}"
+        item_type = "power_shift"
+    elif category == "reactions":
+        r_text = str(raw.get("reaction", "")).strip() or fallback_text
+        if r_text:
+            summary = f"Reaction: {r_text}"
+        item_type = "reaction"
+    elif category == "counter_evidence":
+        ce_text = str(raw.get("counter_evidence", raw.get("claim", ""))).strip() or fallback_text
+        if ce_text:
+            summary = f"Counter evidence: {ce_text}"
+        item_type = "counter_evidence"
     else:
         # Fallback for any other category
         text_vals = [str(v).strip() for k, v in raw.items() if isinstance(v, str) and str(v).strip() and k not in ("episode_id", "item_type")]
@@ -531,8 +1107,9 @@ def build_compact_summary(
     evidence: EpisodeEvidence,
     *,
     schema_version: str = SUMMARY_SCHEMA_VERSION,
+    coverage_ledger: Any = None,
 ) -> CompactEpisodeSummary:
-    """Deterministically build a grounded CompactEpisodeSummary from EpisodeEvidence.
+    """Deterministically build a grounded CompactEpisodeSummary from EpisodeEvidence and coverage ledger.
 
     Extracts narrative items from all evidence categories, preserving episode identity,
     timestamps, characters, and short summaries. Deduplicates overlapping evidence
@@ -542,6 +1119,7 @@ def build_compact_summary(
     raw_items: list[CompactSummaryItem] = []
     ep_id = episode.episode_id
     max_duration = float(episode.duration_seconds) if episode.duration_seconds > 0.0 else float(evidence.duration_seconds)
+    eff_ledger = coverage_ledger if coverage_ledger is not None else evidence.coverage
 
     for cat_name, cat_list in sorted(evidence.data.items(), key=lambda x: x[0]):
         if not isinstance(cat_list, list):
@@ -732,6 +1310,21 @@ def compact_summary(
                 it.item_type in ("setup", "payoff", "reveal", "reversal", "decision", "consequence", "failure", "conflict", "unresolved")
                 or any(c in ("setup_payoff", "reveals", "reversals", "character_decisions", "consequences", "failures", "conflicts", "unresolved") for c in it.categories)
             )
+            is_policy_priority = (
+                it.item_type in (
+                    "supporting_development", "relationship", "reveal", "reversal", "setup", "payoff",
+                    "consequence", "conflict", "subplot", "recurring_behavior", "contradiction",
+                    "counter_evidence", "dilemma", "power_shift", "reaction", "visual_storytelling",
+                )
+                or any(
+                    c in (
+                        "supporting_developments", "relationships", "reveals", "reversals", "setup_payoff",
+                        "consequences", "conflicts", "subplots", "recurring_behavior", "contradictions",
+                        "counter_evidence", "dilemmas", "power_shifts", "reactions", "visual_storytelling",
+                    )
+                    for c in it.categories
+                )
+            )
             t_sum = it.summary[:100] if len(it.summary) > 100 else it.summary
             compacted_it = CompactSummaryItem(
                 refs=list(it.refs[:2]),
@@ -743,7 +1336,7 @@ def compact_summary(
                 categories=list(it.categories),
                 item_type=it.item_type,
             )
-            if is_supporting or is_turning_point:
+            if is_supporting or is_turning_point or is_policy_priority:
                 priority_items.append(compacted_it)
             else:
                 fallback_items.append(compacted_it)
@@ -773,6 +1366,21 @@ def compact_summary(
             it.item_type in ("setup", "payoff", "reveal", "reversal", "decision", "consequence", "failure", "conflict", "unresolved")
             or any(c in ("setup_payoff", "reveals", "reversals", "character_decisions", "consequences", "failures", "conflicts", "unresolved") for c in it.categories)
         )
+        is_policy_priority = (
+            it.item_type in (
+                "supporting_development", "relationship", "reveal", "reversal", "setup", "payoff",
+                "consequence", "conflict", "subplot", "recurring_behavior", "contradiction",
+                "counter_evidence", "dilemma", "power_shift", "reaction", "visual_storytelling",
+            )
+            or any(
+                c in (
+                    "supporting_developments", "relationships", "reveals", "reversals", "setup_payoff",
+                    "consequences", "conflicts", "subplots", "recurring_behavior", "contradictions",
+                    "counter_evidence", "dilemmas", "power_shifts", "reactions", "visual_storytelling",
+                )
+                for c in it.categories
+            )
+        )
         t_sum = it.summary[:skeleton_cap] if len(it.summary) > skeleton_cap else it.summary
         compacted_it = CompactSummaryItem(
             refs=[str(r)[:80] for r in (it.refs[:2] if it.refs else [f"{it.item_type or 'ev'}:0"])],
@@ -784,7 +1392,7 @@ def compact_summary(
             categories=[str(c)[:50] for c in it.categories[:5]],
             item_type=it.item_type,
         )
-        if is_supporting or is_turning_point:
+        if is_supporting or is_turning_point or is_policy_priority:
             skeleton_items.append(compacted_it)
         else:
             fallback_skeleton.append(compacted_it)
@@ -846,6 +1454,9 @@ class AnalysisManifest:
     recap_mode: str = "MAIN_STORIES"
     content_type: str = "US_TV_SHOW"
     source_rights_status: str = "UNVERIFIED"
+    zero_output_reason: str | None = None
+    zero_output_status: str | None = None
+    verification: VerificationResult | dict[str, Any] | None = None
 
     def validate(self) -> None:
         """Strict validation of manifest integrity:
@@ -923,7 +1534,7 @@ class AnalysisManifest:
                         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "project_id": self.project_id,
             "analysis_scope": self.analysis_scope,
             "source_episodes": [ep.to_dict() for ep in self.source_episodes],
@@ -934,6 +1545,13 @@ class AnalysisManifest:
             "content_type": self.content_type,
             "source_rights_status": self.source_rights_status,
         }
+        if self.zero_output_reason is not None:
+            d["zero_output_reason"] = self.zero_output_reason
+        if self.zero_output_status is not None:
+            d["zero_output_status"] = self.zero_output_status
+        if self.verification is not None:
+            d["verification"] = self.verification.to_dict() if hasattr(self.verification, "to_dict") else self.verification
+        return d
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
@@ -954,6 +1572,11 @@ class AnalysisManifest:
             if isinstance(out, (dict, CommentaryOutput))
         ]
 
+        ver_raw = data.get("verification")
+        ver_obj = None
+        if ver_raw is not None:
+            ver_obj = ver_raw if isinstance(ver_raw, VerificationResult) else VerificationResult.from_dict(ver_raw)
+
         manifest = cls(
             project_id=str(data.get("project_id", "")),
             analysis_scope=str(data.get("analysis_scope", AnalysisScope.SINGLE_EPISODE.value)),
@@ -964,6 +1587,9 @@ class AnalysisManifest:
             recap_mode=str(data.get("recap_mode", "MAIN_STORIES")),
             content_type=str(data.get("content_type", "US_TV_SHOW")),
             source_rights_status=str(data.get("source_rights_status", data.get("rights", "UNVERIFIED"))),
+            zero_output_reason=data.get("zero_output_reason"),
+            zero_output_status=data.get("zero_output_status"),
+            verification=ver_obj,
         )
 
         if validate:

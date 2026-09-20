@@ -649,8 +649,13 @@ def test_final_plan_cache_and_resume_with_engine(tmp_path: Path) -> None:
         ]
     }
 
+    from tests.helpers_editorial import stage_response
+
+    disc_resp = stage_response("candidate discoverer", episodes=episodes, default=finalizer_resp)
+    cons_resp = stage_response("candidate consolidator", episodes=episodes, default=finalizer_resp)
+
     # RUN 1: Full pipeline execution
-    client1 = MockFinalizerClient([scanner_resp, scanner_resp, conn_resp, finalizer_resp])
+    client1 = MockFinalizerClient([scanner_resp, scanner_resp, conn_resp, disc_resp, cons_resp, finalizer_resp])
     engine1 = AnalysisEngine(
         settings=settings,
         client=client1,
@@ -667,7 +672,7 @@ def test_final_plan_cache_and_resume_with_engine(tmp_path: Path) -> None:
 
     assert len(manifest1.outputs) == 1
     assert manifest1.outputs[0].title == "Complete Season Recap"
-    assert len(client1.call_history) == 4  # 2 scanner + 1 conn + 1 finalizer
+    assert len(client1.call_history) == 6  # 2 scanner + 1 conn + 1 disc + 1 cons + 1 finalizer
 
     # Verify plan cache file exists
     plan_files = list(engine1.plan_cache_dir.glob("*.json"))

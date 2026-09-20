@@ -1068,25 +1068,35 @@ def test_sequential_batch_unaffected(tmp_path: Path, dummy_video: Path, monkeypa
     settings = AppSettings(gateway_enabled=True)
     queue = ProjectQueue(records, store=store, settings=settings)
 
+    from tests.helpers_editorial import stage_response
+
+    custom_output = {
+        "outputs": [
+            {
+                "output_id": "out_01",
+                "title": "Batch Output",
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.0}],
+                        "narration": "Narration text",
+                        "audio_policy": "duck",
+                    }
+                ],
+            }
+        ]
+    }
+
     def mock_chat_json(self, *, model, **kwargs):
         if model == "sub":
-            return {"range_start_ms": 0, "range_end_ms": 2000, "events": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}]}
-        return {
-            "outputs": [
-                {
-                    "output_id": "out_01",
-                    "title": "Batch Output",
-                    "segments": [
-                        {
-                            "segment_id": "s1",
-                            "source_clips": [{"episode_id": "E01", "start": 0.0, "end": 1.0}],
-                            "narration": "Narration text",
-                            "audio_policy": "duck",
-                        }
-                    ],
-                }
-            ]
-        }
+            return {
+                "range_start_ms": 0,
+                "range_end_ms": 2000,
+                "events": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}],
+                "major_scenes": [{"start_ms": 0, "end_ms": 1000, "summary": "Ev"}],
+                "dialogue": [{"start_ms": 0, "end_ms": 1000, "speaker": "A", "quote": "Hi"}],
+            }
+        return stage_response(kwargs.get("system", ""), kwargs.get("user_text", ""), default=custom_output)
     monkeypatch.setattr(OpenAICompatibleClient, "chat_json", mock_chat_json)
 
     from toolrecap_v2.renderer import PublicationRenderer

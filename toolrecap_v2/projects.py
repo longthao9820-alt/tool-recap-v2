@@ -80,8 +80,14 @@ class ProjectRecord:
     stage: str = "Sẵn sàng"
     error_scope: str | None = None
     error_target: str | None = None
+    zero_output_reason: str | None = None
+    zero_output_status: str | None = None
+    verification: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.verification is not None and hasattr(self.verification, "to_dict"):
+            self.verification = self.verification.to_dict()
+
         # Convert nested dicts to dataclass instances if needed
         if self.source_episodes:
             self.source_episodes = [
@@ -222,6 +228,207 @@ class ProjectRecord:
         )
 
 
+ZERO_OUTPUT_MESSAGES: dict[str, str] = {
+    "NO_ELIGIBLE_CANDIDATES": "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs).",
+    "INSUFFICIENT_EVIDENCE": "Hoàn thành phân tích: Không đủ dữ liệu bằng chứng để tạo recap.",
+    "CANDIDATE_DISCOVERY_FAILED": "Hoàn thành phân tích: Khám phá ứng viên không thành công.",
+    "CANDIDATES_REJECTED_BY_VALIDATION": "Hoàn thành phân tích: Tất cả ứng viên bị loại sau khi xác minh.",
+    "FINALIZER_FAILED": "Hoàn thành phân tích: Tạo kịch bản hoàn tất thất bại.",
+    "MALFORMED_AI_RESPONSE": "Hoàn thành phân tích: Phản hồi AI không đúng định dạng.",
+    "PARSER_FAILURE": "Hoàn thành phân tích: Lỗi phân tích cú pháp dữ liệu.",
+    "COVERAGE_INCOMPLETE": "Hoàn thành phân tích: Phạm vi bằng chứng chưa đầy đủ.",
+    "LOW_COVERAGE_SUSPECT": "Hoàn thành phân tích: Độ bao phủ thấp đáng ngờ.",
+}
+
+
+def _phase_update(
+    record: ProjectRecord,
+    phase: AnalysisPhase | str,
+    target_id: str,
+    data: dict[str, Any],
+    notify_fn: Callable[[ProjectRecord], None] | None = None,
+) -> None:
+    phase_val = phase.value if hasattr(phase, "value") else str(phase)
+    record.phase = phase_val
+    msg = data.get("status_message") or data.get("status") or ""
+
+    def _update_prog(val: int) -> None:
+        record.progress = max(record.progress, min(100, val))
+
+    num_eps = max(1, len(record.source_episodes))
+
+    # Check if retry message: ensure queue displays retry and remains RUNNING
+    is_retry = "Thử lại" in msg or "Retrying" in msg or "retry" in msg.lower()
+    if is_retry:
+        record.status = "RUNNING"
+        record.current_message = f"[{target_id}] {msg}"
+
+    # 4a. Scanner callbacks (progress within 20-55; details coverage_check/second_pass/complete)
+    if phase in {AnalysisPhase.SCANNER, "scanner"}:
+        ep = next((e for e in record.source_episodes if e.episode_id == target_id), None)
+        st = data.get("status")
+
+        if data.get("cached") is True:
+            if ep:
+                ep.cached = True
+                ep.status = "CACHED"
+                ep.stage = "Evidence Complete"
+                ep.progress = 100
+                ep.current_message = "Đã có trong bộ nhớ đệm"
+        elif st == "complete":
+            if ep:
+                ep.status = "EVIDENCE_COMPLETE"
+                ep.stage = "Evidence Complete"
+                ep.progress = 100
+                ep.current_message = "Hoàn tất"
+        elif st in {"coverage_check", "second_pass"}:
+            if ep:
+                if ep.status not in {"COMPLETED", "CACHED", "EVIDENCE_COMPLETE"}:
+                    ep.status = "RUNNING"
+                ep.stage = "Scanner"
+                ep.current_message = f"Kiểm tra Evidence Coverage — {target_id}"
+            if not is_retry:
+                record.current_message = f"Kiểm tra Evidence Coverage — {target_id}"
+        else:
+            if ep and ep.status not in {"COMPLETED", "CACHED", "EVIDENCE_COMPLETE"}:
+                ep.status = "RUNNING"
+                ep.stage = "Scanner"
+                if msg:
+                    ep.current_message = msg
+
+        # Dynamic monotonic interpolation within 20-55
+        ep_ratios: list[float] = []
+        for e in record.source_episodes:
+            if e.status in {"CACHED", "COMPLETED", "EVIDENCE_COMPLETE"}:
+                ep_ratios.append(1.0)
+            elif e.episode_id == target_id and st in {"coverage_check", "second_pass"}:
+                ep_ratios.append(0.85)
+            elif e.episode_id == target_id and data.get("total_chunks"):
+                chunk_idx = int(data.get("chunk_index") or 0)
+                tot_chunks = max(1, int(data.get("total_chunks") or 1))
+                ep_ratios.append(0.7 * (chunk_idx / tot_chunks))
+            elif e.status == "RUNNING":
+                ep_ratios.append(0.5)
+            else:
+                ep_ratios.append(0.0)
+
+        completed_eps = sum(1 for e in record.source_episodes if e.status in {"CACHED", "COMPLETED", "EVIDENCE_COMPLETE"})
+        avg_ratio = sum(ep_ratios) / num_eps
+        scanner_prog = 20 + int(35 * avg_ratio)
+        _update_prog(min(55, scanner_prog))
+
+        if not is_retry and st not in {"coverage_check", "second_pass"}:
+            record.current_message = f"Phân tích [scanner]: {target_id} ({completed_eps}/{num_eps})"
+
+    # 4b. EPISODE_SUMMARIZING / BATCH_SUMMARIZING (55-60)
+    elif phase_val in {"episode_summarizing", "batch_summarizing"} or phase in {
+        AnalysisPhase.EPISODE_SUMMARIZING,
+        AnalysisPhase.BATCH_SUMMARIZING,
+    }:
+        record.season_status = "RUNNING"
+        record.season_stage = "Episode Summarizing"
+        _update_prog(58)
+        if not is_retry:
+            record.current_message = f"Phân tích tóm tắt tập: {target_id}"
+
+    # 4c. SEASON_BATCH per batch (60-65 using data index/total)
+    elif phase in {AnalysisPhase.SEASON_BATCH, "season_batch"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Season Batch"
+        batch_idx = int(data.get("batch_index") or 1)
+        total_batches = int(data.get("total_batches") or 1)
+        batch_prog = 60 + int(5 * (batch_idx / max(1, total_batches)))
+        _update_prog(min(65, batch_prog))
+        record.season_progress = int((batch_idx / max(1, total_batches)) * 100)
+        if not is_retry:
+            record.current_message = f"Phân tích nhóm mùa phim {target_id} ({batch_idx}/{total_batches})"
+
+    # 4d. SEASON_MERGING (63-65)
+    elif phase in {AnalysisPhase.SEASON_MERGING, "season_merging"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Season Merging"
+        record.season_progress = 75
+        _update_prog(65)
+        if not is_retry:
+            record.current_message = f"Hợp nhất dữ liệu cốt truyện: {target_id}"
+
+    # 4e. CANDIDATE_DISCOVERY (65-72)
+    elif phase in {AnalysisPhase.CANDIDATE_DISCOVERY, "candidate_discovery"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Khám phá ứng viên"
+        idx = int(data.get("index") or 1)
+        total = int(data.get("total") or 1)
+        disc_prog = 65 + int(7 * (idx / max(1, total)))
+        _update_prog(min(72, disc_prog))
+        record.season_progress = int((idx / max(1, total)) * 100)
+        if not is_retry:
+            record.current_message = f"Khám phá ứng viên ({idx}/{total})" if total > 1 else "Khám phá ứng viên"
+
+    # 4f. CANDIDATE_CONSOLIDATION (72-77)
+    elif phase in {AnalysisPhase.CANDIDATE_CONSOLIDATION, "candidate_consolidation"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Hợp nhất ứng viên"
+        idx = int(data.get("index") or 1)
+        total = int(data.get("total") or 1)
+        cons_prog = 72 + int(5 * (idx / max(1, total)))
+        _update_prog(min(77, cons_prog))
+        record.season_progress = int((idx / max(1, total)) * 100)
+        if not is_retry:
+            record.current_message = f"Hợp nhất ứng viên ({idx}/{total})" if total > 1 else "Hợp nhất ứng viên"
+
+    # 4g. ZERO/CANDIDATE_VERIFYING (77-80)
+    elif phase in {
+        AnalysisPhase.CANDIDATE_VERIFYING,
+        AnalysisPhase.ZERO_OUTPUT_VERIFICATION,
+        "candidate_verifying",
+        "zero_output_verification",
+    }:
+        record.season_status = "RUNNING"
+        record.season_stage = "Xác minh kết quả 0 output"
+        idx = int(data.get("index") or 1)
+        total = int(data.get("total") or 1)
+        verif_prog = 77 + int(3 * (idx / max(1, total)))
+        _update_prog(min(80, verif_prog))
+        record.season_progress = int((idx / max(1, total)) * 100)
+        if not is_retry:
+            record.current_message = "Xác minh kết quả 0 output"
+
+    # 4h. SEASON_MINING / finalizer (80-85)
+    elif phase in {AnalysisPhase.SEASON_MINING, "season_mining", "finalizer"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Season Mining"
+        idx = int(data.get("index") or data.get("group_index") or 1)
+        total = int(data.get("total") or data.get("total_groups") or 1)
+        fin_prog = 80 + int(5 * (idx / max(1, total)))
+        _update_prog(min(85, fin_prog))
+        record.season_progress = int((idx / max(1, total)) * 100)
+        if not is_retry:
+            record.current_message = f"Khai thác cốt truyện: {target_id}" if "node" not in str(target_id).lower() else "Khai thác cốt truyện"
+
+    # 4i. OUTPUT_PLAN_READY (85)
+    elif phase in {AnalysisPhase.OUTPUT_PLAN_READY, "output_plan_ready"}:
+        _update_prog(85)
+        record.season_status = "COMPLETED"
+        record.season_stage = "Hoàn thành"
+        record.season_progress = 100
+        if not is_retry:
+            record.current_message = "Kế hoạch recap sẵn sàng"
+
+    # Other season phases (55-60)
+    elif phase in {AnalysisPhase.SEASON_BARRIER, "season_barrier", AnalysisPhase.SEASON_CONNECTING, "season_connecting"}:
+        record.season_status = "RUNNING"
+        record.season_stage = "Season Analysis"
+        _update_prog(60)
+        if not is_retry:
+            record.current_message = f"Season Analysis — {target_id}"
+    else:
+        if not is_retry:
+            record.current_message = f"Phân tích [{record.phase}]: {target_id}"
+
+    if notify_fn:
+        notify_fn(record)
+
+
 class ProjectStore:
     """Atomic persistent storage for project queue in %LOCALAPPDATA%."""
 
@@ -296,6 +503,15 @@ class ProjectQueue:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    def _phase_update(
+        self,
+        record: ProjectRecord,
+        phase: AnalysisPhase | str,
+        target_id: str,
+        data: dict[str, Any],
+    ) -> None:
+        _phase_update(record, phase, target_id, data, notify_fn=self._notify_update)
 
     def start(self) -> None:
         """Start sequential processing thread."""
@@ -630,112 +846,7 @@ class ProjectQueue:
         )
 
         def _on_engine_phase(phase: AnalysisPhase, target_id: str, data: dict[str, Any]) -> None:
-            phase_val = phase.value if hasattr(phase, "value") else str(phase)
-            record.phase = phase_val
-            msg = data.get("status_message") or data.get("status") or ""
-
-            # Check if retry message: ensure queue displays retry and remains RUNNING
-            is_retry = "Thử lại" in msg or "Retrying" in msg or "retry" in msg.lower()
-            if is_retry:
-                record.status = "RUNNING"
-                record.current_message = f"[{target_id}] {msg}"
-
-            # 4a. Scanner callbacks (20-60 proportionally each episode; cached immediately count)
-            if phase in {AnalysisPhase.SCANNER, "scanner"}:
-                ep = next((e for e in record.source_episodes if e.episode_id == target_id), None)
-                if data.get("cached") is True:
-                    if ep:
-                        ep.cached = True
-                        ep.status = "CACHED"
-                        ep.stage = "Evidence Complete"
-                        ep.progress = 100
-                        ep.current_message = "Đã có trong bộ nhớ đệm"
-                elif data.get("status") == "complete":
-                    if ep:
-                        ep.status = "EVIDENCE_COMPLETE"
-                        ep.stage = "Evidence Complete"
-                        ep.progress = 100
-                        ep.current_message = "Hoàn tất"
-                else:
-                    if ep and ep.status not in {"COMPLETED", "CACHED", "EVIDENCE_COMPLETE"}:
-                        ep.status = "RUNNING"
-                        ep.stage = "Scanner"
-                        if msg:
-                            ep.current_message = msg
-
-                completed_eps = sum(1 for e in record.source_episodes if e.status in {"CACHED", "COMPLETED", "EVIDENCE_COMPLETE"})
-                _update_progress(20 + int(40 * completed_eps / max(1, num_eps)))
-                if not is_retry:
-                    record.current_message = f"Phân tích [scanner]: {target_id} ({completed_eps}/{num_eps})"
-
-            # 4b. EPISODE_SUMMARIZING / BATCH_SUMMARIZING (60-63)
-            elif phase_val in {"episode_summarizing", "batch_summarizing"} or phase in {
-                AnalysisPhase.EPISODE_SUMMARIZING,
-                AnalysisPhase.BATCH_SUMMARIZING,
-            }:
-                record.season_status = "RUNNING"
-                record.season_stage = "Episode Summarizing"
-                _update_progress(60)
-                if not is_retry:
-                    record.current_message = f"Phân tích tóm tắt tập: {target_id}"
-
-            # 4c. SEASON_BATCH per batch (63-70 using data index/total)
-            elif phase in {AnalysisPhase.SEASON_BATCH, "season_batch"}:
-                record.season_status = "RUNNING"
-                record.season_stage = "Season Batch"
-                batch_idx = int(data.get("batch_index") or 1)
-                total_batches = int(data.get("total_batches") or 1)
-                batch_prog = 63 + int(7 * (batch_idx / max(1, total_batches)))
-                _update_progress(min(70, batch_prog))
-                record.season_progress = int((batch_idx / max(1, total_batches)) * 100)
-                if not is_retry:
-                    record.current_message = f"Phân tích nhóm mùa phim {target_id} ({batch_idx}/{total_batches})"
-
-            # 4d. SEASON_MERGING (70-75)
-            elif phase in {AnalysisPhase.SEASON_MERGING, "season_merging"}:
-                record.season_status = "RUNNING"
-                record.season_stage = "Season Merging"
-                record.season_progress = 75
-                if data.get("status") == "complete" or data.get("cache_hit") or data.get("progress") == 75:
-                    _update_progress(75)
-                else:
-                    _update_progress(70)
-                if not is_retry:
-                    record.current_message = f"Hợp nhất dữ liệu cốt truyện: {target_id}"
-
-            # 4e. SEASON_MINING / finalizer (75-85)
-            elif phase in {AnalysisPhase.SEASON_MINING, "season_mining"}:
-                record.season_status = "RUNNING"
-                record.season_stage = "Season Mining"
-                record.season_progress = 90
-                _update_progress(75)
-                if not is_retry:
-                    record.current_message = f"Đào sâu cốt truyện mùa phim: {target_id}"
-
-            # 4f. OUTPUT_PLAN_READY (85)
-            elif phase in {AnalysisPhase.OUTPUT_PLAN_READY, "output_plan_ready"}:
-                _update_progress(85)
-                record.season_status = "COMPLETED"
-                record.season_stage = "Hoàn thành"
-                record.season_progress = 100
-                if not is_retry:
-                    record.current_message = f"Kế hoạch recap sẵn sàng: {target_id}"
-
-            # Other season phases
-            elif phase in {AnalysisPhase.SEASON_BARRIER, "season_barrier", AnalysisPhase.SEASON_CONNECTING, "season_connecting"}:
-                record.season_status = "RUNNING"
-                record.season_stage = "Season Analysis"
-                if data.get("cache_hit") or data.get("status") == "cached" or data.get("progress") == 75:
-                    _update_progress(75)
-                else:
-                    _update_progress(60)
-                if not is_retry:
-                    record.current_message = f"Season Analysis — {target_id}"
-            else:
-                if not is_retry:
-                    record.current_message = f"Phân tích [{record.phase}]: {target_id}"
-
-            self._notify_update(record)
+            self._phase_update(record, phase, target_id, data)
 
         def _engine_log(msg: str) -> None:
             record.current_message = msg
@@ -758,14 +869,24 @@ class ProjectQueue:
                 raise
             err_text = str(exc)
             failed_ep = next((e for e in record.source_episodes if e.episode_id in err_text), None)
-            if failed_ep and ("scanner" in err_text.lower() or record.phase == "scanner"):
+            is_candidate_or_verif = (
+                record.phase in {
+                    "candidate_discovery", "candidate_consolidation", "candidate_verifying", "zero_output_verification",
+                    "CANDIDATE_DISCOVERY", "CANDIDATE_CONSOLIDATION", "CANDIDATE_VERIFYING", "ZERO_OUTPUT_VERIFICATION",
+                }
+                or "0 output" in err_text
+                or "xác nhận kết quả 0 output" in err_text.lower()
+                or "candidate" in err_text.lower()
+                or "verification" in err_text.lower()
+            )
+            if failed_ep and ("scanner" in err_text.lower() or record.phase == "scanner") and not is_candidate_or_verif:
                 record.error_scope = "EPISODE"
                 record.error_target = failed_ep.episode_id
                 failed_ep.status = "ERROR"
                 failed_ep.stage = "Lỗi"
                 failed_ep.error = err_text
                 failed_ep.current_message = f"Lỗi: {err_text}"
-            elif record.analysis_scope == "SEASON" or "season" in err_text.lower() or "batch" in err_text.lower() or "merge" in err_text.lower() or record.phase in {"season_barrier", "season_connecting", "episode_summarizing", "season_batch", "season_merging", "season_mining"}:
+            elif is_candidate_or_verif or record.analysis_scope == "SEASON" or "season" in err_text.lower() or "batch" in err_text.lower() or "merge" in err_text.lower() or record.phase in {"season_barrier", "season_connecting", "episode_summarizing", "season_batch", "season_merging", "season_mining"}:
                 record.season_status = "ERROR"
                 record.season_error = err_text
                 record.season_stage = "Lỗi"
@@ -784,13 +905,28 @@ class ProjectQueue:
         record.manifest_path = str(out_dir / f"{record.name}_manifest.json")
         Path(record.manifest_path).write_text(manifest.to_json(indent=2), encoding="utf-8")
         record.outputs = manifest.outputs
+        record.zero_output_reason = manifest.zero_output_reason
+        record.zero_output_status = manifest.zero_output_status
+        record.verification = (
+            manifest.verification.to_dict()
+            if hasattr(manifest.verification, "to_dict")
+            else (manifest.verification if isinstance(manifest.verification, dict) else None)
+        )
 
         # 5. Check zero outputs: complete analysis with status COMPLETED and no publication files
         if not manifest.outputs:
             record.status = "COMPLETED"
             record.phase = "COMPLETED"
             _update_progress(100)
-            record.current_message = "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs)."
+            if record.analysis_scope == "SEASON":
+                record.season_status = "COMPLETED"
+                record.season_stage = "Hoàn thành"
+                record.season_progress = 100
+            msg = ZERO_OUTPUT_MESSAGES.get(
+                manifest.zero_output_reason or "",
+                "Hoàn thành phân tích: Không có ứng viên recap nào đạt yêu cầu (0 outputs).",
+            )
+            record.current_message = msg
             self._notify_update(record)
             return
 
