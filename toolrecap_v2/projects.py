@@ -20,11 +20,13 @@ from .analyzer.phases import AnalysisPhase
 from .api_client import OpenAICompatibleClient
 from .domain import AnalysisManifest, CommentaryOutput, MediaSelection, SourceEpisode
 from .domain.cache import EvidenceCacheManager
+from .domain.enums import OutputStatus
 from .gpu import video_encode_args
 from .media import (
     MediaError,
     MediaProbeResult,
     RenderCancelled,
+    RenderStageError,
     cut_clip,
     find_binary,
     probe_duration,
@@ -41,7 +43,7 @@ from .narration import (
     transcribe_local_whisper,
 )
 from .paths import default_data_directory
-from .renderer import PublicationRenderer
+from .renderer import PublicationRenderer, compute_output_render_signature
 from .settings import AppSettings
 from .subtitles.cache import SubtitleCacheManager
 from .subtitles.discovery import discover_sidecars
@@ -321,6 +323,49 @@ def compute_project_render_signature(
         "true_peak_dbtp": settings.true_peak_dbtp,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _persist_manifest_operational(manifest: AnalysisManifest | None, manifest_path: str) -> None:
+    if manifest is None or not manifest_path:
+        return
+    path = Path(manifest_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and "outputs" in existing:
+                existing_outputs_by_id = {
+                    out.get("output_id"): out
+                    for out in existing.get("outputs", [])
+                    if isinstance(out, dict) and out.get("output_id")
+                }
+                for mem_out in manifest.outputs:
+                    out_dict = mem_out.to_dict()
+                    target = existing_outputs_by_id.get(mem_out.output_id)
+                    if target is not None:
+                        for op_field in (
+                            "status",
+                            "progress",
+                            "error",
+                            "publication_video_path",
+                            "publication_original_srt_path",
+                            "publication_narration_srt_path",
+                            "render_signature",
+                            "sanitized_title",
+                        ):
+                            target[op_field] = out_dict.get(op_field)
+                    else:
+                        existing.setdefault("outputs", []).append(out_dict)
+                tmp_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp_path, path)
+                return
+        except Exception:
+            pass
+
+    tmp_path.write_text(manifest.to_json(indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def _phase_update(
@@ -1038,18 +1083,32 @@ class ProjectQueue:
         os.replace(manifest_tmp, Path(record.manifest_path))
         record.analysis_signature = analysis_signature
 
+        # Always copy prior fields by output id regardless of global render signature
+        for out in manifest.outputs:
+            prior = previous_outputs.get(out.output_id)
+            if prior is not None:
+                out.status = prior.status
+                out.progress = prior.progress
+                out.error = prior.error
+                out.publication_video_path = prior.publication_video_path
+                out.publication_original_srt_path = prior.publication_original_srt_path
+                out.publication_narration_srt_path = prior.publication_narration_srt_path
+                out.render_signature = getattr(prior, "render_signature", "") or getattr(out, "render_signature", "")
+                if getattr(prior, "sanitized_title", None):
+                    out.sanitized_title = prior.sanitized_title
+
+        # Compute target signature for each manifest output from analysis_signature/settings/voice
+        target_signatures = {
+            out.output_id: compute_output_render_signature(
+                out=out,
+                settings=self.settings,
+                voice_id=record.voice_id,
+                analysis_signature=analysis_signature,
+            )
+            for out in manifest.outputs
+        }
+
         render_signature = compute_project_render_signature(analysis_signature, record, self.settings)
-        resume_render = bool(record.render_signature and record.render_signature == render_signature)
-        if resume_render:
-            for out in manifest.outputs:
-                prior = previous_outputs.get(out.output_id)
-                if prior is not None:
-                    out.status = prior.status
-                    out.progress = prior.progress
-                    out.error = prior.error
-                    out.publication_video_path = prior.publication_video_path
-                    out.publication_original_srt_path = prior.publication_original_srt_path
-                    out.publication_narration_srt_path = prior.publication_narration_srt_path
         record.render_signature = render_signature
         record.outputs = manifest.outputs
         record.zero_output_reason = manifest.zero_output_reason
@@ -1086,10 +1145,24 @@ class ProjectQueue:
         record.current_message = f"Bắt đầu kết xuất {len(manifest.outputs)} video recap..."
         self._notify_update(record)
 
+        # Ensure manifest object and record.outputs are the same list before call
+        record.outputs = manifest.outputs
+
         def _render_prog(out_idx: int, total_out: int, cur_out: CommentaryOutput, pct: float, msg: str) -> None:
             record.current_message = f"[{out_idx}/{total_out}] {cur_out.title}: {msg}"
             _update_progress(min(99, 85 + int(((out_idx - 1 + pct / 100.0) / max(1, total_out)) * 15)))
             self._notify_update(record)
+
+        def _on_output_complete(completed_out: CommentaryOutput, out_idx: int, total_out: int) -> None:
+            if not record.output_video and completed_out.publication_video_path:
+                record.output_video = completed_out.publication_video_path
+                record.output_original_srt = completed_out.publication_original_srt_path
+                record.output_narration_srt = completed_out.publication_narration_srt_path
+                record.output_srt = completed_out.publication_narration_srt_path
+            _persist_manifest_operational(manifest, record.manifest_path)
+            self.store.save(self.projects)
+            if self.on_update:
+                self.on_update(record)
 
         renderer = PublicationRenderer(voice_manager=get_voice_manager())
         try:
@@ -1101,36 +1174,76 @@ class ProjectQueue:
                 output_root=out_dir,
                 callbacks=_render_prog,
                 cancel_event=self._cancel_event,
-                resume_completed=resume_render,
+                resume_completed=True,
+                analysis_signature=analysis_signature,
+                target_signatures=target_signatures,
+                on_output_complete=_on_output_complete,
             )
+            record.outputs = rendered_outputs
+            manifest.outputs = rendered_outputs
+            if rendered_outputs:
+                first = rendered_outputs[0]
+                record.output_video = first.publication_video_path
+                record.output_original_srt = first.publication_original_srt_path
+                record.output_narration_srt = first.publication_narration_srt_path
+                record.output_srt = first.publication_narration_srt_path
+
+            record.status = "COMPLETED"
+            record.phase = "COMPLETED"
+            _update_progress(100)
+            record.current_message = "Hoàn tất xuất sắc!"
+            self._notify_update(record)
+        except RenderCancelled:
+            raise
+        except RenderStageError as exc:
+            record.error_scope = "OUTPUT"
+            target_id = exc.output_id or (manifest.outputs[0].output_id if manifest.outputs else None)
+            record.error_target = target_id
+            failed_idx: int | None = None
+            for idx, out in enumerate(manifest.outputs):
+                if out.output_id == target_id:
+                    out.status = OutputStatus.ERROR.value
+                    out.error = str(exc)
+                    failed_idx = idx
+                    break
+            if failed_idx is not None:
+                for rem in manifest.outputs[failed_idx + 1:]:
+                    rem.status = OutputStatus.WAITING.value
+                    rem.progress = 0
+            elif manifest.outputs:
+                manifest.outputs[0].status = OutputStatus.ERROR.value
+                manifest.outputs[0].error = str(exc)
+                record.error_target = manifest.outputs[0].output_id
+                for rem in manifest.outputs[1:]:
+                    rem.status = OutputStatus.WAITING.value
+                    rem.progress = 0
+            raise
         except Exception as exc:
             if self._cancel_event.is_set() or isinstance(exc, (RenderCancelled, AnalysisCancelledError)):
                 raise
-            failed_out = next((o for o in record.outputs if getattr(o, "status", None) in {"ERROR", OutputStatus.ERROR.value}), None)
-            if failed_out:
-                record.error_scope = "OUTPUT"
+            record.error_scope = "OUTPUT"
+            failed_out = next(
+                (o for o in manifest.outputs if getattr(o, "status", None) in {"ERROR", OutputStatus.ERROR.value}),
+                None,
+            )
+            if failed_out is not None:
                 record.error_target = failed_out.output_id
-            elif record.outputs:
-                record.error_scope = "OUTPUT"
-                record.error_target = record.outputs[0].output_id
-                record.outputs[0].status = OutputStatus.ERROR.value
-                record.outputs[0].error = str(exc)
+                try:
+                    fail_idx = manifest.outputs.index(failed_out)
+                    for rem in manifest.outputs[fail_idx + 1:]:
+                        rem.status = OutputStatus.WAITING.value
+                        rem.progress = 0
+                except ValueError:
+                    pass
+            elif manifest.outputs:
+                failed_out = manifest.outputs[0]
+                failed_out.status = OutputStatus.ERROR.value
+                failed_out.error = str(exc)
+                record.error_target = failed_out.output_id
+                for rem in manifest.outputs[1:]:
+                    rem.status = OutputStatus.WAITING.value
+                    rem.progress = 0
             raise
-
-        record.outputs = rendered_outputs
-        manifest.outputs = rendered_outputs
-        manifest_tmp = Path(record.manifest_path).with_suffix(".tmp")
-        manifest_tmp.write_text(manifest.to_json(indent=2), encoding="utf-8")
-        os.replace(manifest_tmp, Path(record.manifest_path))
-        if rendered_outputs:
-            first = rendered_outputs[0]
-            record.output_video = first.publication_video_path
-            record.output_original_srt = first.publication_original_srt_path
-            record.output_narration_srt = first.publication_narration_srt_path
-            record.output_srt = first.publication_narration_srt_path
-
-        record.status = "COMPLETED"
-        record.phase = "COMPLETED"
-        _update_progress(100)
-        record.current_message = "Hoàn tất xuất sắc!"
-        self._notify_update(record)
+        finally:
+            _persist_manifest_operational(manifest, record.manifest_path)
+            self.store.save(self.projects)

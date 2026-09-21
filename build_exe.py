@@ -158,9 +158,11 @@ def build_portable_package() -> int:
         shutil.copy2(repo_root / "LICENSE", app_dir / "LICENSE")
     if (repo_root / "THIRD_PARTY_LICENSES.md").is_file():
         shutil.copy2(repo_root / "THIRD_PARTY_LICENSES.md", app_dir / "THIRD_PARTY_LICENSES.md")
+    if (repo_root / "HUONG_DAN.md").is_file():
+        shutil.copy2(repo_root / "HUONG_DAN.md", app_dir / "HUONG_DAN.md")
 
     guide_content = r"""========================================================================
-             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.4.0)
+             HƯỚNG DẪN SỬ DỤNG TOOLRECAP V2 (PORTABLE WINDOWS v0.5.2)
 ========================================================================
 
 1. CÁCH MỞ ỨNG DỤNG:
@@ -267,6 +269,23 @@ def build_portable_package() -> int:
 14. CẬP NHẬT & DỮ LIỆU:
     - Tự động kiểm tra GitHub Releases chính thức từ longthao9820-alt/tool-recap-v2 kèm SHA256.
     - Dữ liệu lưu ngoài thư mục ứng dụng tại %LOCALAPPDATA%\ToolRecapV2.
+
+15. BỘ KẾT XUẤT ĐA NGUỒN MẠNH MẼ (ROBUST MULTI-SOURCE RENDERER v0.5.2):
+    - Strict Signature Fast Path: So sánh chữ ký kỹ thuật (StreamSignature: codec, độ phân giải,
+      fps, pix_fmt, sar, sample_rate, channels). Nếu các phân đoạn đồng nhất hoàn toàn,
+      kích hoạt ghép nối trực tiếp (stream-copy concat demuxer) tức thì không cần nén lại.
+    - Normalized Video/Audio Profile: Khi các đoạn nguồn lệch chuẩn (khác độ phân giải,
+      tốc độ khung hình, số kênh âm thanh), tự động chuẩn hóa video (kích thước chẵn,
+      setsar=1, format=yuv420p, fps đồng nhất) và chuẩn hóa âm thanh (aresample=48000Hz,
+      format=fltp, 2 kênh stereo).
+    - Silent Audio Handling: Tự động bổ sung luồng âm thanh im lặng (anullsrc stereo 48kHz)
+      cho các clip không có âm thanh hoặc áp dụng chính sách tắt tiếng gốc (MUTE_ORIGINAL),
+      ngăn chặn hiện tượng lệch luồng và mất đồng bộ khi ghép nối.
+    - Validation: Thăm dò độc lập bằng ffprobe cho từng tệp sau khi cắt và sau khi ghép,
+      đảm bảo đủ 3 tệp thành phẩm (.mp4, .original.srt, .narration.srt) và khớp thời lượng.
+    - Per-Output Resume & Errors: Ghi nhớ trạng thái theo từng video đầu ra, tự động
+      bỏ qua các video đã hoàn thành dựa trên render signature khi chạy lại; phân định
+      mã lỗi chi tiết theo từng giai đoạn (CUT, CONCAT, SYNTHESIS, MIX, VALIDATION).
 ========================================================================
 """
     (app_dir / "HUONG_DAN_SU_DUNG.txt").write_text(guide_content, encoding="utf-8")
@@ -322,6 +341,20 @@ exit
         print(f"  Self-check:\n{out_msg}")
         if chk_res.returncode != 0:
             print(f"Lỗi: Self-check trả về mã lỗi {chk_res.returncode}")
+            return 1
+
+        cat_res = subprocess.run(
+            [str(exe_path), "--concat-check"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        cat_msg = (cat_res.stdout or "").strip()
+        print(f"  Concat-check:\n{cat_msg}")
+        if cat_res.returncode != 0:
+            print(f"Lỗi: Concat-check trả về mã lỗi {cat_res.returncode}")
             return 1
     except Exception as exc:
         print(f"Lỗi khi chạy thử file exe: {exc}")

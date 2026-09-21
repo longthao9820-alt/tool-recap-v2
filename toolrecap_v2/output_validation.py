@@ -203,6 +203,15 @@ def validate_publication_folder(
     video_path = p_dir / expected_video_name
     probe = validate_mp4_file(video_path, require_audio=require_audio)
 
+    if expected_duration is not None and expected_duration > 0:
+        tol = max(0.75, 0.02 * expected_duration)
+        diff = abs(probe.duration - expected_duration)
+        if diff > tol:
+            raise OutputValidationError(
+                f"Thời lượng video xuất bản lệch quá mức: thực tế={probe.duration:.3f}s, "
+                f"kỳ vọng={expected_duration:.3f}s, chênh lệch={diff:.3f}s > dung sai={tol:.3f}s"
+            )
+
     # Validate original subtitles
     orig_srt_path = p_dir / expected_orig_srt_name
     orig_cues = validate_srt_file(

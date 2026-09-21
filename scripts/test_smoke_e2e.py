@@ -32,7 +32,7 @@ from toolrecap_v2.domain.models import (
 )
 from toolrecap_v2.domain.policy import EditorialPolicy
 from toolrecap_v2.gpu import bundled_binary
-from toolrecap_v2.media import probe_duration, probe_media
+from toolrecap_v2.media import concat_media_clips, probe_duration, probe_media, probe_typed_media
 from toolrecap_v2.output_validation import validate_publication_folder
 from toolrecap_v2.paths import default_data_directory
 from toolrecap_v2.projects import ProjectQueue, ProjectRecord, ProjectStore
@@ -59,7 +59,7 @@ def run_smoke_test() -> int:
 
     sample_video = test_dir / "episode_01.mp4"
     sample_srt = test_dir / "episode_01.srt"
-    print(f"[1/7] Tạo video kiểm thử và phụ đề sidecar SRT tại: {sample_video.name}...")
+    print(f"[1/8] Tạo video kiểm thử và phụ đề sidecar SRT tại: {sample_video.name}...")
     cmd = [
         str(ffmpeg),
         "-y",
@@ -97,13 +97,13 @@ He uncovers an unexpected secret that changes everything.
         return 1
 
     # 2. Test scanner (direct-only)
-    print("[2/7] Kiểm tra bộ quét video (scanner direct-only)...")
+    print("[2/8] Kiểm tra bộ quét video (scanner direct-only)...")
     scanned = scan_videos(test_dir)
     assert sample_video.resolve() in scanned, "Scanner không tìm thấy video mẫu!"
     print(f"  + Tìm thấy {len(scanned)} video hợp lệ (direct-only non-recursive).")
 
     # 3. Test single episode batch sequential execution
-    print("[3/7] Chạy chu trình sản xuất recap tập đơn lẻ (Single Episode)...")
+    print("[3/8] Chạy chu trình sản xuất recap tập đơn lẻ (Single Episode)...")
     out_dir = test_dir / "output_single"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -139,7 +139,7 @@ He uncovers an unexpected secret that changes everything.
     print(f"  + Phụ đề SRT hoàn thành: {Path(record.output_srt).name}")
 
     # 4. Test season multi-source smoke execution
-    print("[4/7] Chạy chu trình sản xuất recap cả mùa (Season Multi-Source)...")
+    print("[4/8] Chạy chu trình sản xuất recap cả mùa (Season Multi-Source)...")
     season_dir = test_dir / "season_source"
     season_dir.mkdir(parents=True, exist_ok=True)
     ep1_path = season_dir / "ep01.mp4"
@@ -200,7 +200,7 @@ He uncovers an unexpected secret that changes everything.
         print(f"  + Xuất bản Season Output hợp lệ (Outputs exact three): {out.sanitized_title}")
 
     # 5. Editorial stage mock (Policy derivation, candidate discovery & consolidation)
-    print("[5/7] Kiểm tra mô phỏng giai đoạn biên tập (Editorial policy, candidates & consolidation)...")
+    print("[5/8] Kiểm tra mô phỏng giai đoạn biên tập (Editorial policy, candidates & consolidation)...")
     prompt = "Focus on major confrontation and relationships between characters. Prioritize season arc candidates."
     policy = EditorialPolicy.from_prompt(prompt)
     assert policy.policy_hash, "EditorialPolicy không tạo được policy_hash!"
@@ -253,7 +253,7 @@ He uncovers an unexpected secret that changes everything.
     print(f"  + EditorialPolicy và Hợp nhất ứng viên thành công: {len(consolidated.candidates)} ứng viên.")
 
     # 6. Valid zero-output verification & reason distinctions
-    print("[6/7] Kiểm tra xác minh kết quả 0 output hợp lệ (Valid zero verification & reason distinctions)...")
+    print("[6/8] Kiểm tra xác minh kết quả 0 output hợp lệ (Valid zero verification & reason distinctions)...")
     health_healthy = PipelineHealth(
         discovery_completed=True,
         consolidation_completed=True,
@@ -289,7 +289,7 @@ He uncovers an unexpected secret that changes everything.
     print(f"  + Xác minh Genuine Zero và phân định lý do lỗi thành công.")
 
     # 7. Test UI instantiation and key controls (Main window + 4 Settings Panes)
-    print("[7/7] Kiểm tra khởi tạo giao diện người dùng (GUI & 4 Settings Panes)...")
+    print("[7/8] Kiểm tra khởi tạo giao diện người dùng (GUI & 4 Settings Panes)...")
     try:
         app = ToolRecapV2App()
         app.update()
@@ -316,6 +316,62 @@ He uncovers an unexpected secret that changes everything.
         print(f"  + Giao diện và 4 tab Cài đặt khởi tạo thành công không lỗi.")
     except Exception as exc:
         print(f"Lỗi khởi tạo giao diện: {exc}")
+        return 1
+
+    # 8. Robust multi-source technical scenario (mismatched clips, normalized output)
+    print("[8/8] Kiểm tra bộ kết xuất ghép nối đa nguồn mạnh mẽ (Robust multi-source technical concat scenario)...")
+    try:
+        robust_dir = test_dir / "robust_concat_smoke"
+        robust_dir.mkdir(parents=True, exist_ok=True)
+
+        # Prefer bundled binary in release/ if available, otherwise bundled_binary("ffmpeg")
+        packaged_ffmpeg = repo_root / "release" / "ToolRecapV2" / "runtime" / "ffmpeg" / "bin" / "ffmpeg.exe"
+        eff_ffmpeg = str(packaged_ffmpeg) if packaged_ffmpeg.is_file() else str(ffmpeg)
+
+        # Synthetic clip 1: 320x240, 25fps, stereo 44.1kHz audio, duration 1.0s
+        clip1_path = robust_dir / "synth_clip1.mp4"
+        cmd_c1 = [
+            eff_ffmpeg, "-y",
+            "-f", "lavfi", "-i", "color=c=navy:s=320x240:d=1.0:r=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1.0",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-c:a", "aac",
+            "-shortest", str(clip1_path),
+        ]
+        res_c1 = subprocess.run(cmd_c1, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        assert res_c1.returncode == 0 and clip1_path.is_file(), f"Lỗi tạo clip mẫu 1: {res_c1.stderr.decode()}"
+
+        # Synthetic clip 2: 640x360 (mismatched res), 30fps (mismatched fps), NO audio, duration 1.0s
+        clip2_path = robust_dir / "synth_clip2.mp4"
+        cmd_c2 = [
+            eff_ffmpeg, "-y",
+            "-f", "lavfi", "-i", "color=c=darkred:s=640x360:d=1.0:r=30",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-an", str(clip2_path),
+        ]
+        res_c2 = subprocess.run(cmd_c2, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        assert res_c2.returncode == 0 and clip2_path.is_file(), f"Lỗi tạo clip mẫu 2: {res_c2.stderr.decode()}"
+
+        # Concat with normalization and silent audio injection
+        concat_out = robust_dir / "normalized_output.mp4"
+        probe_res = concat_media_clips(
+            [clip1_path, clip2_path],
+            output=concat_out,
+            require_audio=True,
+            expected_durations=[1.0, 1.0],
+        )
+
+        assert concat_out.is_file(), "Tệp sau ghép nối đa nguồn không tồn tại!"
+        assert abs(probe_res.duration - 2.0) < 0.4, f"Thời lượng {probe_res.duration}s không khớp dự kiến ~2.0s!"
+        assert probe_res.has_audio and probe_res.audio_streams, "Tệp ghép nối thiếu luồng âm thanh!"
+        audio_stream = probe_res.audio_streams[0]
+        assert audio_stream.sample_rate == 48000, f"Sample rate {audio_stream.sample_rate} != 48000!"
+        assert audio_stream.channels == 2, f"Channels {audio_stream.channels} != 2 (stereo)!"
+        print(f"  + Ghép nối đa nguồn thành công: {concat_out.name} ({probe_res.duration:.2f}s)")
+        print(f"  + Âm thanh đã chuẩn hóa: {audio_stream.sample_rate}Hz, {audio_stream.channels} kênh (stereo fltp)")
+        print(f"  + Video đã chuẩn hóa: {probe_res.width}x{probe_res.height}")
+    except Exception as exc:
+        print(f"Lỗi kịch bản ghép nối đa nguồn: {exc}")
         return 1
 
     print("\n>>> TẤT CẢ CÁC BƯỚC SMOKE TEST ĐỀU ĐẠT THÀNH CÔNG (PASS)!")

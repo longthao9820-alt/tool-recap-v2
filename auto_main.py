@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import traceback
@@ -170,11 +171,35 @@ def _run_self_check() -> int:
         except Exception as exc:
             accel_summary = f"Lỗi phát hiện: {exc}"
 
+    # 9. Check FFmpeg filters and encoders for robust rendering
+    filters_ok = True
+    encoders_ok = True
+    if ffmpeg_ok and ffmpeg:
+        try:
+            f_res = subprocess.run([str(ffmpeg), "-filters"], capture_output=True, text=True, timeout=10)
+            f_text = (f_res.stdout or "").lower()
+            required_filters = ["scale", "pad", "fps", "aresample", "aformat", "anullsrc", "concat"]
+            missing_filters = [f for f in required_filters if f not in f_text]
+            if missing_filters:
+                filters_ok = False
+                errors.append(f"FFmpeg thiếu các bộ lọc bắt buộc cho robust renderer: {', '.join(missing_filters)}")
+
+            e_res = subprocess.run([str(ffmpeg), "-encoders"], capture_output=True, text=True, timeout=10)
+            e_text = (e_res.stdout or "").lower()
+            required_encoders = ["libx264", "aac"]
+            missing_encoders = [e for e in required_encoders if e not in e_text]
+            if missing_encoders:
+                encoders_ok = False
+                errors.append(f"FFmpeg thiếu các bộ mã hóa bắt buộc: {', '.join(missing_encoders)}")
+        except Exception as exc:
+            errors.append(f"Lỗi kiểm tra bộ lọc/mã hóa FFmpeg: {exc}")
+
     if not errors:
         print(f"ToolRecap V2 v{__version__} self-check PASSED (ffmpeg={ffmpeg_ok}, voice={voice_ok}, icon={icon_ok}, gui={gui_ok})")
         print(f"  - OCR runtime package: {ocr_pkg_name} {ocr_pkg_ver} (available={ocr_pkg_ok})")
         print(f"  - Models downloaded: OCR={'yes' if ocr_models_downloaded else 'no'}, Voice={'yes' if voice_models_downloaded else 'no'}, STT={'yes' if stt_models_downloaded else 'no'} (lazy assets, 'no' is valid)")
         print(f"  - Voice backend runtime: {voice_backend_mode} ({voice_backend_path or 'install-on-first-use'})")
+        print(f"  - Robust renderer filters: {'OK' if filters_ok else 'FAIL'}, encoders: {'OK' if encoders_ok else 'FAIL'}")
         if hybrid_report:
             print(hybrid_report)
         return 0
@@ -185,6 +210,67 @@ def _run_self_check() -> int:
         return 1
 
 
+def _run_concat_check() -> int:
+    """Run a fast synthetic multi-source concat self-check using bundled binary."""
+    from toolrecap_v2.gpu import bundled_binary
+    from toolrecap_v2.media import concat_media_clips
+
+    ffmpeg = bundled_binary("ffmpeg")
+    if not ffmpeg:
+        print("Lỗi: Không tìm thấy FFmpeg để kiểm tra concat!")
+        return 1
+
+    temp_dir = default_data_directory() / "concat_selfcheck"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Clip 1: 320x240, 25fps, 44100Hz audio, 1.0s
+        c1 = temp_dir / "clip1.mp4"
+        cmd1 = [
+            str(ffmpeg), "-y",
+            "-f", "lavfi", "-i", "color=c=blue:s=320x240:d=1.0:r=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1.0",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-c:a", "aac",
+            "-shortest", str(c1),
+        ]
+        subprocess.run(cmd1, capture_output=True, check=True, timeout=15)
+
+        # Clip 2: 640x360, 30fps, NO audio, 1.0s
+        c2 = temp_dir / "clip2.mp4"
+        cmd2 = [
+            str(ffmpeg), "-y",
+            "-f", "lavfi", "-i", "color=c=red:s=640x360:d=1.0:r=30",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-an", str(c2),
+        ]
+        subprocess.run(cmd2, capture_output=True, check=True, timeout=15)
+
+        # Run concat_media_clips
+        out_concat = temp_dir / "normalized_concat.mp4"
+        probe_res = concat_media_clips([c1, c2], output=out_concat, require_audio=True)
+
+        assert out_concat.is_file(), "Tệp sau ghép nối không tồn tại!"
+        assert abs(probe_res.duration - 2.0) < 0.4, f"Thời lượng {probe_res.duration}s không khớp dự kiến 2.0s!"
+        assert probe_res.has_audio and probe_res.audio_streams, "Tệp ghép nối thiếu luồng âm thanh!"
+        audio_stream = probe_res.audio_streams[0]
+        assert audio_stream.sample_rate == 48000, f"Sample rate {audio_stream.sample_rate} != 48000!"
+        assert audio_stream.channels == 2, f"Channels {audio_stream.channels} != 2 (stereo)!"
+
+        print(f"ToolRecap V2 v{__version__} concat self-check PASSED:")
+        print(f"  - Output: {out_concat.name} ({probe_res.duration:.2f}s)")
+        print(f"  - Audio: {audio_stream.sample_rate}Hz, {audio_stream.channels}ch (normalized stereo)")
+        print(f"  - Video: {probe_res.width}x{probe_res.height}")
+        return 0
+    except Exception as exc:
+        print(f"ToolRecap V2 v{__version__} concat self-check FAILED: {exc}")
+        return 1
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     if "--version" in sys.argv:
         print(f"ToolRecap V2 v{__version__}")
@@ -192,6 +278,9 @@ if __name__ == "__main__":
 
     if "--self-check" in sys.argv:
         sys.exit(_run_self_check())
+
+    if "--concat-check" in sys.argv:
+        sys.exit(_run_concat_check())
 
     try:
         run_app()

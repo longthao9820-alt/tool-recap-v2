@@ -78,9 +78,41 @@ class VideoStreamInfo:
     title: str = ""
     default: bool = False
     forced: bool = False
+    fps_rational: str = ""
+    pix_fmt: str = ""
+    profile: str = ""
+    time_base: str = ""
+    sar: str = ""
+    start_time: float = 0.0
+
+    @property
+    def SAR(self) -> str:
+        return self.sar
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> VideoStreamInfo:
+        return cls(
+            index=int(data.get("index", 0)),
+            video_index=int(data.get("video_index", 0)),
+            codec=str(data.get("codec", "")),
+            width=int(data.get("width", 0)),
+            height=int(data.get("height", 0)),
+            fps=float(data.get("fps", 0.0)),
+            duration=float(data.get("duration", 0.0)),
+            bitrate=int(data.get("bitrate", 0)),
+            title=str(data.get("title", "")),
+            default=bool(data.get("default", False)),
+            forced=bool(data.get("forced", False)),
+            fps_rational=str(data.get("fps_rational", "")),
+            pix_fmt=str(data.get("pix_fmt", "")),
+            profile=str(data.get("profile", "")),
+            time_base=str(data.get("time_base", "")),
+            sar=str(data.get("sar") or data.get("SAR") or ""),
+            start_time=float(data.get("start_time", 0.0)),
+        )
 
 
 @dataclass
@@ -90,16 +122,43 @@ class AudioStreamInfo:
     codec: str
     language: str
     title: str = ""
-    channels: int = 2
-    channel_layout: str = "stereo"
+    channels: int = 0
+    channel_layout: str = ""
     bitrate: int = 0
     default: bool = False
     forced: bool = False
     is_commentary: bool = False
     is_descriptive: bool = False
+    sample_rate: int = 0
+    sample_fmt: str = ""
+    profile: str = ""
+    time_base: str = ""
+    start_time: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AudioStreamInfo:
+        return cls(
+            index=int(data.get("index", 0)),
+            audio_index=int(data.get("audio_index", 0)),
+            codec=str(data.get("codec", "")),
+            language=str(data.get("language", "")),
+            title=str(data.get("title", "")),
+            channels=int(data.get("channels", 0)),
+            channel_layout=str(data.get("channel_layout", "")),
+            bitrate=int(data.get("bitrate", 0)),
+            default=bool(data.get("default", False)),
+            forced=bool(data.get("forced", False)),
+            is_commentary=bool(data.get("is_commentary", False)),
+            is_descriptive=bool(data.get("is_descriptive", False)),
+            sample_rate=int(data.get("sample_rate", 0)),
+            sample_fmt=str(data.get("sample_fmt", "")),
+            profile=str(data.get("profile", "")),
+            time_base=str(data.get("time_base", "")),
+            start_time=float(data.get("start_time", 0.0)),
+        )
 
 
 @dataclass
@@ -147,11 +206,13 @@ class MediaProbeResult:
     audio_streams: list[AudioStreamInfo] = field(default_factory=list)
     subtitle_streams: list[SubtitleStreamInfo] = field(default_factory=list)
     selected_audio: AudioSelectionResult | None = None
+    start_time: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
             "duration": self.duration,
+            "start_time": self.start_time,
             "width": self.width,
             "height": self.height,
             "has_video": self.has_video,
@@ -163,6 +224,164 @@ class MediaProbeResult:
             "subtitle_streams": [s.to_dict() for s in self.subtitle_streams],
             "selected_audio": self.selected_audio.to_dict() if self.selected_audio else None,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MediaProbeResult:
+        sel_audio_raw = data.get("selected_audio")
+        sel_audio = None
+        if isinstance(sel_audio_raw, dict):
+            sel_stream_raw = sel_audio_raw.get("selected_stream")
+            sel_stream = AudioStreamInfo.from_dict(sel_stream_raw) if sel_stream_raw else None
+            sel_audio = AudioSelectionResult(
+                selected_stream=sel_stream,
+                has_warning=bool(sel_audio_raw.get("has_warning", False)),
+                warning=sel_audio_raw.get("warning"),
+                reason=str(sel_audio_raw.get("reason", "")),
+            )
+        elif isinstance(sel_audio_raw, AudioSelectionResult):
+            sel_audio = sel_audio_raw
+
+        return cls(
+            path=str(data.get("path", "")),
+            duration=float(data.get("duration", 0.0)),
+            width=int(data.get("width", 0)),
+            height=int(data.get("height", 0)),
+            has_video=bool(data.get("has_video", False)),
+            has_audio=bool(data.get("has_audio", False)),
+            video_codec=data.get("video_codec"),
+            audio_codec=data.get("audio_codec"),
+            video_streams=[
+                VideoStreamInfo.from_dict(v) if isinstance(v, dict) else v
+                for v in data.get("video_streams", [])
+            ],
+            audio_streams=[
+                AudioStreamInfo.from_dict(a) if isinstance(a, dict) else a
+                for a in data.get("audio_streams", [])
+            ],
+            subtitle_streams=[
+                SubtitleStreamInfo(**s) if isinstance(s, dict) else s
+                for s in data.get("subtitle_streams", [])
+            ],
+            selected_audio=sel_audio,
+            start_time=float(data.get("start_time", 0.0)),
+        )
+
+
+@dataclass
+class StreamSignature:
+    """Canonical signature of primary video and selected audio for compatibility checking."""
+    video_codec: str = ""
+    video_profile: str = ""
+    width: int = 0
+    height: int = 0
+    pix_fmt: str = ""
+    fps_rational: str = ""
+    fps: float = 0.0
+    video_time_base: str = ""
+    sar: str = ""
+    has_audio: bool = False
+    audio_codec: str = ""
+    audio_profile: str = ""
+    sample_rate: int = 0
+    sample_fmt: str = ""
+    channels: int = 0
+    channel_layout: str = ""
+    audio_time_base: str = ""
+
+    @property
+    def SAR(self) -> str:
+        return self.sar
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StreamSignature:
+        return cls(
+            video_codec=str(data.get("video_codec", "")),
+            video_profile=str(data.get("video_profile", "")),
+            width=int(data.get("width", 0)),
+            height=int(data.get("height", 0)),
+            pix_fmt=str(data.get("pix_fmt", "")),
+            fps_rational=str(data.get("fps_rational", "")),
+            fps=float(data.get("fps", 0.0)),
+            video_time_base=str(data.get("video_time_base", "")),
+            sar=str(data.get("sar") or data.get("SAR") or ""),
+            has_audio=bool(data.get("has_audio", False)),
+            audio_codec=str(data.get("audio_codec", "")),
+            audio_profile=str(data.get("audio_profile", "")),
+            sample_rate=int(data.get("sample_rate", 0)),
+            sample_fmt=str(data.get("sample_fmt", "")),
+            channels=int(data.get("channels", 0)),
+            channel_layout=str(data.get("channel_layout", "")),
+            audio_time_base=str(data.get("audio_time_base", "")),
+        )
+
+
+@dataclass
+class FastConcatDecision:
+    """Outcome of fast-concat compatibility check across multiple source clips."""
+    compatible: bool
+    reason: str
+    differences: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FastConcatDecision:
+        return cls(
+            compatible=bool(data.get("compatible", False)),
+            reason=str(data.get("reason", "")),
+            differences=list(data.get("differences", [])),
+        )
+
+
+@dataclass
+class NormalizationProfile:
+    """Standardized canvas, frame rate, and audio parameters for normalized encoding."""
+    width: int = 1920
+    height: int = 1080
+    fps: float = 24.0
+    fps_rational: str = "24/1"
+    video_codec: str = "h264"
+    pix_fmt: str = "yuv420p"
+    video_profile: str = "high"
+    video_time_base: str = "1/1000"
+    sar: str = "1:1"
+    audio_codec: str = "aac"
+    sample_rate: int = 48000
+    sample_fmt: str = "fltp"
+    channels: int = 2
+    channel_layout: str = "stereo"
+    audio_bitrate: str = "192k"
+    requires_audio: bool = True
+    synthesize_audio: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> NormalizationProfile:
+        return cls(
+            width=int(data.get("width", 1920)),
+            height=int(data.get("height", 1080)),
+            fps=float(data.get("fps", 24.0)),
+            fps_rational=str(data.get("fps_rational", "24/1")),
+            video_codec=str(data.get("video_codec", "h264")),
+            pix_fmt=str(data.get("pix_fmt", "yuv420p")),
+            video_profile=str(data.get("video_profile", "high")),
+            video_time_base=str(data.get("video_time_base", "1/1000")),
+            sar=str(data.get("sar") or data.get("SAR") or "1:1"),
+            audio_codec=str(data.get("audio_codec", "aac")),
+            sample_rate=int(data.get("sample_rate", 48000)),
+            sample_fmt=str(data.get("sample_fmt", "fltp")),
+            channels=int(data.get("channels", 2)),
+            channel_layout=str(data.get("channel_layout", "stereo")),
+            audio_bitrate=str(data.get("audio_bitrate", "192k")),
+            requires_audio=bool(data.get("requires_audio", True)),
+            synthesize_audio=bool(data.get("synthesize_audio", True)),
+        )
 
 
 @dataclass

@@ -25,7 +25,7 @@ from toolrecap_v2.domain.models import (
     SourceEpisode,
     ValidationError,
 )
-from toolrecap_v2.media import MediaProbeResult
+from toolrecap_v2.media import MediaProbeResult, RenderStageError
 from toolrecap_v2.projects import ProjectQueue, ProjectRecord, ProjectStore
 from toolrecap_v2.renderer import PublicationRenderer, RenderCancelled
 from toolrecap_v2.settings import AppSettings, SettingsStore
@@ -221,7 +221,7 @@ def test_zero_narration_rejection_and_overlong_narration_explicit(tmp_path: Path
     renderer = PublicationRenderer(voice_manager=FakeVoiceManager(duration=1.0))
     settings = AppSettings(burn_subtitles=False, use_gpu=False)
 
-    with pytest.raises(ValidationError, match="không có commentary narration"):
+    with pytest.raises((ValidationError, RenderStageError), match="không có commentary narration"):
         renderer.render_manifest(
             manifest=manifest_zero,
             settings=settings,
@@ -252,7 +252,7 @@ def test_zero_narration_rejection_and_overlong_narration_explicit(tmp_path: Path
     overlong_voice = FakeVoiceManager(duration=2.5)  # Generates 2.5s tone
     renderer_overlong = PublicationRenderer(voice_manager=overlong_voice)
 
-    with pytest.raises(ValidationError, match="nhưng footage chỉ có 1.50s"):
+    with pytest.raises((ValidationError, RenderStageError), match="nhưng footage chỉ có 1.50s"):
         renderer_overlong.render_manifest(
             manifest=manifest_overlong,
             settings=settings,

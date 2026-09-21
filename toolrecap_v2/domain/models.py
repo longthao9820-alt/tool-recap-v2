@@ -195,6 +195,7 @@ class CommentaryOutput:
     file_name: str = ""
     output_type: str = ""
     language: str = ""
+    render_signature: str = ""
 
     @property
     def video_path(self) -> str | None:
@@ -234,6 +235,8 @@ class CommentaryOutput:
             "error": self.error,
             "progress": self.progress,
         }
+        if self.render_signature:
+            d["render_signature"] = self.render_signature
         cid = getattr(self, "source_candidate_id", "") or getattr(self, "candidate_id", "")
         if cid:
             d["source_candidate_id"] = cid
@@ -277,6 +280,7 @@ class CommentaryOutput:
             file_name=str(data.get("file_name", "")),
             output_type=str(data.get("output_type", "")),
             language=str(data.get("language", "")),
+            render_signature=str(data.get("render_signature", "")),
         )
 
     @classmethod
