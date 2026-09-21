@@ -21,6 +21,7 @@ HARD_PAYLOAD_CEILING: int = 500_000
 TARGET_PAYLOAD_CEILING: int = 480_000
 DEFAULT_ANALYSIS_PAYLOAD_CEILING: int = 500_000
 DEFAULT_VISION_PAYLOAD_CEILING: int = 5_000_000
+UNBOUNDED_PAYLOAD: int = 0
 
 
 def resolve_payload_ceiling(phase: Any = None, max_payload_bytes: int | None = None) -> int:
@@ -29,6 +30,11 @@ def resolve_payload_ceiling(phase: Any = None, max_payload_bytes: int | None = N
         return int(max_payload_bytes)
     if phase is not None:
         p = str(phase.value if hasattr(phase, "value") else phase).lower().strip()
+        if p in ("finalizer", "season_mining", "json_repair"):
+            # Finalizer context capacity belongs to the configured Gateway/model.
+            # ToolRecap measures and logs it but must not impose the Scanner's
+            # 500 KB per-chunk transport ceiling on a whole-project request.
+            return UNBOUNDED_PAYLOAD
         if any(k in p for k in ("vision", "ocr", "subtitles", "subtitle")):
             return DEFAULT_VISION_PAYLOAD_CEILING
     return DEFAULT_ANALYSIS_PAYLOAD_CEILING
@@ -463,7 +469,7 @@ class OpenAICompatibleClient:
 
                 encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 payload_bytes = len(encoded)
-                if payload_bytes > payload_ceiling:
+                if payload_ceiling > 0 and payload_bytes > payload_ceiling:
                     raise APIError(
                         _sanitize_error(
                             f"Kích thước yêu cầu ({payload_bytes} bytes) vượt quá giới hạn tối đa cho phép "

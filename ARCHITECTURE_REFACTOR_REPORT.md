@@ -1,8 +1,8 @@
-# ToolRecap V2 v0.5.0 — Architecture Refactor Engineering Report
+# ToolRecap V2 v0.5.1 — Architecture Refactor Engineering Report
 
 ## 1. Version and implementation commit
 
-- Version: `0.5.0`
+- Version: `0.5.1`
 - Implementation commit: `3dd3f1991846715f45318d85683c930b71271b65`
 - Branch: `main`
 
@@ -197,8 +197,8 @@ directory.
 
 ## 18. Tests executed and exact results
 
-- Full suite: **472 collected; 452 passed; 20 skipped; 0 failed; 0 errors**.
-- Canonical architecture suite: **12 passed; 0 skipped; 0 failed**.
+- Full suite: **474 collected; 454 passed; 20 skipped; 0 failed; 0 errors**.
+- Canonical architecture suite: **14 passed; 0 skipped; 0 failed**.
 - Canonical + updater focused run: **20 passed; 0 failed**.
 - `python -m compileall -q toolrecap_v2`: passed.
 - `git diff --check`: passed (only Git CRLF conversion notices on Windows).
@@ -212,14 +212,14 @@ unit coverage; the new canonical suite replaces their invalid production-topolog
 
 - Command: `python build_exe.py`
 - Result: passed.
-- Executable version check: `ToolRecap V2 v0.5.0`.
+- Executable version check: `ToolRecap V2 v0.5.1`.
 - Executable self-check: passed (`ffmpeg=True, voice=True, icon=True, gui=True`).
 - Bundled encoder detection: NVENC, AMF, and QSV available in bundled FFmpeg; local detected plan used
   NVIDIA NVENC on an RTX 3060.
-- Portable ZIP: `release/ToolRecapV2-v0.5.0-windows-portable.zip`
-- Size: `245,945,830` bytes.
-- SHA256: `bad9f9bdb08f621dd7def8696228a7996bc0170fbd08ae8f7f746a276d90c345`
-- Checksum file: `release/ToolRecapV2-v0.5.0-windows-portable.zip.sha256.txt`
+- Portable ZIP: `release/ToolRecapV2-v0.5.1-windows-portable.zip`
+- Size: `245,952,702` bytes.
+- SHA256: `07327eabd5026bea189ae5b3506b275a98e2f69521a2b9545edbdbdb1fd7afad`
+- Checksum file: `release/ToolRecapV2-v0.5.1-windows-portable.zip.sha256.txt`
 
 ## 20. Update test result
 
@@ -242,3 +242,24 @@ script safety. The freshly built ZIP/checksum pair is internally consistent.
 - Legacy editorial modules remain in the repository for compatibility/migration but are bypassed by the
   enabled-Gateway production path. They can be removed in a later cleanup after old cached projects no
   longer require them.
+
+## 22. v0.5.1 whole-project payload hotfix
+
+v0.5.0 incorrectly reused the Scanner's 500,000-byte chunk ceiling for the complete
+Finalizer project request. This was an application-side limit, not a Gateway limit,
+and caused valid season projects to fail before any Finalizer request was sent.
+
+v0.5.1 keeps the Scanner per-chunk ceiling but makes Finalizer payload capacity
+Gateway-managed. ToolRecap still measures and logs exact request bytes. Scanner
+observations use a lossless columnar transport with presence masks, derived timestamp
+aliases, duplicate references, and a string table. Coverage audit metadata and source
+identity duplicates are not sent as editorial context; every value in
+`EpisodeEvidence.data` round-trips exactly.
+
+The real nine-episode failing project was measured as follows:
+
+- v0.5.0 request: `2,710,254` bytes and rejected locally.
+- v0.5.1 request: `460,529` bytes.
+- Observation pack/unpack equality: `True` for all nine episodes.
+- A synthetic Finalizer request larger than 500,000 bytes is accepted by ToolRecap
+  and passed to the configured Gateway.

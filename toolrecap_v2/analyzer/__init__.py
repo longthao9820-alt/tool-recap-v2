@@ -47,6 +47,8 @@ from .final_json import (
     CanonicalProjectFinalizer,
     FinalJsonIssue,
     FinalJsonValidationError,
+    pack_scanner_observations,
+    unpack_scanner_observations,
     validate_final_json,
 )
 from .phases import AnalysisPhase, PhaseCallback
@@ -111,7 +113,9 @@ __all__ = [
     "partition_season_batches",
     "plan_second_pass_requests",
     "run_analysis",
+    "pack_scanner_observations",
     "subtract_intervals",
     "verify_zero_or_low_output",
+    "unpack_scanner_observations",
     "validate_final_json",
 ]

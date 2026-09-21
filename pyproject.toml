@@ -1,6 +1,6 @@
 [project]
 name = "toolrecap-v2"
-version = "0.5.0"
+version = "0.5.1"
 description = "Automated English Recap Video Desktop Application"
 requires-python = ">=3.11"
 dependencies = [

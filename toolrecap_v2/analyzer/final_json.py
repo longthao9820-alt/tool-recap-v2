@@ -7,13 +7,14 @@ and asks the same Finalizer to repair technical contract violations.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import threading
 from typing import Any, Callable
 
-from ..api_client import OpenAICompatibleClient
+from ..api_client import OpenAICompatibleClient, estimate_request_size
 from ..domain.enums import AudioPolicy, CandidateScope, OutputStatus
 from ..domain.models import (
     AnalysisManifest,
@@ -30,6 +31,7 @@ from .phases import AnalysisPhase, PhaseCallback
 
 
 FINAL_JSON_SCHEMA_VERSION = "1.0"
+SCANNER_TRANSPORT_FORMAT = "columnar-json-v1"
 SUPPORTED_AUDIO_POLICIES = {policy.value for policy in AudioPolicy}
 
 
@@ -86,6 +88,251 @@ def _source_contract(episodes: list[SourceEpisode]) -> list[dict[str, Any]]:
     ]
 
 
+def pack_scanner_observations(
+    evidence_map: dict[str, EpisodeEvidence],
+) -> dict[str, Any]:
+    """Losslessly remove transport-only JSON repetition from Scanner observations.
+
+    Coverage ledgers and evidence source metadata are deliberately excluded because
+    they are technical audit/cache data already represented by the project source
+    contract, not content observations for the Finalizer. Every value inside
+    ``EpisodeEvidence.data`` is retained. Repeated object keys are represented once
+    per category; a hexadecimal presence mask preserves missing-vs-null fields.
+    """
+    def iter_strings(value: Any):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, list):
+            for child in value:
+                yield from iter_strings(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from iter_strings(child)
+
+    frequencies: Counter[str] = Counter()
+    for evidence in evidence_map.values():
+        for value in evidence.data.values():
+            frequencies.update(iter_strings(value))
+
+    def base36(number: int) -> str:
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+        if number == 0:
+            return "0"
+        digits = ""
+        while number:
+            number, remainder = divmod(number, 36)
+            digits = alphabet[remainder] + digits
+        return digits
+
+    candidates: list[tuple[int, str]] = []
+    for value, count in frequencies.items():
+        encoded_len = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        if count >= 2 and encoded_len >= 8:
+            projected_saving = (encoded_len - 4) * count - encoded_len
+            if projected_saving > 0:
+                candidates.append((projected_saving, value))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    strings = [value for _saving, value in candidates]
+    string_lookup = {value: index for index, value in enumerate(strings)}
+
+    def encode_value(value: Any) -> Any:
+        if isinstance(value, str):
+            if value in string_lookup:
+                return "~" + base36(string_lookup[value])
+            if value.startswith(("~", "^")):
+                return value[0] + value
+            return value
+        if isinstance(value, list):
+            return [encode_value(child) for child in value]
+        if isinstance(value, dict):
+            return {str(key): encode_value(child) for key, child in value.items()}
+        return value
+
+    schemas: dict[str, list[str]] = {}
+    for _episode_id, evidence in sorted(evidence_map.items()):
+        for category, raw_items in evidence.data.items():
+            if not isinstance(raw_items, list):
+                continue
+            columns = schemas.setdefault(str(category), [])
+            seen = set(columns)
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                for key in item:
+                    key_str = str(key)
+                    if key_str not in seen:
+                        columns.append(key_str)
+                        seen.add(key_str)
+
+    episodes: dict[str, dict[str, Any]] = {}
+    for episode_id, evidence in sorted(evidence_map.items()):
+        packed_episode: dict[str, Any] = {}
+        scalars: dict[str, Any] = {}
+        empty_categories: list[str] = []
+        for category, raw_items in evidence.data.items():
+            category_str = str(category)
+            if not isinstance(raw_items, list):
+                scalars[category_str] = encode_value(raw_items)
+                continue
+            columns = schemas.get(category_str, [])
+            rows: list[Any] = []
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    # Preserve non-object list members explicitly.
+                    rows.append(["!", encode_value(item)])
+                    continue
+                present_indices = [index for index, key in enumerate(columns) if key in item]
+                mask = 0
+                derived_mask = 0
+                values: list[Any] = []
+                prior_values: dict[str, int] = {}
+                for index in present_indices:
+                    mask |= 1 << index
+                    key = columns[index]
+                    value = item[key]
+                    is_derived = key == "episode_id" and value == str(episode_id)
+                    if key in {"start_sec", "end_sec"}:
+                        ms_key = "start_ms" if key == "start_sec" else "end_ms"
+                        try:
+                            is_derived = ms_key in item and float(value) == float(item[ms_key]) / 1000.0
+                        except (TypeError, ValueError):
+                            is_derived = False
+                    if is_derived:
+                        derived_mask |= 1 << index
+                        continue
+                    fingerprint = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    if fingerprint in prior_values and len(fingerprint.encode("utf-8")) > 4:
+                        values.append("^" + base36(prior_values[fingerprint]))
+                    else:
+                        values.append(encode_value(value))
+                        prior_values[fingerprint] = index
+                row_mask = format(mask, "x")
+                if derived_mask:
+                    row_mask += "/" + format(derived_mask, "x")
+                rows.append([row_mask, *values])
+            if rows:
+                packed_episode[category_str] = rows
+            else:
+                empty_categories.append(category_str)
+        if scalars:
+            packed_episode["$scalars"] = scalars
+        if empty_categories:
+            packed_episode["$empty"] = empty_categories
+        episodes[str(episode_id)] = packed_episode
+
+    return {
+        "format": SCANNER_TRANSPORT_FORMAT,
+        "decoder": (
+            "For each category, schemas[category] lists object keys. Each row starts with a hexadecimal "
+            "presence bitmask optionally followed by / and a derived-value bitmask; consume remaining values "
+            "for set non-derived bits from least to most significant. Derived episode_id equals its episode key; "
+            "derived start_sec/end_sec equal start_ms/end_ms divided by 1000. "
+            "A row beginning with ! contains a literal non-object item. Values matching ~ plus a base36 "
+            "index reference strings[index]; ^ plus a base36 column index repeats that earlier value. "
+            "Literal strings beginning with ~ or ^ are escaped by doubling the prefix."
+        ),
+        "strings": strings,
+        "schemas": schemas,
+        "episodes": episodes,
+    }
+
+
+def unpack_scanner_observations(packed: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Decode ``pack_scanner_observations`` for verification and diagnostics."""
+    if packed.get("format") != SCANNER_TRANSPORT_FORMAT:
+        raise ValueError("Unsupported Scanner observation transport format.")
+    schemas = packed.get("schemas", {})
+    strings = packed.get("strings", [])
+    packed_episodes = packed.get("episodes", {})
+    if not isinstance(schemas, dict) or not isinstance(strings, list) or not isinstance(packed_episodes, dict):
+        raise ValueError("Malformed Scanner observation transport payload.")
+
+    def decode_value(value: Any) -> Any:
+        if isinstance(value, str) and value.startswith("~~"):
+            return value[1:]
+        if isinstance(value, str) and value.startswith("^^"):
+            return value[1:]
+        if isinstance(value, str) and value.startswith("~") and len(value) > 1:
+            try:
+                index = int(value[1:], 36)
+            except ValueError:
+                return value
+            if index < 0 or index >= len(strings):
+                raise ValueError("Scanner string-table reference is out of range.")
+            return strings[index]
+        if isinstance(value, list):
+            return [decode_value(child) for child in value]
+        if isinstance(value, dict):
+            return {str(key): decode_value(child) for key, child in value.items()}
+        return value
+
+    decoded: dict[str, dict[str, Any]] = {}
+    for episode_id, packed_episode in packed_episodes.items():
+        if not isinstance(packed_episode, dict):
+            raise ValueError("Malformed packed episode observations.")
+        data: dict[str, Any] = {}
+        for category, rows in packed_episode.items():
+            if category == "$scalars":
+                if isinstance(rows, dict):
+                    data.update({str(key): decode_value(value) for key, value in rows.items()})
+                continue
+            if category == "$empty":
+                if not isinstance(rows, list):
+                    raise ValueError("Malformed empty-category list.")
+                for empty_category in rows:
+                    data[str(empty_category)] = []
+                continue
+            columns = schemas.get(category, [])
+            if not isinstance(columns, list) or not isinstance(rows, list):
+                raise ValueError("Malformed category schema or rows.")
+            items: list[Any] = []
+            for row in rows:
+                if not isinstance(row, list) or not row:
+                    raise ValueError("Malformed observation row.")
+                if row[0] == "!":
+                    items.append(decode_value(row[1]) if len(row) > 1 else None)
+                    continue
+                mask_parts = str(row[0]).split("/", 1)
+                mask = int(mask_parts[0], 16)
+                derived_mask = int(mask_parts[1], 16) if len(mask_parts) == 2 else 0
+                value_index = 1
+                item: dict[str, Any] = {}
+                for column_index, key in enumerate(columns):
+                    if mask & (1 << column_index):
+                        if derived_mask & (1 << column_index):
+                            continue
+                        if value_index >= len(row):
+                            raise ValueError("Observation row has fewer values than its presence mask.")
+                        raw_value = row[value_index]
+                        if isinstance(raw_value, str) and raw_value.startswith("^") and not raw_value.startswith("^^"):
+                            source_column_index = int(raw_value[1:], 36)
+                            source_key = str(columns[source_column_index])
+                            if source_key not in item:
+                                raise ValueError("Observation duplicate reference points to an unavailable column.")
+                            item[str(key)] = item[source_key]
+                        else:
+                            item[str(key)] = decode_value(raw_value)
+                        value_index += 1
+                if value_index != len(row):
+                    raise ValueError("Observation row has more values than its presence mask.")
+                for column_index, key in enumerate(columns):
+                    if not (derived_mask & (1 << column_index)):
+                        continue
+                    key_str = str(key)
+                    if key_str == "episode_id":
+                        item[key_str] = str(episode_id)
+                    elif key_str == "start_sec" and "start_ms" in item:
+                        item[key_str] = float(item["start_ms"]) / 1000.0
+                    elif key_str == "end_sec" and "end_ms" in item:
+                        item[key_str] = float(item["end_ms"]) / 1000.0
+                    else:
+                        raise ValueError("Unsupported or incomplete derived observation value.")
+                items.append(item)
+            data[str(category)] = items
+        decoded[str(episode_id)] = data
+    return decoded
+
+
 def final_json_contract() -> dict[str, Any]:
     """Return the renderer-facing contract sent to the configured Finalizer."""
     return {
@@ -137,10 +384,7 @@ def build_finalizer_project_prompt(
     scope: str,
 ) -> str:
     """Build one project-level request while preserving the raw Recap Prompt verbatim."""
-    observations = {
-        episode_id: evidence.to_dict()
-        for episode_id, evidence in sorted(evidence_map.items())
-    }
+    observations = pack_scanner_observations(evidence_map)
     payload = {
         "project_id": project_id,
         "analysis_scope": scope,
@@ -159,7 +403,7 @@ def build_finalizer_project_prompt(
         f"{raw_prompt}\n"
         "END RAW RECAP PROMPT\n\n"
         "PROJECT TECHNICAL DATA\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
     )
 
 
@@ -488,11 +732,23 @@ class CanonicalProjectFinalizer:
             raise AnalysisCancelledError("Finalizer cancelled before request.")
         if on_phase:
             on_phase(AnalysisPhase.FINALIZER, project_id, {"status": "requesting_final_json"})
+        user_text = build_finalizer_project_prompt(project_id, episodes, evidence_map, self.settings, scope)
+        request_bytes = estimate_request_size(
+            self.settings.finalizer_model,
+            FINAL_JSON_SYSTEM_PROMPT,
+            user_text,
+            thinking=self.settings.finalizer_thinking,
+        )
+        if log:
+            log(
+                f"[Finalizer transport] episodes={len(episodes)} request_bytes={request_bytes} "
+                f"ceiling=gateway-managed format={SCANNER_TRANSPORT_FORMAT}"
+            )
         raw = self.client.chat_json(
             model=self.settings.finalizer_model,
             thinking=self.settings.finalizer_thinking,
             system=FINAL_JSON_SYSTEM_PROMPT,
-            user_text=build_finalizer_project_prompt(project_id, episodes, evidence_map, self.settings, scope),
+            user_text=user_text,
             max_tokens=32_000,
             cancel_event=cancel_event,
             phase="finalizer",
@@ -553,5 +809,7 @@ __all__ = [
     "build_finalizer_project_prompt",
     "build_repair_prompt",
     "final_json_contract",
+    "pack_scanner_observations",
+    "unpack_scanner_observations",
     "validate_final_json",
 ]

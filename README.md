@@ -48,6 +48,12 @@ which stories become outputs. The Finalizer receives the complete project source
 mapping, Scanner observations, renderer contract, and the user's raw Recap Prompt.
 It returns one canonical Final JSON with zero, one, or any number of outputs.
 
+Scanner requests retain their 500 KB per-chunk safeguard. Whole-project Finalizer
+requests do not inherit that limit: ToolRecap losslessly packs repeated transport
+structure, measures/logs the request, and lets the configured Gateway/model enforce
+its real context capacity. No observation, timestamp, or episode is truncated to fit
+an application-side byte quota.
+
 ## Final JSON boundary
 
 Every output contains an ID, title, file/output metadata, language, and ordered

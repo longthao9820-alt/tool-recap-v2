@@ -14,6 +14,8 @@ from toolrecap_v2.analyzer.final_json import (
     CanonicalProjectFinalizer,
     FinalJsonValidationError,
     build_finalizer_project_prompt,
+    pack_scanner_observations,
+    unpack_scanner_observations,
     validate_final_json,
 )
 from toolrecap_v2.domain.models import EpisodeEvidence, SourceEpisode
@@ -21,7 +23,11 @@ from toolrecap_v2.projects import ProjectRecord, compute_project_analysis_signat
 from toolrecap_v2.settings import AppSettings
 from toolrecap_v2.updater import generate_apply_script
 from toolrecap_v2.renderer import PublicationRenderer
-from toolrecap_v2.api_client import GLOBAL_GATEWAY_CONCURRENCY, OpenAICompatibleClient
+from toolrecap_v2.api_client import (
+    GLOBAL_GATEWAY_CONCURRENCY,
+    OpenAICompatibleClient,
+    resolve_payload_ceiling,
+)
 
 
 class RecordingClient:
@@ -321,3 +327,55 @@ def test_global_gateway_scheduler_bounds_all_clients(monkeypatch: pytest.MonkeyP
         results = list(pool.map(invoke, range(GLOBAL_GATEWAY_CONCURRENCY * 2)))
     assert all(result == {"ok": True} for result in results)
     assert peak <= GLOBAL_GATEWAY_CONCURRENCY
+
+
+def test_scanner_transport_is_lossless_for_all_value_shapes(tmp_path: Path) -> None:
+    ep = _episode(tmp_path)
+    data = {
+        "events": [
+            {
+                "episode_id": "E01",
+                "start_ms": 1250,
+                "start_sec": 1.25,
+                "end_ms": 2500,
+                "end_sec": 2.5,
+                "summary": "Repeated meaningful observation",
+                "description": "Repeated meaningful observation",
+                "literal_tilde": "~not-a-reference",
+                "literal_caret": "^not-a-reference",
+                "nested": {"names": ["Beth", "Beth"], "value": None},
+            }
+        ],
+        "empty": [],
+        "metadata": {"confidence": 0.75},
+    }
+    evidence = {"E01": EpisodeEvidence("E01", ep.source_video, 120.0, data=data)}
+    packed = pack_scanner_observations(evidence)
+    assert unpack_scanner_observations(packed) == {"E01": data}
+
+
+def test_finalizer_payload_size_is_managed_by_gateway_not_toolrecap(tmp_path: Path) -> None:
+    ep = _episode(tmp_path, duration=10_000.0)
+    observations = [
+        {
+            "episode_id": "E01",
+            "start_ms": index * 1000,
+            "start_sec": float(index),
+            "end_ms": index * 1000 + 900,
+            "end_sec": index + 0.9,
+            "summary": f"Unique grounded observation {index:05d} " + ("x" * 180),
+        }
+        for index in range(4_000)
+    ]
+    settings = AppSettings(finalizer_model="large-context-editor", recap_prompt="Use all supplied evidence.")
+    client = RecordingClient([{"outputs": []}])
+    manifest = CanonicalProjectFinalizer(settings, client).finalize(  # type: ignore[arg-type]
+        project_id="large-season",
+        episodes=[ep],
+        evidence_map={"E01": EpisodeEvidence("E01", ep.source_video, 10_000.0, data={"events": observations})},
+        scope="SEASON",
+    )
+    assert len(client.calls[0]["user_text"].encode("utf-8")) > 500_000
+    assert manifest.zero_output_status == "VALID_EMPTY_OUTPUT"
+    assert resolve_payload_ceiling("finalizer") == 0
+    assert resolve_payload_ceiling("scanner") == 500_000
