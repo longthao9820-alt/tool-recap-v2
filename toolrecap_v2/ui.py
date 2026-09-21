@@ -70,8 +70,6 @@ from .voice.catalog import (
     SUPPORTED_VOICE_STYLES,
     STYLE_NAMES,
     get_voice_spec,
-    get_voice_status,
-    is_voicestudio_ready,
 )
 from .voice.manager import get_voice_manager
 
@@ -102,9 +100,9 @@ def safe_after(widget: tk.Misc | None, ms: int, func: Callable, *args: Any) -> s
 
 
 def open_voicestudio_dialog(parent: tk.Misc) -> tk.Toplevel:
-    """Open VoiceStudio Subsystem updater dialog."""
+    """Compatibility name for ToolRecap's local voice runtime diagnostics dialog."""
     dlg = tk.Toplevel(parent)
-    dlg.title("Cập nhật VoiceStudio Subsystem")
+    dlg.title("ToolRecap Local Voice Runtime")
     dlg.geometry("520x370")
     dlg.resizable(False, False)
     dlg.transient(parent)
@@ -116,85 +114,73 @@ def open_voicestudio_dialog(parent: tk.Misc) -> tk.Toplevel:
 
     ttk.Label(
         frame,
-        text="Hệ thống VoiceStudio (debpalash/VoiceStudio)",
+        text="ToolRecap Local Voice Engine",
         font=("Segoe UI Semibold", 11),
     ).pack(anchor="w", pady=(0, 6))
 
-    info_box = ttk.LabelFrame(frame, text="Thông tin phiên bản", padding=10)
+    info_box = ttk.LabelFrame(frame, text="Runtime diagnostics", padding=10)
     info_box.pack(fill="x", pady=(0, 10))
 
     lbl_installed = ttk.Label(info_box, text="Đang kiểm tra...", font=("Segoe UI", 9))
     lbl_installed.pack(anchor="w", pady=2)
 
-    lbl_supported = ttk.Label(info_box, text="Phiên bản hỗ trợ: v0.5.3 (đã ghim tương thích)", font=("Segoe UI", 9))
+    from .voice.runtime import VOICE_RUNTIME_VERSION
+    lbl_supported = ttk.Label(info_box, text=f"Required runtime: v{VOICE_RUNTIME_VERSION}", font=("Segoe UI", 9))
     lbl_supported.pack(anchor="w", pady=2)
 
-    lbl_latest = ttk.Label(info_box, text="Bản phát hành chính thức debpalash: Đang kết nối...", font=("Segoe UI", 9))
+    lbl_latest = ttk.Label(info_box, text="Engine: public OmniVoice (ToolRecap managed)", font=("Segoe UI", 9))
     lbl_latest.pack(anchor="w", pady=2)
 
     txt_status = tk.Text(frame, height=5, font=("Segoe UI", 9), wrap="word")
     txt_status.pack(fill="both", expand=True, pady=(0, 10))
-    txt_status.insert("1.0", "Đang kết nối kiểm tra trạng thái VoiceStudio...")
+    txt_status.insert("1.0", "Inspecting the local voice runtime...")
     txt_status.config(state="disabled")
 
     btn_box = ttk.Frame(frame)
     btn_box.pack(fill="x")
 
-    btn_update = ttk.Button(btn_box, text="Cập nhật adapter", style="Primary.TButton", state="disabled")
+    btn_update = ttk.Button(btn_box, text="Install / Repair Runtime", style="Primary.TButton")
     btn_update.pack(side="left")
 
     btn_close = ttk.Button(btn_box, text="Để sau / Đóng", command=dlg.destroy)
     btn_close.pack(side="right")
 
-    def _fetch_status() -> None:
-        from .voice.voice_updater import (
-            apply_voicestudio_subsystem_update,
-            check_voicestudio_status,
-            download_and_stage_voicestudio_adapter,
+    manager = get_voice_manager()
+
+    def show_health() -> None:
+        health = manager.runtime.inspect(run_imports=False)
+        lbl_installed.config(
+            text=f"Installed: {'yes' if health.runtime_present else 'no'} · Manifest: "
+            f"{'valid' if health.runtime_version_ok else 'missing/mismatch'}"
         )
-        status = check_voicestudio_status()
+        txt_status.config(state="normal")
+        txt_status.delete("1.0", "end")
+        txt_status.insert("1.0", manager.runtime.diagnostics_text(health))
+        txt_status.config(state="disabled")
 
-        def _update_ui() -> None:
-            if not dlg.winfo_exists():
-                return
-            inst_text = status.installed_version or "Chưa cài đặt"
-            lbl_installed.config(text=f"Phiên bản đã cài đặt: {inst_text}")
-            latest_tag = status.release_info.tag_name if status.release_info else "Không xác định (ngoại tuyến)"
-            lbl_latest.config(text=f"Bản phát hành chính thức debpalash: {latest_tag}")
+    def repair() -> None:
+        btn_update.config(state="disabled", text="Preparing...")
 
-            txt_status.config(state="normal")
-            txt_status.delete("1.0", "end")
-            txt_status.insert("1.0", status.status_label)
-            txt_status.config(state="disabled")
+        def work() -> None:
+            try:
+                settings = SettingsStore().load()
+                health = manager.ensure_ready(
+                    settings.voice_id,
+                    settings.voice_style,
+                    smoke_test=True,
+                    force_repair=True,
+                )
+                safe_after(dlg, 0, lambda: messagebox.showinfo("Voice ready", health.human_message, parent=dlg))
+            except Exception as exc:
+                safe_after(dlg, 0, lambda e=exc: messagebox.showerror("Voice runtime error", str(e), parent=dlg))
+            finally:
+                safe_after(dlg, 0, show_health)
+                safe_after(dlg, 0, lambda: btn_update.config(state="normal", text="Install / Repair Runtime"))
 
-            if status.is_compatible and status.has_adapter and status.adapter_asset:
-                btn_update.config(state="normal")
-                def _do_update() -> None:
-                    btn_update.config(state="disabled", text="Đang cập nhật...")
-                    def _work() -> None:
-                        try:
-                            staged = download_and_stage_voicestudio_adapter(status.adapter_asset)
-                            apply_voicestudio_subsystem_update(staged, version=status.supported_version)
-                            safe_after(parent, 0, lambda: messagebox.showinfo(
-                                "Cập nhật thành công",
-                                "VoiceStudio adapter đã được cập nhật thành công!",
-                                parent=dlg,
-                            ))
-                            safe_after(parent, 0, dlg.destroy)
-                        except Exception as exc:
-                            safe_after(parent, 0, lambda: messagebox.showerror(
-                                "Lỗi cập nhật",
-                                f"Cập nhật VoiceStudio thất bại, hệ thống cũ được giữ nguyên: {exc}",
-                                parent=dlg,
-                            ))
-                    threading.Thread(target=_work, daemon=True).start()
-                btn_update.config(command=_do_update)
-            else:
-                btn_update.config(state="disabled")
+        threading.Thread(target=work, daemon=True).start()
 
-        safe_after(parent, 0, _update_ui)
-
-    threading.Thread(target=_fetch_status, daemon=True).start()
+    btn_update.config(command=repair)
+    show_health()
     return dlg
 
 
@@ -964,6 +950,8 @@ class SettingsDialog(tk.Toplevel):
         self._panes: dict[str, ttk.Frame] = {}
         self._nav_buttons: dict[str, ttk.Button] = {}
         self.preview_player = AudioPreviewPlayer()
+        self._voice_preview_cancel = threading.Event()
+        self._voice_preview_busy = False
 
         self.title("Cài đặt — ToolRecap V2")
         self.geometry("920x680")
@@ -1211,8 +1199,8 @@ class SettingsDialog(tk.Toplevel):
 
         self.btn_voicestudio = ttk.Button(
             voice_action_bar,
-            text="🎙 Cập nhật VoiceStudio",
-            command=lambda: open_voicestudio_dialog(self),
+            text="🛠 Repair Voice Runtime",
+            command=self._repair_voice_runtime,
         )
         self.btn_voicestudio.pack(side="right")
 
@@ -1366,23 +1354,56 @@ class SettingsDialog(tk.Toplevel):
 
     def _update_voice_status_label(self) -> None:
         cur_id = self.voice_var.get()
-        status = get_voice_status(cur_id)
-        if not status["ready"]:
-            self.voice_status_var.set(status["status_label"])
+        mgr = get_voice_manager()
+        cached = mgr.get_cached_health(cur_id, self.voice_style_var.get())
+        if cached and cached.ready:
+            self.voice_status_var.set("✓ ToolRecap local voice ready")
+            self.lbl_voice_status.config(foreground="#16a34a")
+            self.voice_preview_prog["value"] = 100
+            return
+        metadata_health = mgr.runtime.inspect(run_imports=False)
+        if metadata_health.runtime_present and metadata_health.runtime_version_ok:
+            self.voice_status_var.set("Voice runtime installed — click Preview to verify production synthesis")
+            self.lbl_voice_status.config(foreground="#6b7280")
+        elif metadata_health.runtime_present:
+            self.voice_status_var.set("Voice runtime requires repair")
             self.lbl_voice_status.config(foreground="#dc2626")
-            self.voice_preview_prog["value"] = 0
         else:
-            mgr = get_voice_manager()
-            if mgr.is_voice_installed(cur_id):
-                self.voice_status_var.set("✓ Giọng đọc đã cài đặt và sẵn sàng")
-                self.lbl_voice_status.config(foreground="#16a34a")
-                self.voice_preview_prog["value"] = 100
-            else:
-                self.voice_status_var.set("Model giọng đọc sẽ tự động tải khi bắt đầu render")
-                self.lbl_voice_status.config(foreground="#6b7280")
-                self.voice_preview_prog["value"] = 0
+            self.voice_status_var.set("ToolRecap local voice runtime is not installed — Preview will install it")
+            self.lbl_voice_status.config(foreground="#6b7280")
+        self.voice_preview_prog["value"] = 0
+
+    def _repair_voice_runtime(self) -> None:
+        self.btn_voicestudio.config(state="disabled")
+        self.voice_status_var.set("Repairing ToolRecap local voice runtime...")
+        voice_id = self.voice_var.get()
+        voice_style = self.voice_style_var.get()
+
+        def worker() -> None:
+            try:
+                health = get_voice_manager().ensure_ready(
+                    voice_id,
+                    voice_style,
+                    smoke_test=True,
+                    force_repair=True,
+                    progress_callback=lambda _d, _t, pct: safe_after(
+                        self, 0, lambda p=pct: self.voice_preview_prog.configure(value=p)
+                    ),
+                )
+                safe_after(self, 0, lambda: self.voice_status_var.set(health.human_message))
+            except Exception as exc:
+                safe_after(self, 0, lambda e=exc: self.voice_status_var.set(f"Voice runtime repair failed: {e}"))
+            finally:
+                safe_after(self, 0, lambda: self.btn_voicestudio.config(state="normal"))
+                safe_after(self, 0, self._update_voice_status_label)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _toggle_preview(self) -> None:
+        if self._voice_preview_busy:
+            self._voice_preview_cancel.set()
+            self.voice_status_var.set("Stopping voice preview...")
+            return
         if self.preview_player.is_playing:
             self.preview_player.stop()
             self.btn_preview.config(text="🔊 Nghe thử giọng")
@@ -1390,32 +1411,30 @@ class SettingsDialog(tk.Toplevel):
 
         spec = get_voice_spec(self.voice_var.get())
         mgr = get_voice_manager()
+        preview_style = self.voice_style_var.get()
+        self._voice_preview_cancel.clear()
+        self._voice_preview_busy = True
         self.btn_preview.config(text="⏹ Dừng nghe")
 
         def _generate_and_play() -> None:
-            preview_wav = default_data_directory() / "cache" / f"preview_{spec.voice_id}.wav"
             try:
-                if not preview_wav.is_file():
-                    def _prog(current: int, total: int, pct: float) -> None:
-                        def _update_ui() -> None:
-                            if total > 0 and current < total:
-                                self.voice_status_var.set(f"Đang tải model giọng ({pct:.0f}%)...")
-                                self.voice_preview_prog["value"] = pct
-                            else:
-                                self.voice_status_var.set("Đang tạo âm thanh mẫu...")
-                                self.voice_preview_prog["value"] = 100
-                        safe_after(self, 0, _update_ui)
-
-                    mgr.synthesize(
-                        spec.voice_id,
-                        spec.preview_text,
-                        preview_wav,
-                        style=self.voice_style_var.get(),
-                        progress_callback=_prog,
+                def _prog(current: int, total: int, pct: float) -> None:
+                    safe_after(
+                        self,
+                        0,
+                        lambda: (
+                            self.voice_status_var.set(f"Preparing local voice engine ({pct:.0f}%)..."),
+                            self.voice_preview_prog.configure(value=pct),
+                        ),
                     )
-                    safe_after(self, 0, self._update_voice_status_label)
-                else:
-                    safe_after(self, 0, self._update_voice_status_label)
+
+                preview_wav = mgr.preview(
+                    spec.voice_id,
+                    preview_style,
+                    progress_callback=_prog,
+                    cancel_event=self._voice_preview_cancel,
+                )
+                safe_after(self, 0, self._update_voice_status_label)
 
                 self.preview_player.play(
                     preview_wav,
@@ -1425,6 +1444,9 @@ class SettingsDialog(tk.Toplevel):
                 safe_after(self, 0, lambda: self.voice_status_var.set(f"Không thể phát nghe thử: {exc}"))
                 safe_after(self, 0, lambda: self.btn_preview.config(text="🔊 Nghe thử giọng"))
                 safe_after(self, 0, self._update_voice_status_label)
+            finally:
+                self._voice_preview_busy = False
+                safe_after(self, 0, lambda: self.btn_preview.config(text="🔊 Nghe thử giọng"))
 
         threading.Thread(target=_generate_and_play, daemon=True).start()
 
@@ -1476,8 +1498,8 @@ class SettingsDialog(tk.Toplevel):
 
         ttk.Button(
             sub_box,
-            text="🔄 Kiểm tra VoiceStudio Subsystem",
-            command=lambda: open_voicestudio_dialog(self),
+            text="🛠 Check / Repair Local Voice Runtime",
+            command=self._repair_voice_runtime,
         ).pack(side="left", padx=(0, 8))
 
         return frame
@@ -1709,6 +1731,7 @@ class SettingsDialog(tk.Toplevel):
         self._on_close()
 
     def _on_close(self) -> None:
+        self._voice_preview_cancel.set()
         self.preview_player.stop()
         self.destroy()
 

@@ -195,7 +195,10 @@ def test_voice_filter_default_status_and_persist(tk_root: tk.Tk, tmp_path: Path)
         # 3. Honest status check
         status = get_voice_status(dialog.voice_var.get())
         if not status["ready"]:
-            assert "chưa được cài đặt" in dialog.voice_status_var.get()
+            assert any(
+                marker in dialog.voice_status_var.get()
+                for marker in ("not installed", "click Preview", "requires repair")
+            )
 
         # 4. Select a voice and save
         chosen_display = [v for v in gb_vals if "Librarian" in v][0]
@@ -444,10 +447,10 @@ def test_notification_and_updater_regression(tk_root: tk.Tk) -> None:
         except Exception:
             pass
 
-    # VoiceStudio dialog regression
+    # ToolRecap-owned local voice runtime dialog regression
     vs_dlg = open_voicestudio_dialog(tk_root)
     try:
-        assert "VoiceStudio" in vs_dlg.title()
+        assert "ToolRecap Local Voice Runtime" in vs_dlg.title()
         vs_dlg.update()
     finally:
         vs_dlg.destroy()

@@ -51,6 +51,7 @@ from .subtitles.models import SubtitleCue
 from .subtitles.pipeline import SubtitlePipeline
 from .voice.catalog import DEFAULT_VOICE_ID
 from .voice.manager import get_voice_manager
+from .voice.runtime import VOICE_MODEL_REVISION, runtime_fingerprint
 
 
 ProjectCallback = Callable[["ProjectRecord"], None]
@@ -311,6 +312,8 @@ def compute_project_render_signature(
         "analysis_signature": analysis_signature,
         "voice_id": record.voice_id,
         "voice_style": settings.voice_style,
+        "voice_runtime_fingerprint": runtime_fingerprint(),
+        "voice_model_revision": VOICE_MODEL_REVISION,
         "quality": settings.quality,
         "use_gpu": settings.use_gpu,
         "generate_srt": settings.generate_srt,
@@ -618,10 +621,13 @@ class ProjectStore:
     def save(self, projects: list[ProjectRecord]) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
+            tmp = self.path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
             data = {"projects": [asdict(p) for p in projects]}
-            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, self.path)
+            try:
+                tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, self.path)
+            finally:
+                tmp.unlink(missing_ok=True)
 
 
 class ProjectQueue:
@@ -778,6 +784,36 @@ class ProjectQueue:
         record.phase = "IDLE"
         record.current_message = "Bắt đầu phân tích video..."
         self._notify_update(record)
+
+        # Voice is a render dependency, but its readiness must be proven before
+        # expensive source/AI work. Existing analysis signatures and Final JSON are
+        # untouched by this preflight and remain reusable after a voice failure.
+        record.phase = "VOICE_PREFLIGHT"
+        record.current_message = "Đang kiểm tra ToolRecap Local Voice Engine..."
+        self._notify_update(record)
+        voice_manager = get_voice_manager()
+        ensure_ready = getattr(voice_manager, "ensure_ready", None)
+        if callable(ensure_ready):
+            try:
+                ensure_ready(
+                    record.voice_id,
+                    self.settings.voice_style,
+                    cancel_event=self._cancel_event,
+                    smoke_test=True,
+                )
+            except Exception as exc:
+                if self._cancel_event.is_set():
+                    raise RenderCancelled("Voice preparation was cancelled.") from exc
+                record.error_scope = "OUTPUT" if record.outputs else "VOICE"
+                failed_output = next(
+                    (out for out in record.outputs if out.status != OutputStatus.COMPLETED.value),
+                    None,
+                )
+                if failed_output is not None:
+                    record.error_target = failed_output.output_id
+                    failed_output.status = OutputStatus.ERROR.value
+                    failed_output.error = f"[VOICE_ERROR] {exc}"
+                raise MediaError(f"[VOICE_ERROR] {exc}") from exc
 
         # 1. Validate source episodes
         if not record.source_episodes and record.source_video:

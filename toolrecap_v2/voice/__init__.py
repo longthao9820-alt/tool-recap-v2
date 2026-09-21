@@ -46,6 +46,17 @@ from .manager import (
     get_voice_manager,
     validate_wav_audio,
 )
+from .runtime import (
+    CORE_DEPENDENCIES,
+    DEPENDENCY_MANIFEST_VERSION,
+    VOICE_ENGINE_VERSION,
+    VOICE_MODEL_REVISION,
+    VOICE_RUNTIME_SCHEMA,
+    VOICE_RUNTIME_VERSION,
+    VoiceHealthResult,
+    VoiceRuntimeInspector,
+    runtime_fingerprint,
+)
 
 __all__ = [
     # Catalog
@@ -81,6 +92,15 @@ __all__ = [
     "VoiceError",
     "DownloadCancelled",
     "validate_wav_audio",
+    "VoiceHealthResult",
+    "VoiceRuntimeInspector",
+    "VOICE_RUNTIME_SCHEMA",
+    "VOICE_RUNTIME_VERSION",
+    "VOICE_ENGINE_VERSION",
+    "VOICE_MODEL_REVISION",
+    "DEPENDENCY_MANIFEST_VERSION",
+    "CORE_DEPENDENCIES",
+    "runtime_fingerprint",
     # Audio mix
     "AudioMixSettings",
     "AudioMixPlan",

@@ -95,6 +95,20 @@ Prompt or Finalizer changes regenerate Final JSON while retaining compatible sou
 and Scanner artifacts. A failed multi-output render validates and skips previously
 completed outputs when its render dependency signature is unchanged.
 
+## ToolRecap Local Voice Engine
+
+Preview and production rendering use one ToolRecap-owned OmniVoice path. On first
+use, ToolRecap installs a pinned Python 3.11 runtime and compatible dependency
+manifest under `%LOCALAPPDATA%\ToolRecapV2\voice_runtime`, downloads the pinned
+public model revision into the ToolRecap model cache, performs real synthesis, and
+validates the WAV before reporting READY. It does not detect, prefer, or require an
+external VoiceStudio installation.
+
+Voice readiness is based on manifest identity, exact package versions, imports,
+model integrity, real synthesis, and audio validation. A cached preview never creates
+a READY state by itself. Voice/runtime/model/style changes affect render signatures
+only and do not invalidate Scanner evidence or Final JSON.
+
 ## Renderer and publication output
 
 The existing V2 renderer remains responsible for local voice generation, source

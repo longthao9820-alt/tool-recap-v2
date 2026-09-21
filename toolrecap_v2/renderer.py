@@ -44,6 +44,7 @@ from .subtitles.models import SubtitleCue
 from .subtitles.remap import cues_to_srt_rows, remap_subtitles
 from .voice.catalog import DEFAULT_VOICE_ID
 from .voice.manager import get_voice_manager, validate_wav_audio
+from .voice.runtime import VOICE_MODEL_REVISION, runtime_fingerprint
 
 
 def compute_output_render_signature(
@@ -88,6 +89,8 @@ def compute_output_render_signature(
         "segments": segments_payload,
         "voice_id": eff_voice_id,
         "voice_style": _get_setting("voice_style", "film_recap"),
+        "voice_runtime_fingerprint": runtime_fingerprint(),
+        "voice_model_revision": VOICE_MODEL_REVISION,
         "quality": _get_setting("quality", "1080p"),
         "use_gpu": bool(_get_setting("use_gpu", True)),
         "generate_srt": bool(_get_setting("generate_srt", True)),

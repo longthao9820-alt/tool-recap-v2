@@ -847,8 +847,12 @@ def test_cancellation_during_phases_and_ui_restoration(tmp_path: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 def test_voice_studio_unavailable_fails_clear(tmp_path: Path) -> None:
-    """VoiceManager raises VoiceError if VoiceStudio is not installed, no fake Piper fallback."""
-    vm = VoiceModelManager(cache_dir=tmp_path / "cache", subsystem_dir=tmp_path / "subsystem")
+    """Missing ToolRecap runtime fails clearly with no fake/Piper fallback."""
+    vm = VoiceModelManager(
+        cache_dir=tmp_path / "cache",
+        subsystem_dir=tmp_path / "subsystem",
+        auto_bootstrap=False,
+    )
 
     # In production (allow_mock_synth=False), synthesizing without adapter must fail clear
     with pytest.raises(VoiceError) as exc:
@@ -859,7 +863,7 @@ def test_voice_studio_unavailable_fails_clear(tmp_path: Path) -> None:
             allow_mock_synth=False,
         )
 
-    assert "VoiceStudio adapter chưa được cài đặt" in str(exc.value)
+    assert "ToolRecap local voice runtime" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

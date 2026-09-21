@@ -250,11 +250,10 @@ def test_dynamic_catalog_requires_executable_adapter(tmp_path: Path) -> None:
     assert "custom.narrator-deep" not in voices_no_adapter
     assert "omnivoice.fake-voice" not in voices_no_adapter
 
-    # Now add executable adapter (VoiceStudio.exe)
+    # External adapter manifests no longer participate in the production catalog.
     (tmp_path / "VoiceStudio.exe").write_bytes(b"MZ_EXE")
     voices_with_adapter = get_available_voices(manifest_path=manifest_file)
-    assert "custom.narrator-deep" in voices_with_adapter
-    # Fake OmniVoice must still be rejected unless omnivoice.exe is present
+    assert "custom.narrator-deep" not in voices_with_adapter
     assert "omnivoice.fake-voice" not in voices_with_adapter
 
 

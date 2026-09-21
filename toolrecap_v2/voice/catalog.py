@@ -1,6 +1,6 @@
 """Catalog of supported English voices and model specifications for ToolRecap V2.
 
-Contains exact 12 VoiceStudio English voice models from V1 as the primary production catalog,
+Contains 12 ToolRecap local OmniVoice presets as the primary production catalog,
 with internal compatibility fallbacks for legacy Piper models.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..paths import application_root, default_data_directory
+from .runtime import VoiceRuntimeInspector
 
 
 @dataclass(frozen=True)
@@ -74,8 +75,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     # en-US (6 voices)
     "voicestudio.en.neighbor": VoiceSpec(
         voice_id="voicestudio.en.neighbor",
-        display_name="Neighbor — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Neighbor — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Female",
         description="Film recap / Storytelling",
@@ -90,8 +91,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.companion": VoiceSpec(
         voice_id="voicestudio.en.companion",
-        display_name="Companion — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Companion — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Female",
         description="Film recap / Storytelling",
@@ -106,8 +107,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.teacher": VoiceSpec(
         voice_id="voicestudio.en.teacher",
-        display_name="Teacher — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Teacher — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Female",
         description="Film recap / Storytelling",
@@ -122,8 +123,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.anchor": VoiceSpec(
         voice_id="voicestudio.en.anchor",
-        display_name="Anchor — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Anchor — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Male",
         description="Documentary / News",
@@ -138,8 +139,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.documentarian": VoiceSpec(
         voice_id="voicestudio.en.documentarian",
-        display_name="Documentarian — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Documentarian — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Male",
         description="Documentary / Recap (Default US)",
@@ -154,8 +155,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.promo": VoiceSpec(
         voice_id="voicestudio.en.promo",
-        display_name="Promo — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Promo — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-US",
         gender="Male",
         description="Energetic / Trailer",
@@ -171,8 +172,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     # en-GB (6 voices)
     "voicestudio.en.librarian": VoiceSpec(
         voice_id="voicestudio.en.librarian",
-        display_name="Librarian — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Librarian — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Female",
         description="Storytelling / Drama",
@@ -187,8 +188,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.podcaster": VoiceSpec(
         voice_id="voicestudio.en.podcaster",
-        display_name="Podcaster — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Podcaster — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Female",
         description="Narrative / Conversation",
@@ -203,8 +204,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.luxe": VoiceSpec(
         voice_id="voicestudio.en.luxe",
-        display_name="Luxe — Nữ — Premium Local",
-        engine="voicestudio",
+        display_name="Luxe — Nữ — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Female",
         description="Emotional / Drama",
@@ -219,8 +220,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.storyteller": VoiceSpec(
         voice_id="voicestudio.en.storyteller",
-        display_name="Storyteller — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Storyteller — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Male",
         description="Storytelling / Drama",
@@ -235,8 +236,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.commentator": VoiceSpec(
         voice_id="voicestudio.en.commentator",
-        display_name="Commentator — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Commentator — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Male",
         description="Commentary / Recap (Default UK)",
@@ -251,8 +252,8 @@ BUILTIN_VOICES: dict[str, VoiceSpec] = {
     ),
     "voicestudio.en.explainer": VoiceSpec(
         voice_id="voicestudio.en.explainer",
-        display_name="Explainer — Nam — Premium Local",
-        engine="voicestudio",
+        display_name="Explainer — Nam — ToolRecap Local",
+        engine="omnivoice",
         language="en-GB",
         gender="Male",
         description="Documentary / Explainer",
@@ -424,28 +425,10 @@ def is_voicestudio_ready(
     *,
     detect_official: bool | None = None,
 ) -> bool:
-    """Truthfully check if VoiceStudio executable adapter or backend runtime is ready."""
-    if detect_official is None:
-        detect_official = (subsystem_dir is None)
-
-    if detect_official:
-        official = detect_official_voicestudio_runtime()
-        if official is not None:
-            return True
-
-    target = subsystem_dir or (default_data_directory() / "voice_subsystem")
-    if is_executable_adapter_available(target):
-        return True
-    if get_isolated_runtime_python(target) is not None:
-        return True
-
-    bundled = application_root() / "runtime" / "voices"
-    if is_executable_adapter_available(bundled):
-        return True
-    if get_isolated_runtime_python(bundled) is not None:
-        return True
-
-    return False
+    """Legacy API name: verify managed dependencies and model, never external apps."""
+    runtime_dir = (subsystem_dir / "runtime") if subsystem_dir is not None else None
+    health = VoiceRuntimeInspector(runtime_dir=runtime_dir).inspect(run_imports=True)
+    return health.dependencies_ok and health.model_valid
 
 
 def is_voice_selectable(
@@ -456,7 +439,7 @@ def is_voice_selectable(
 ) -> bool:
     """Check whether a voice is selectable based on actual backend readiness."""
     spec = get_voice_spec(voice_id)
-    if spec.engine == "voicestudio":
+    if spec.engine == "omnivoice":
         return is_voicestudio_ready(subsystem_dir=subsystem_dir, detect_official=detect_official)
     elif spec.engine == "piper":
         try:
@@ -473,21 +456,26 @@ def get_voice_status(
     *,
     detect_official: bool | None = None,
 ) -> dict[str, Any]:
-    """Honest status of voice readiness without claiming VoiceStudio is installed when absent."""
+    """Stateless diagnostic status; READY requires VoiceManager's synthesis proof."""
     spec = get_voice_spec(voice_id)
-    if spec.engine == "voicestudio":
-        ready = is_voicestudio_ready(subsystem_dir=subsystem_dir, detect_official=detect_official)
+    if spec.engine == "omnivoice":
+        runtime_dir = (subsystem_dir / "runtime") if subsystem_dir is not None else None
+        health = VoiceRuntimeInspector(runtime_dir=runtime_dir).inspect(run_imports=True)
+        prepared = health.dependencies_ok and health.model_valid
         return {
             "voice_id": voice_id,
-            "engine": "voicestudio",
-            "ready": ready,
-            "status": "READY" if ready else "NOT_INSTALLED",
-            "install_on_first_use": not ready,
+            "engine": "omnivoice",
+            # A stateless catalog probe cannot prove that synthesis just succeeded.
+            # VoiceManager health cache is the sole READY authority.
+            "ready": False,
+            "status": "VERIFYING" if prepared else health.state,
+            "install_on_first_use": not health.runtime_present,
             "status_label": (
-                "VoiceStudio adapter sẵn sàng."
-                if ready
-                else "VoiceStudio adapter chưa được cài đặt (sẽ tự động cài đặt khi dùng lần đầu)."
+                "Voice runtime and model are installed — run Preview to verify production synthesis."
+                if prepared
+                else health.human_message
             ),
+            "health": health.to_dict(),
         }
     elif spec.engine == "piper":
         try:
@@ -519,7 +507,7 @@ def migrate_voice_setting(
     *,
     backend_ready: bool | None = None,
 ) -> tuple[str, str | None]:
-    """Migrate legacy Piper voice selection to preferred VoiceStudio voice when backend is ready.
+    """Migrate legacy Piper selection to a ToolRecap local voice when ready.
 
     If backend is ready, migrates to corresponding VoiceStudio voice (or language default).
     If backend is not ready, preserves current Piper setting and returns a warning.
@@ -543,7 +531,7 @@ def migrate_voice_setting(
             return preferred, None
         else:
             warning = (
-                f"VoiceStudio backend chưa sẵn sàng; giữ cấu hình Piper hiện tại ({current_voice_id})."
+                f"ToolRecap local voice runtime chưa sẵn sàng; giữ cấu hình Piper hiện tại ({current_voice_id})."
             )
             return current_voice_id, warning
 
@@ -551,48 +539,8 @@ def migrate_voice_setting(
 
 
 def get_available_voices(manifest_path: Path | None = None) -> dict[str, VoiceSpec]:
-    """Retrieve primary selectable production voices (exact 12 VoiceStudio voices).
-    Does NOT include Piper voices in selectable production list.
-    Dynamic extra voices from installed subsystem manifest are added only if verified executable adapter exists.
-    """
-    voices = dict(BUILTIN_VOICES)
-
-    candidate_paths: list[Path] = []
-    if manifest_path:
-        candidate_paths.append(Path(manifest_path))
-    candidate_paths.append(default_data_directory() / "voice_subsystem" / "voice_manifest.json")
-    candidate_paths.append(application_root() / "runtime" / "voices" / "voice_manifest.json")
-
-    for cand in candidate_paths:
-        if cand.is_file() and is_executable_adapter_available(cand.parent):
-            try:
-                data = json.loads(cand.read_text(encoding="utf-8"))
-                extra_voices = data.get("installed_voices", [])
-                for v in extra_voices:
-                    if isinstance(v, dict) and "voice_id" in v:
-                        vid = str(v["voice_id"])
-                        # Reject unverified omnivoice fake entries
-                        if "omnivoice" in vid.lower() and not (cand.parent / "omnivoice.exe").is_file():
-                            continue
-                        voices[vid] = VoiceSpec(
-                            voice_id=vid,
-                            display_name=str(v.get("display_name", vid)),
-                            engine=str(v.get("engine", "voicestudio")),
-                            language=str(v.get("language", "en-US")),
-                            gender=str(v.get("gender", "Neutral")),
-                            description=str(v.get("description", "")),
-                            repo_id=str(v.get("repo_id", "")),
-                            base_url=str(v.get("base_url", "")),
-                            files=tuple(str(f) for f in v.get("files", ())),
-                            required_files=tuple(str(f) for f in v.get("required_files", ())),
-                            preview_text=str(v.get("preview_text", "Voice test.")),
-                            style=str(v.get("style", "film_recap")),
-                            instruct=str(v.get("instruct", "")),
-                        )
-            except Exception:
-                pass
-
-    return voices
+    """Return ToolRecap's fixed, verified local voice preset catalog."""
+    return dict(BUILTIN_VOICES)
 
 
 def get_voice_spec(voice_id: str, manifest_path: Path | None = None) -> VoiceSpec:

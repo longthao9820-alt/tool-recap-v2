@@ -62,7 +62,7 @@ def validate_request(
     """Validate request against allowlists and path safety rules."""
     if voice_id not in OFFICIAL_VOICE_INSTRUCTS:
         raise ValueError(
-            f"Voice ID '{voice_id}' không nằm trong danh sách 12 giọng đọc VoiceStudio được hỗ trợ. "
+            f"Voice ID '{voice_id}' không nằm trong danh sách 12 giọng ToolRecap Local được hỗ trợ. "
             f"Hợp lệ: {', '.join(sorted(OFFICIAL_VOICE_INSTRUCTS.keys()))}"
         )
     if style not in SUPPORTED_VOICE_STYLES:
@@ -148,8 +148,9 @@ def main() -> int:
 
     # 2. Import torch, torchaudio, and omnivoice
     try:
+        import numpy as np
+        import soundfile as sf
         import torch
-        import torchaudio
         from omnivoice import OmniVoice
     except ImportError as imp_err:
         sys.stderr.write(f"Lỗi import backend: {imp_err}. Vui lòng cài đặt đầy đủ torch, torchaudio, omnivoice.\n")
@@ -159,15 +160,17 @@ def main() -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
 
-    model_source = model_name or "k2-fsa/OmniVoice"
+    model_source = model_name or "k2-fsa/OmniVoice@c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
+    model_revision = None
+    if "@" in model_source:
+        model_source, model_revision = model_source.rsplit("@", 1)
     report_progress("loading_model", 25, f"Tải mô hình {model_source} trên {device} ({dtype})...")
 
     try:
-        model = OmniVoice.from_pretrained(
-            model_source,
-            device_map=device,
-            dtype=dtype,
-        )
+        load_kwargs = {"device_map": device, "dtype": dtype}
+        if model_revision:
+            load_kwargs["revision"] = model_revision
+        model = OmniVoice.from_pretrained(model_source, **load_kwargs)
     except Exception as exc:
         sys.stderr.write(f"Lỗi tải mô hình OmniVoice từ '{model_source}': {exc}\n")
         return 3
@@ -191,31 +194,14 @@ def main() -> int:
     # 5. Save PCM16 WAV
     report_progress("saving", 85, "Lưu tệp âm thanh PCM16 WAV...")
     try:
-        audio_tensor = audios[0]
-        if audio_tensor.ndim == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
-        audio_tensor = audio_tensor.detach().cpu()
-
+        audio_value = audios[0]
+        if hasattr(audio_value, "detach"):
+            audio_value = audio_value.detach().cpu().numpy()
+        audio_array = np.asarray(audio_value, dtype=np.float32).squeeze()
+        if audio_array.size == 0:
+            raise ValueError("OmniVoice returned an empty audio array.")
         sample_rate = getattr(model, "sampling_rate", 24000)
-
-        # Save as standard PCM_S 16-bit
-        try:
-            torchaudio.save(
-                str(output_path),
-                audio_tensor,
-                sample_rate,
-                encoding="PCM_S",
-                bits_per_sample=16,
-            )
-        except Exception:
-            # Fallback using wave module
-            import wave
-            clamped = (audio_tensor.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).numpy()
-            with wave.open(str(output_path), "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(clamped.tobytes())
+        sf.write(str(output_path), audio_array, sample_rate, subtype="PCM_16")
     except Exception as exc:
         sys.stderr.write(f"Lỗi lưu tệp âm thanh WAV: {exc}\n")
         return 6

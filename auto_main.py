@@ -65,15 +65,14 @@ def _run_self_check() -> int:
     else:
         errors.append("Không tìm thấy FFmpeg trong runtime hoặc PATH.")
 
-    # 3. Check voice synthesis runtime (Piper builtin - mandatory)
+    # 3. Check ToolRecap's managed voice architecture (mutable runtime installs on demand).
     voice_ok = False
     try:
-        import piper
-        from piper import PiperVoice
-        voice_ok = True
+        from toolrecap_v2.voice.runtime import VOICE_RUNTIME_VERSION, runtime_fingerprint
+        voice_ok = bool(VOICE_RUNTIME_VERSION and runtime_fingerprint())
     except Exception as exc:
         voice_ok = False
-        errors.append(f"Không thể tải runtime giọng nói Piper ({exc}).")
+        errors.append(f"Không thể tải kiến trúc ToolRecap Local Voice ({exc}).")
 
     # 4. Check GUI module (mandatory)
     gui_ok = False
@@ -134,22 +133,17 @@ def _run_self_check() -> int:
     except Exception:
         stt_models_downloaded = False
 
-    # 7. Check Voice backend runtime: official / isolated / install-on-first-use
+    # 7. Check ToolRecap-owned voice runtime only.
     voice_backend_mode = "install-on-first-use"
     voice_backend_path = None
     try:
-        from toolrecap_v2.voice.catalog import detect_official_voicestudio_runtime, get_isolated_runtime_python
-        official = detect_official_voicestudio_runtime()
-        if official is not None and official.is_file():
-            voice_backend_mode = "official"
-            voice_backend_path = str(official)
+        from toolrecap_v2.voice.runtime import VoiceRuntimeInspector
+        voice_health = VoiceRuntimeInspector().inspect(run_imports=False)
+        if voice_health.runtime_present and voice_health.runtime_version_ok:
+            voice_backend_mode = "toolrecap-managed"
+            voice_backend_path = str(VoiceRuntimeInspector().python_executable)
         else:
-            isolated = get_isolated_runtime_python()
-            if isolated is not None and isolated.is_file():
-                voice_backend_mode = "isolated"
-                voice_backend_path = str(isolated)
-            else:
-                voice_backend_mode = "install-on-first-use"
+            voice_backend_mode = "install-or-repair-on-first-use"
     except Exception as exc:
         voice_backend_mode = f"install-on-first-use (probe error: {exc})"
 

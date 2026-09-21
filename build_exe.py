@@ -245,7 +245,7 @@ def build_portable_package() -> int:
       (sub - thinking max), checkbox rõ ràng "Scanner model supports image/Vision input",
       Finalizer model (prime - thinking high), số luồng song song (1-4) và độ dài đoạn (60-900s).
     - Tab 3 - Voice: Lựa chọn 12 giọng thiết kế chuẩn (Neighbor, Companion...), phong cách
-      giọng đọc, nút "🔊 Nghe thử giọng", nút "🎙 Cập nhật VoiceStudio", và khu vực
+      giọng đọc, nút "🔊 Nghe thử giọng", nút "🛠 Repair Voice Runtime", và khu vực
       Audio Mix chuyên nghiệp (âm lượng gốc dB, âm lượng thuyết minh dB, Auto-ducking,
       Target loudness -14 LUFS, True peak -1 dBTP).
     - Tab 4 - Render and Output: Chất lượng video (standard/high/source), bật/tắt GPU

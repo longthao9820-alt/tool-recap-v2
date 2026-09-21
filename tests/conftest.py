@@ -7,6 +7,32 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _project_voice_preflight_test_double(monkeypatch: pytest.MonkeyPatch):
+    """Keep non-voice ProjectQueue tests offline after voice preflight became mandatory.
+
+    Individual voice/preflight tests can and do override this patch explicitly.
+    """
+    import wave
+
+    class ReadyVoiceManager:
+        def ensure_ready(self, *args, **kwargs):
+            return type("Health", (), {"ready": True, "state": "READY"})()
+
+        def synthesize(self, voice_id, text, output_path, **kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output_path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(24000)
+                wav.writeframes(b"\x00\x20" * 2400)
+            return output_path
+
+    manager = ReadyVoiceManager()
+    monkeypatch.setattr("toolrecap_v2.projects.get_voice_manager", lambda: manager)
+    return manager
+
+
 # These integration cases assert the superseded production topology
 # (Season Connection -> Candidate Discovery/Consolidation/Verification -> Finalizer)
 # or feed that topology's pre-Final-JSON fixtures into ProjectQueue. The refactor

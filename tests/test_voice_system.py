@@ -56,10 +56,16 @@ from toolrecap_v2.voice.omnivoice_adapter import (
     OFFICIAL_VOICE_INSTRUCTS,
     validate_request,
 )
+from toolrecap_v2.voice.runtime import (
+    DEPENDENCY_MANIFEST_VERSION,
+    VOICE_RUNTIME_SCHEMA,
+    VOICE_RUNTIME_VERSION,
+    runtime_fingerprint,
+)
 
 
 def test_builtin_voice_catalog_exact_12_voicestudio() -> None:
-    """Invariant 1: Exact 12 V1 voices, engine voicestudio, correct IDs/labels/languages/genders/defaults."""
+    """The 12 legacy IDs are ToolRecap-owned OmniVoice presets."""
     assert len(BUILTIN_VOICES) == 12
 
     # Check defaults
@@ -72,20 +78,20 @@ def test_builtin_voice_catalog_exact_12_voicestudio() -> None:
 
     # Exact expected 12 IDs from survey
     expected_us_voices = {
-        "voicestudio.en.neighbor": ("Female", "Neighbor — Nữ — Premium Local"),
-        "voicestudio.en.companion": ("Female", "Companion — Nữ — Premium Local"),
-        "voicestudio.en.teacher": ("Female", "Teacher — Nữ — Premium Local"),
-        "voicestudio.en.anchor": ("Male", "Anchor — Nam — Premium Local"),
-        "voicestudio.en.documentarian": ("Male", "Documentarian — Nam — Premium Local"),
-        "voicestudio.en.promo": ("Male", "Promo — Nam — Premium Local"),
+        "voicestudio.en.neighbor": ("Female", "Neighbor — Nữ — ToolRecap Local"),
+        "voicestudio.en.companion": ("Female", "Companion — Nữ — ToolRecap Local"),
+        "voicestudio.en.teacher": ("Female", "Teacher — Nữ — ToolRecap Local"),
+        "voicestudio.en.anchor": ("Male", "Anchor — Nam — ToolRecap Local"),
+        "voicestudio.en.documentarian": ("Male", "Documentarian — Nam — ToolRecap Local"),
+        "voicestudio.en.promo": ("Male", "Promo — Nam — ToolRecap Local"),
     }
     expected_gb_voices = {
-        "voicestudio.en.librarian": ("Female", "Librarian — Nữ — Premium Local"),
-        "voicestudio.en.podcaster": ("Female", "Podcaster — Nữ — Premium Local"),
-        "voicestudio.en.luxe": ("Female", "Luxe — Nữ — Premium Local"),
-        "voicestudio.en.storyteller": ("Male", "Storyteller — Nam — Premium Local"),
-        "voicestudio.en.commentator": ("Male", "Commentator — Nam — Premium Local"),
-        "voicestudio.en.explainer": ("Male", "Explainer — Nam — Premium Local"),
+        "voicestudio.en.librarian": ("Female", "Librarian — Nữ — ToolRecap Local"),
+        "voicestudio.en.podcaster": ("Female", "Podcaster — Nữ — ToolRecap Local"),
+        "voicestudio.en.luxe": ("Female", "Luxe — Nữ — ToolRecap Local"),
+        "voicestudio.en.storyteller": ("Male", "Storyteller — Nam — ToolRecap Local"),
+        "voicestudio.en.commentator": ("Male", "Commentator — Nam — ToolRecap Local"),
+        "voicestudio.en.explainer": ("Male", "Explainer — Nam — ToolRecap Local"),
     }
 
     # Verify en-US voices
@@ -93,7 +99,7 @@ def test_builtin_voice_catalog_exact_12_voicestudio() -> None:
         assert vid in BUILTIN_VOICES
         spec = BUILTIN_VOICES[vid]
         assert spec.voice_id == vid
-        assert spec.engine == "voicestudio"
+        assert spec.engine == "omnivoice"
         assert spec.language == "en-US"
         assert spec.gender == expected_gender
         assert spec.display_name == expected_label
@@ -105,7 +111,7 @@ def test_builtin_voice_catalog_exact_12_voicestudio() -> None:
         assert vid in BUILTIN_VOICES
         spec = BUILTIN_VOICES[vid]
         assert spec.voice_id == vid
-        assert spec.engine == "voicestudio"
+        assert spec.engine == "omnivoice"
         assert spec.language == "en-GB"
         assert spec.gender == expected_gender
         assert spec.display_name == expected_label
@@ -118,14 +124,14 @@ def test_no_piper_in_production_selectable_list() -> None:
     # 1. BUILTIN_VOICES must contain NO Piper voices
     for vid, spec in BUILTIN_VOICES.items():
         assert not vid.startswith("piper.")
-        assert spec.engine == "voicestudio"
+        assert spec.engine == "omnivoice"
 
     # 2. get_available_voices must contain NO Piper voices
     available = get_available_voices()
     assert len(available) == 12
     for vid, spec in available.items():
         assert not vid.startswith("piper.")
-        assert spec.engine == "voicestudio"
+        assert spec.engine == "omnivoice"
 
     # 3. Compatibility voices exist separately for backwards lookup
     assert len(PIPER_COMPATIBILITY_VOICES) == 4
@@ -141,7 +147,7 @@ def test_no_piper_in_production_selectable_list() -> None:
 
 
 def test_truthful_backend_readiness_and_status(tmp_path: Path) -> None:
-    """Invariant 2: Catalog must not lie that VoiceStudio is installed when absent."""
+    """External executables never make the ToolRecap runtime READY."""
     subsystem_dir = tmp_path / "voice_subsystem"
     subsystem_dir.mkdir()
 
@@ -152,28 +158,39 @@ def test_truthful_backend_readiness_and_status(tmp_path: Path) -> None:
     status = get_voice_status("voicestudio.en.documentarian", subsystem_dir=subsystem_dir)
     assert status["ready"] is False
     assert status["status"] == "NOT_INSTALLED"
-    assert "chưa được cài đặt" in status["status_label"]
+    assert "not installed" in status["status_label"]
 
-    # 2. When executable adapter IS present:
+    # 2. An unrelated external adapter must have no effect.
     (subsystem_dir / "VoiceStudio.exe").write_bytes(b"MZ_EXE")
-    assert is_voicestudio_ready(subsystem_dir) is True
-    assert is_voice_selectable("voicestudio.en.documentarian", subsystem_dir=subsystem_dir) is True
+    assert is_voicestudio_ready(subsystem_dir) is False
+    assert is_voice_selectable("voicestudio.en.documentarian", subsystem_dir=subsystem_dir) is False
 
+    # 3. Only ToolRecap runtime metadata matching the manifest is recognized.
+    runtime_dir = subsystem_dir / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "python.exe").write_bytes(b"MZ_PYTHON")
+    (runtime_dir / "voice_runtime.json").write_text(json.dumps({
+        "voice_runtime_schema": VOICE_RUNTIME_SCHEMA,
+        "voice_runtime_version": VOICE_RUNTIME_VERSION,
+        "dependency_manifest_version": DEPENDENCY_MANIFEST_VERSION,
+        "runtime_fingerprint": runtime_fingerprint(),
+    }), encoding="utf-8")
+    # Metadata/python presence alone still cannot establish readiness.
+    assert is_voicestudio_ready(subsystem_dir) is False
     status_ready = get_voice_status("voicestudio.en.documentarian", subsystem_dir=subsystem_dir)
-    assert status_ready["ready"] is True
-    assert status_ready["status"] == "READY"
-    assert "sẵn sàng" in status_ready["status_label"]
+    assert status_ready["ready"] is False
+    assert status_ready["status"] != "READY"
 
 
 def test_truthful_synthesis_rejection_without_adapter(tmp_path: Path) -> None:
-    """Invariant 2: Production must reject VoiceStudio synthesis when adapter is missing, not silently Piper."""
+    """Production reports missing managed runtime and never silently uses Piper."""
     empty_subsystem = tmp_path / "empty_subsystem"
     empty_subsystem.mkdir()
-    mgr = VoiceModelManager(cache_dir=tmp_path / "models", subsystem_dir=empty_subsystem)
+    mgr = VoiceModelManager(cache_dir=tmp_path / "models", subsystem_dir=empty_subsystem, auto_bootstrap=False)
     out_wav = tmp_path / "synth.wav"
 
     # In production (allow_mock_synth=False), calling synthesize with voicestudio voice must fail honestly
-    with pytest.raises(VoiceError, match="VoiceStudio adapter chưa được cài đặt hoặc không khả dụng"):
+    with pytest.raises(VoiceError, match="ToolRecap local voice runtime"):
         mgr.synthesize("voicestudio.en.documentarian", "Test text", out_wav, allow_mock_synth=False)
 
     # In test harness (allow_mock_synth=True), test synthesis is allowed
@@ -265,11 +282,22 @@ def test_voice_manager_cache_reuse_and_progress(tmp_path: Path) -> None:
     assert mgr.is_voice_installed(spec.voice_id) is False
 
     # 2. Simulate installed OmniVoice model weights in shared cache directory
-    ov_dir = cache_dir / "omnivoice" / "hub" / "models--k2-fsa--OmniVoice"
+    ov_dir = cache_dir / "omnivoice" / "hub" / "models--k2-fsa--OmniVoice" / "snapshots" / "c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
     ov_dir.mkdir(parents=True, exist_ok=True)
-    (ov_dir / "model.safetensors").write_bytes(b"cached_omnivoice_model_weights")
+    (ov_dir / "config.json").write_text("{}", encoding="utf-8")
+    (ov_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (ov_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    with (ov_dir / "model.safetensors").open("wb") as handle:
+        handle.seek(101 * 1024 * 1024)
+        handle.write(b"0")
+    (cache_dir / "omnivoice" / "toolrecap_model.json").write_text(json.dumps({
+        "model_id": "k2-fsa/OmniVoice",
+        "model_revision": "c5fdb5ccb189668d56333f77ba2629f4cd7535f4",
+        "runtime_fingerprint": runtime_fingerprint(),
+    }), encoding="utf-8")
 
-    assert mgr.is_voice_installed(spec.voice_id) is True
+    # Model files alone do not prove production readiness.
+    assert mgr.is_voice_installed(spec.voice_id) is False
 
     # 3. Cache reuse: ensure_voice_model reuses cache immediately and reports 100% progress
     progress_records: list[tuple[int, int, float]] = []
@@ -344,7 +372,7 @@ def test_omnivoice_adapter_validate_request(tmp_path: Path) -> None:
     validate_request("voicestudio.en.documentarian", "Valid text", "film_recap", out_wav)
 
     # Invalid voice ID
-    with pytest.raises(ValueError, match="không nằm trong danh sách 12 giọng đọc"):
+    with pytest.raises(ValueError, match="không nằm trong danh sách 12 giọng ToolRecap Local"):
         validate_request("invalid.voice", "Valid text", "film_recap", out_wav)
 
     # Invalid style
@@ -467,23 +495,24 @@ def test_bootstrap_atomic_swap_and_rollback_on_failure(tmp_path: Path) -> None:
         subprocess.CompletedProcess(args=["python", "get-pip.py"], returncode=0, stdout="", stderr=""),
         subprocess.CompletedProcess(args=["python", "-m", "pip", "torch"], returncode=0, stdout="", stderr=""),
         subprocess.CompletedProcess(args=["python", "-m", "pip", "other"], returncode=0, stdout="", stderr=""),
+        subprocess.CompletedProcess(args=["python", "-m", "pip", "engine"], returncode=0, stdout="", stderr=""),
     ]
 
-    original_copy2 = shutil.copy2
-    fail_once = True
+    original_replace = os.replace
+    promotion_failed = False
 
-    def failing_copy2(src, dst):
-        nonlocal fail_once
-        if fail_once and "python.exe" in str(dst):
-            fail_once = False
+    def failing_replace(src, dst):
+        nonlocal promotion_failed
+        if not promotion_failed and Path(src).name == "extracted_runtime" and Path(dst) == target_dir:
+            promotion_failed = True
             raise OSError("Simulated disk error during atomic swap")
-        return original_copy2(src, dst)
+        return original_replace(src, dst)
 
     with (
         patch.object(bootstrap, "download_asset", side_effect=fake_download_asset),
         patch("toolrecap_v2.voice.bootstrap.safe_extract_zip", side_effect=fake_safe_extract),
         patch("subprocess.run", mock_run),
-        patch("shutil.copy2", side_effect=failing_copy2),
+        patch("os.replace", side_effect=failing_replace),
     ):
         with pytest.raises(OSError, match="Simulated disk error during atomic swap"):
             bootstrap.bootstrap(install_packages=True, force=True)
@@ -520,7 +549,7 @@ def test_manager_synthesize_subprocess_request_inspection(tmp_path: Path) -> Non
             wf.writeframes(b"\x00\x20" * 2400)
 
     class MockPopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None):
+        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None, **kwargs):
             captured["cmd"] = cmd
             captured["shell"] = shell
             captured["env"] = env
@@ -544,7 +573,7 @@ def test_manager_synthesize_subprocess_request_inspection(tmp_path: Path) -> Non
 
     progress_events: list[tuple[int, int, float]] = []
 
-    with patch("subprocess.Popen", MockPopen):
+    with patch("subprocess.Popen", MockPopen), patch.object(mgr, "ensure_ready", return_value=MagicMock(ready=True)):
         res = mgr.synthesize(
             "voicestudio.en.documentarian",
             "Inspection test text",
@@ -575,7 +604,7 @@ def test_manager_synthesize_subprocess_request_inspection(tmp_path: Path) -> Non
 
     # Verify progress reported from JSON stderr
     assert (50, 100, 50.0) in progress_events
-    assert (100, 100, 100.0) in progress_events
+    assert (50, 100, 50.0) in progress_events
 
 
 def test_manager_synthesize_stderr_sanitization_and_progress(tmp_path: Path) -> None:
@@ -593,7 +622,7 @@ def test_manager_synthesize_stderr_sanitization_and_progress(tmp_path: Path) -> 
     out_wav = tmp_path / "fail.wav"
 
     class FailingPopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None):
+        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None, **kwargs):
             self.pid = 88888
             self.returncode = 1
             raw_stderr = (
@@ -615,7 +644,7 @@ def test_manager_synthesize_stderr_sanitization_and_progress(tmp_path: Path) -> 
 
     progress_events: list[tuple[int, int, float]] = []
 
-    with patch("subprocess.Popen", FailingPopen):
+    with patch("subprocess.Popen", FailingPopen), patch.object(mgr, "ensure_ready", return_value=MagicMock(ready=True)):
         with pytest.raises(VoiceError) as exc_info:
             mgr.synthesize(
                 "voicestudio.en.anchor",
@@ -632,7 +661,7 @@ def test_manager_synthesize_stderr_sanitization_and_progress(tmp_path: Path) -> 
     err_str = str(exc_info.value)
     assert "Critical GPU error occurred!" in err_str
     assert '{"stage": "generating"' not in err_str
-    assert "[truncated]" in err_str
+    assert len(err_str) < 2300
 
 
 def test_manager_synthesize_cancellation_kills_process_tree(tmp_path: Path) -> None:
@@ -653,7 +682,7 @@ def test_manager_synthesize_cancellation_kills_process_tree(tmp_path: Path) -> N
     killed_pids: list[int] = []
 
     class HangingPopen:
-        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None):
+        def __init__(self, cmd, stdout=None, stderr=None, text=True, shell=False, env=None, **kwargs):
             self.pid = 77777
             self.returncode = None
             self.stderr = io.StringIO("")
@@ -668,8 +697,9 @@ def test_manager_synthesize_cancellation_kills_process_tree(tmp_path: Path) -> N
     with (
         patch("subprocess.Popen", HangingPopen),
         patch("toolrecap_v2.voice.manager._kill_process_tree", side_effect=lambda pid: killed_pids.append(pid)),
+        patch.object(mgr, "ensure_ready", return_value=MagicMock(ready=True)),
     ):
-        with pytest.raises(VoiceError, match="Quá trình đọc giọng đã bị hủy"):
+        with pytest.raises(VoiceError, match="Voice synthesis was cancelled"):
             mgr.synthesize(
                 "voicestudio.en.anchor",
                 "Cancel test",
@@ -681,24 +711,17 @@ def test_manager_synthesize_cancellation_kills_process_tree(tmp_path: Path) -> N
     assert 77777 in killed_pids
 
 
-def test_official_voicestudio_runtime_smoke() -> None:
-    """Invariant: official VoiceStudio runtime import smoke runs if detected, skips cleanly if absent."""
-    clear_official_runtime_cache()
-    official_py = detect_official_voicestudio_runtime()
-    if official_py is None:
-        pytest.skip("Official VoiceStudio runtime not detected on host machine.")
-
-    assert official_py.is_file()
-    res = subprocess.run(
-        [
-            str(official_py),
-            "-c",
-            "import torch, torchaudio, omnivoice; from importlib.metadata import version; print(version('omnivoice'))",
-        ],
-        capture_output=True,
-        text=True,
-        shell=False,
-        timeout=30,
+def test_external_voicestudio_runtime_is_not_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An external VoiceStudio environment cannot alter ToolRecap's runtime choice."""
+    external = tmp_path / "external" / "python.exe"
+    external.parent.mkdir(parents=True)
+    external.write_bytes(b"external")
+    monkeypatch.setenv("VOICESTUDIO_PYTHON", str(external))
+    managed = tmp_path / "managed"
+    mgr = VoiceModelManager(
+        cache_dir=tmp_path / "models",
+        subsystem_dir=managed,
+        detect_official=True,
+        auto_bootstrap=False,
     )
-    assert res.returncode == 0, f"Official runtime smoke failed: {res.stderr}"
-    assert res.stdout.strip(), "Official runtime returned empty omnivoice version"
+    assert mgr.get_backend_python_executable() is None

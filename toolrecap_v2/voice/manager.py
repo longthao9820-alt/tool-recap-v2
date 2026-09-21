@@ -21,13 +21,18 @@ from .catalog import (
     DEFAULT_VOICE_ID,
     SUPPORTED_VOICE_STYLES,
     VoiceSpec,
-    detect_official_voicestudio_runtime,
-    get_isolated_runtime_python,
     get_voice_spec,
-    is_executable_adapter_available,
-    is_voicestudio_ready,
 )
 from .bootstrap import VoiceRuntimeBootstrap, BootstrapCancelled, BootstrapError
+from .runtime import (
+    CORE_DEPENDENCIES,
+    VOICE_ADAPTER_VERSION,
+    VOICE_ENGINE_VERSION,
+    VOICE_MODEL_REVISION,
+    VoiceHealthResult,
+    VoiceRuntimeInspector,
+    runtime_fingerprint,
+)
 
 
 ProgressCallback = Callable[[int, int, float], None]
@@ -146,10 +151,18 @@ class VoiceModelManager:
     ) -> None:
         self.cache_dir = cache_dir or (default_data_directory() / "models" / "voices")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.subsystem_dir = subsystem_dir or (default_data_directory() / "voice_subsystem")
+        self.subsystem_dir = subsystem_dir or (default_data_directory() / "voice_runtime")
         self._custom_subsystem = subsystem_dir is not None
-        self.detect_official = detect_official if detect_official is not None else (subsystem_dir is None)
+        # Parameter retained for API compatibility; external runtimes are never used.
+        self.detect_official = False
         self.auto_bootstrap = auto_bootstrap if auto_bootstrap is not None else (subsystem_dir is None)
+        runtime_dir = (self.subsystem_dir / "runtime") if self._custom_subsystem else (self.subsystem_dir / "current")
+        self.runtime = VoiceRuntimeInspector(
+            runtime_dir=runtime_dir,
+            model_cache_dir=self.cache_dir / "omnivoice",
+        )
+        self._health_cache: dict[str, VoiceHealthResult] = {}
+        self._health_lock = threading.RLock()
 
     def get_voice_dir(self, spec: VoiceSpec) -> Path:
         """Return the directory where this voice model is located."""
@@ -189,39 +202,21 @@ class VoiceModelManager:
         if default_hf_hub.is_dir():
             return True
 
-        if self.detect_official:
-            official_py = detect_official_voicestudio_runtime()
-            if official_py:
-                vs_root = official_py.parent.parent.parent
-                if (vs_root / "omnivoice_data" / "models" / "k2-fsa" / "OmniVoice").is_dir():
-                    return True
-                if (vs_root / "omnivoice_data" / "models").is_dir() and any((vs_root / "omnivoice_data" / "models").glob("*OmniVoice*")):
-                    return True
-
         return False
 
     def is_voice_installed(self, voice_id: str) -> bool:
         """Check if runtime is ready and required model files exist locally."""
         spec = get_voice_spec(voice_id)
-        if spec.engine == "voicestudio":
-            return self._is_omnivoice_model_cached()
+        if spec.engine == "omnivoice":
+            cached = self.get_cached_health(voice_id, spec.style)
+            return bool(cached and cached.ready)
         v_dir = self.get_voice_dir(spec)
         return self._spec_is_complete_in_dir(spec, v_dir)
 
     def get_backend_python_executable(self) -> Path | None:
-        """Locate backend Python runtime: official VoiceStudio first (if allowed), then V2 isolated runtime."""
-        # 1. Prefer detected official VoiceStudio runtime only when detect_official is True
-        if self.detect_official:
-            official = detect_official_voicestudio_runtime()
-            if official is not None and official.is_file():
-                return official
-
-        # 2. Check isolated V2 runtime
-        isolated = get_isolated_runtime_python(self.subsystem_dir)
-        if isolated is not None and isolated.is_file():
-            return isolated
-
-        return None
+        """Return only ToolRecap's managed runtime Python executable."""
+        py_exe = self.runtime.python_executable
+        return py_exe if py_exe.is_file() else None
 
     def ensure_backend_runtime(
         self,
@@ -230,20 +225,22 @@ class VoiceModelManager:
         cancel_event: threading.Event | None = None,
     ) -> Path:
         """Ensure a backend runtime is ready, lazily bootstrapping isolated runtime if missing."""
-        backend_python = self.get_backend_python_executable()
-        if backend_python:
+        health = self.runtime.inspect(run_imports=True)
+        if health.dependencies_ok:
             if progress_callback:
                 progress_callback(100, 100, 100.0)
-            return backend_python
+            return self.runtime.python_executable
 
         bootstrap = VoiceRuntimeBootstrap(
-            target_dir=self.subsystem_dir / "runtime",
+            target_dir=self.runtime.runtime_dir,
             staging_dir=default_data_directory() / "staging" / "voice_runtime",
         )
         try:
             return bootstrap.bootstrap(
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
+                force=True,
+                validation_callback=lambda py: self._validate_staged_runtime(py, cancel_event=cancel_event),
             )
         except BootstrapCancelled as exc:
             raise VoiceError("Quá trình cài đặt Voice runtime đã bị hủy.") from exc
@@ -251,24 +248,230 @@ class VoiceModelManager:
             raise VoiceError(f"Cài đặt Voice runtime thất bại: {exc}") from exc
 
     def get_adapter_executable(self) -> Path | None:
-        """Locate installed VoiceStudio adapter executable in subsystem or runtime directory."""
-        candidates = [
-            self.subsystem_dir / "VoiceStudio.exe",
-            self.subsystem_dir / "voicestudio.exe",
-            self.subsystem_dir / "adapter.exe",
-            self.subsystem_dir / "voicestudio_adapter.exe",
-            self.subsystem_dir / "adapter.py",
-            self.subsystem_dir / "run.cmd",
-            self.subsystem_dir / "bin" / "VoiceStudio.exe",
-            self.subsystem_dir / "bin" / "voicestudio.exe",
-            application_root() / "runtime" / "voices" / "VoiceStudio.exe",
-            application_root() / "runtime" / "voices" / "adapter.exe",
-            application_root() / "runtime" / "voices" / "adapter.py",
-        ]
-        for cand in candidates:
-            if cand.is_file():
-                return cand
+        """External adapter executables are intentionally not part of production."""
         return None
+
+    def _health_key(self, voice_id: str, style: str) -> str:
+        spec = get_voice_spec(voice_id)
+        raw = json.dumps(
+            {
+                "voice_id": voice_id,
+                "style": style,
+                "instruct": spec.instruct,
+                "runtime": runtime_fingerprint(),
+                "engine": VOICE_ENGINE_VERSION,
+                "adapter": VOICE_ADAPTER_VERSION,
+                "model_revision": VOICE_MODEL_REVISION,
+            },
+            sort_keys=True,
+        )
+        import hashlib
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get_cached_health(self, voice_id: str, style: str) -> VoiceHealthResult | None:
+        with self._health_lock:
+            return self._health_cache.get(self._health_key(voice_id, style))
+
+    def _cache_health(self, voice_id: str, style: str, health: VoiceHealthResult) -> None:
+        with self._health_lock:
+            self._health_cache[self._health_key(voice_id, style)] = health
+
+    def _validate_staged_runtime(
+        self,
+        python_executable: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Validate imports/versions and a real synthesis before runtime promotion."""
+        probe = (
+            "import torch,torchaudio,transformers,accelerate,soundfile,omnivoice,json;"
+            "from importlib.metadata import version;"
+            f"expected={CORE_DEPENDENCIES!r};"
+            "actual={n:version(n) for n in expected};"
+            "bad={n:(expected[n],actual[n]) for n in expected if actual[n].split('+',1)[0]!=expected[n].split('+',1)[0]};"
+            "assert not bad,bad;print(json.dumps(actual))"
+        )
+        completed = subprocess.run(
+            [str(python_executable), "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=self.runtime.subprocess_environment(),
+        )
+        if completed.returncode != 0:
+            raise BootstrapError(
+                f"Voice runtime import validation failed: {completed.stderr.strip()}",
+                code="IMPORT_ERROR",
+            )
+
+        smoke_path = default_data_directory() / "staging" / "voice_runtime_smoke.wav"
+        smoke_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._invoke_omnivoice(
+                python_executable=python_executable,
+                voice_id=DEFAULT_VOICE_ID,
+                text="ToolRecap voice is ready.",
+                output_path=smoke_path,
+                style="documentary",
+                progress_callback=None,
+                cancel_event=cancel_event,
+                timeout=300.0,
+            )
+            validate_wav_audio(smoke_path)
+        except Exception as exc:
+            raise BootstrapError(
+                f"Voice runtime synthesis validation failed: {exc}",
+                code="SYNTHESIS_ERROR",
+            ) from exc
+        finally:
+            smoke_path.unlink(missing_ok=True)
+
+    def health_check(
+        self,
+        voice_id: str,
+        style: str,
+        *,
+        synthesis_test: bool = False,
+        cancel_event: threading.Event | None = None,
+    ) -> VoiceHealthResult:
+        health = self.runtime.inspect(run_imports=True)
+        if not health.dependencies_ok or not health.model_valid:
+            return health
+        if synthesis_test:
+            smoke_path = default_data_directory() / "cache" / "voice_health" / f"{self._health_key(voice_id, style)}.wav"
+            smoke_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._invoke_omnivoice(
+                    python_executable=self.runtime.python_executable,
+                    voice_id=voice_id,
+                    text="ToolRecap voice is ready.",
+                    output_path=smoke_path,
+                    style=style,
+                    progress_callback=None,
+                    cancel_event=cancel_event,
+                    timeout=300.0,
+                )
+                validate_wav_audio(smoke_path)
+                health.synthesis_test_ok = True
+                health.audio_validation_ok = True
+            except Exception as exc:
+                health.state = "REPAIR_REQUIRED"
+                health.failure_stage = "synthesis"
+                health.error_code = "SYNTHESIS_ERROR"
+                health.human_message = f"Voice synthesis health test failed: {exc}"
+                return health
+        else:
+            health.synthesis_test_ok = True
+            health.audio_validation_ok = True
+        health.ready = True
+        health.state = "READY"
+        health.human_message = "ToolRecap local voice is ready."
+        self._cache_health(voice_id, style, health)
+        return health
+
+    def ensure_ready(
+        self,
+        voice_id: str,
+        style: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+        smoke_test: bool = True,
+        force_repair: bool = False,
+    ) -> VoiceHealthResult:
+        if cancel_event and cancel_event.is_set():
+            raise VoiceError("Voice preparation was cancelled.")
+        cached = None if force_repair else self.get_cached_health(voice_id, style)
+        if cached and cached.ready:
+            return cached
+
+        health = self.runtime.inspect(run_imports=True)
+        if force_repair or not health.dependencies_ok:
+            if not self.auto_bootstrap:
+                raise VoiceError(
+                    f"[{health.error_code or 'RUNTIME_NOT_INSTALLED'}] "
+                    "ToolRecap local voice runtime is unavailable or unhealthy."
+                )
+            if progress_callback:
+                progress_callback(0, 100, 0.0)
+            self.ensure_backend_runtime(progress_callback=progress_callback, cancel_event=cancel_event)
+
+        # Model download occurs through the exact production adapter/from_pretrained
+        # path, using the ToolRecap-owned cache and pinned revision.
+        health = self.runtime.inspect(run_imports=True)
+        if smoke_test:
+            smoke_path = default_data_directory() / "cache" / "voice_health" / f"{self._health_key(voice_id, style)}.wav"
+            smoke_path.parent.mkdir(parents=True, exist_ok=True)
+            self._invoke_omnivoice(
+                python_executable=self.runtime.python_executable,
+                voice_id=voice_id,
+                text="ToolRecap voice is ready.",
+                output_path=smoke_path,
+                style=style,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                timeout=300.0,
+            )
+            validate_wav_audio(smoke_path)
+            health = self.runtime.inspect(run_imports=True)
+            health.synthesis_test_ok = True
+            health.audio_validation_ok = True
+        elif health.dependencies_ok and health.model_valid:
+            health.synthesis_test_ok = True
+            health.audio_validation_ok = True
+        else:
+            health.state = "DOWNLOADING_MODEL" if health.dependencies_ok else health.state
+        if not health.ready:
+            if health.dependencies_ok and health.model_valid and health.synthesis_test_ok:
+                health.ready = True
+                health.state = "READY"
+                health.human_message = "ToolRecap local voice is ready."
+            else:
+                raise VoiceError(f"[{health.error_code or 'VOICE_RUNTIME_ERROR'}] {health.human_message}")
+        self._cache_health(voice_id, style, health)
+        if progress_callback:
+            progress_callback(100, 100, 100.0)
+        return health
+
+    def preview(
+        self,
+        voice_id: str,
+        style: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Path:
+        """Generate a real preview through the same production synthesis path."""
+        self.ensure_ready(
+            voice_id,
+            style,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            smoke_test=True,
+        )
+        spec = get_voice_spec(voice_id)
+        preview_dir = default_data_directory() / "cache" / "voice_previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_path = preview_dir / f"{self._health_key(voice_id, style)}.wav"
+        # Always regenerate when the user explicitly requests Preview. This proves
+        # current production synthesis rather than replaying historical audio.
+        preview_path.unlink(missing_ok=True)
+        self._synthesize_production(
+            voice_id,
+            spec.preview_text,
+            preview_path,
+            style=style,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+        health = self.health_check(voice_id, style, synthesis_test=False, cancel_event=cancel_event)
+        health.synthesis_test_ok = True
+        health.audio_validation_ok = True
+        health.ready = True
+        health.state = "READY"
+        self._cache_health(voice_id, style, health)
+        return preview_path
 
     def ensure_voice_model(
         self,
@@ -282,16 +485,18 @@ class VoiceModelManager:
             raise DownloadCancelled("Quá trình tải model đã bị hủy.")
 
         spec = get_voice_spec(voice_id)
-        if spec.engine == "voicestudio":
+        if spec.engine == "omnivoice":
             # All 12 designed voices share single OmniVoice model cache
             target_dir = self.cache_dir / "omnivoice"
             target_dir.mkdir(parents=True, exist_ok=True)
-            if self._is_omnivoice_model_cached():
+            if self.runtime.model_is_present():
                 if progress_callback:
                     progress_callback(100, 100, 100.0)
                 return target_dir
             if progress_callback:
                 progress_callback(0, 100, 0.0)
+            # The pinned adapter downloads the pinned HuggingFace revision into this
+            # cache during smoke-test/production synthesis.
             return target_dir
 
         v_dir = self.get_voice_dir(spec)
@@ -323,6 +528,122 @@ class VoiceModelManager:
 
         return target_dir
 
+    def _invoke_omnivoice(
+        self,
+        *,
+        python_executable: Path,
+        voice_id: str,
+        text: str,
+        output_path: Path,
+        style: str,
+        progress_callback: ProgressCallback | None,
+        cancel_event: threading.Event | None,
+        timeout: float = 300.0,
+    ) -> Path:
+        spec = get_voice_spec(voice_id)
+        adapter_script = Path(__file__).parent / "omnivoice_adapter.py"
+        request_file: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "voice_id": voice_id,
+                        "text": text,
+                        "style": style,
+                        "output": str(output_path),
+                        "instruct": spec.instruct,
+                        "model": f"k2-fsa/OmniVoice@{VOICE_MODEL_REVISION}",
+                        "cache_dir": str(self.cache_dir / "omnivoice"),
+                    },
+                    handle,
+                    ensure_ascii=False,
+                )
+                request_file = Path(handle.name)
+
+            command = [str(python_executable), str(adapter_script), "--request", str(request_file)]
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+                env=self.runtime.subprocess_environment(),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            started = time.monotonic()
+            stderr_lines: list[str] = []
+            while proc.poll() is None:
+                if cancel_event and cancel_event.is_set():
+                    _kill_process_tree(proc.pid)
+                    raise VoiceError("Voice synthesis was cancelled.")
+                if time.monotonic() - started > timeout:
+                    _kill_process_tree(proc.pid)
+                    raise VoiceError("Voice synthesis timed out.")
+                line = proc.stderr.readline() if proc.stderr else ""
+                if line:
+                    stderr_lines.append(line)
+                    try:
+                        progress = json.loads(line.strip())
+                        if isinstance(progress, dict) and "progress" in progress and progress_callback:
+                            value = int(progress["progress"])
+                            progress_callback(value, 100, float(value))
+                    except Exception:
+                        pass
+                else:
+                    if cancel_event:
+                        cancel_event.wait(0.05)
+                    else:
+                        time.sleep(0.05)
+            if proc.stderr:
+                stderr_lines.extend(proc.stderr.readlines())
+            if proc.returncode != 0:
+                clean = []
+                for line in stderr_lines:
+                    stripped = "".join(ch for ch in line.strip() if ch.isprintable() or ch in "\t\n\r")
+                    if not stripped:
+                        continue
+                    if stripped.startswith("{") and stripped.endswith("}"):
+                        try:
+                            if "progress" in json.loads(stripped):
+                                continue
+                        except Exception:
+                            pass
+                    clean.append(stripped)
+                detail = "\n".join(clean)
+                if len(detail) > 2000:
+                    detail = detail[:2000] + "... [truncated]"
+                raise VoiceError(f"Local OmniVoice synthesis failed (code {proc.returncode}): {detail}")
+        finally:
+            if request_file is not None:
+                request_file.unlink(missing_ok=True)
+        validate_wav_audio(output_path)
+        self.runtime.write_model_metadata()
+        return output_path
+
+    def _synthesize_production(
+        self,
+        voice_id: str,
+        text: str,
+        output_path: Path,
+        *,
+        style: str,
+        progress_callback: ProgressCallback | None,
+        cancel_event: threading.Event | None,
+    ) -> Path:
+        runtime_python = self.get_backend_python_executable()
+        if runtime_python is None:
+            raise VoiceError("[RUNTIME_NOT_INSTALLED] ToolRecap local voice runtime is unavailable.")
+        self.ensure_voice_model(voice_id, progress_callback=progress_callback, cancel_event=cancel_event)
+        return self._invoke_omnivoice(
+            python_executable=runtime_python,
+            voice_id=voice_id,
+            text=text,
+            output_path=output_path,
+            style=style,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
+
     def synthesize(
         self,
         voice_id: str,
@@ -352,192 +673,34 @@ class VoiceModelManager:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         spec = get_voice_spec(voice_id)
 
-        if spec.engine == "voicestudio":
+        if spec.engine == "omnivoice":
             # Test harness exemption only when explicitly requested
             if allow_mock_synth:
                 self._generate_test_audio(text, output_path)
                 validate_wav_audio(output_path)
                 return output_path
-
-            # 1. Locate backend Python or executable adapter
-            backend_python = self.get_backend_python_executable()
-            adapter_exe = self.get_adapter_executable()
-
-            if not backend_python and not adapter_exe:
-                if self.auto_bootstrap:
-                    # Lazy bootstrap isolated runtime on first use
-                    try:
-                        backend_python = self.ensure_backend_runtime(
-                            progress_callback=progress_callback,
-                            cancel_event=cancel_event,
-                        )
-                    except Exception as exc:
-                        if isinstance(exc, VoiceError):
-                            raise
-                        raise VoiceError(
-                            f"VoiceStudio adapter chưa được cài đặt hoặc không khả dụng: {exc}. "
-                            f"Không thể tổng hợp giọng đọc cho '{voice_id}'. "
-                            f"Vui lòng cài đặt adapter VoiceStudio tương thích qua voice_updater."
-                        ) from exc
-                else:
-                    raise VoiceError(
-                        f"VoiceStudio adapter chưa được cài đặt hoặc không khả dụng. "
-                        f"Không thể tổng hợp giọng đọc cho '{voice_id}'. "
-                        f"Vui lòng cài đặt adapter VoiceStudio tương thích qua voice_updater."
-                    )
-
-            # Ensure model cache exists (never swallow ensure model errors)
-            self.ensure_voice_model(
+            self.ensure_ready(
                 voice_id,
+                style,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+                smoke_test=True,
+            )
+            result = self._synthesize_production(
+                voice_id,
+                text,
+                output_path,
+                style=style,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
             )
-
-            # 2. If backend Python is available, invoke omnivoice_adapter.py via JSON request
-            if backend_python:
-                adapter_script = Path(__file__).parent / "omnivoice_adapter.py"
-                req_file = None
-                try:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tf:
-                        json.dump(
-                            {
-                                "voice_id": voice_id,
-                                "text": text,
-                                "style": style,
-                                "output": str(output_path),
-                                "instruct": spec.instruct,
-                                "cache_dir": str(self.cache_dir / "omnivoice"),
-                            },
-                            tf,
-                            ensure_ascii=False,
-                        )
-                        req_file = Path(tf.name)
-
-                    cmd = [str(backend_python), str(adapter_script), "--request", str(req_file)]
-                    env = {
-                        "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
-                        "PATH": os.environ.get("PATH", ""),
-                        "TEMP": os.environ.get("TEMP", tempfile.gettempdir()),
-                        "TMP": os.environ.get("TMP", tempfile.gettempdir()),
-                        "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
-                        "APPDATA": os.environ.get("APPDATA", ""),
-                        "USERPROFILE": os.environ.get("USERPROFILE", ""),
-                        "HOMEPATH": os.environ.get("HOMEPATH", ""),
-                        "HOMEDRIVE": os.environ.get("HOMEDRIVE", ""),
-                        "HF_HOME": str(self.cache_dir / "omnivoice"),
-                        "HUGGINGFACE_HUB_CACHE": str(self.cache_dir / "omnivoice" / "hub"),
-                    }
-                    pythonpath_parts: list[str] = []
-                    vs_proj = backend_python.parent.parent.parent
-                    if (vs_proj / "omnivoice").is_dir():
-                        pythonpath_parts.append(str(vs_proj))
-                    if pythonpath_parts:
-                        env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
-
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        shell=False,
-                        env=env,
-                    )
-
-                    start_time = time.time()
-                    timeout = 180.0
-                    stderr_lines: list[str] = []
-
-                    while proc.poll() is None:
-                        if cancel_event and cancel_event.is_set():
-                            _kill_process_tree(proc.pid)
-                            try:
-                                proc.wait(timeout=5)
-                            except Exception:
-                                pass
-                            raise VoiceError("Quá trình đọc giọng đã bị hủy.")
-
-                        if time.time() - start_time > timeout:
-                            _kill_process_tree(proc.pid)
-                            try:
-                                proc.wait(timeout=5)
-                            except Exception:
-                                pass
-                            raise VoiceError("Quá thời gian tổng hợp giọng đọc từ adapter VoiceStudio.")
-
-                        line = proc.stderr.readline() if proc.stderr else ""
-                        if line:
-                            stderr_lines.append(line)
-                            try:
-                                data = json.loads(line.strip())
-                                if isinstance(data, dict) and "progress" in data and progress_callback:
-                                    prog_val = int(data["progress"])
-                                    progress_callback(prog_val, 100, float(prog_val))
-                            except Exception:
-                                pass
-                        else:
-                            time.sleep(0.05)
-
-                    if proc.stderr:
-                        for rem_line in proc.stderr.readlines():
-                            stderr_lines.append(rem_line)
-
-                    if proc.returncode != 0:
-                        clean_lines: list[str] = []
-                        for line in stderr_lines:
-                            line_s = line.strip()
-                            if not line_s:
-                                continue
-                            if line_s.startswith("{") and line_s.endswith("}"):
-                                try:
-                                    d = json.loads(line_s)
-                                    if "stage" in d or "progress" in d:
-                                        continue
-                                except Exception:
-                                    pass
-                            clean_line = "".join(ch for ch in line_s if ch.isprintable() or ch in "\t\n\r")
-                            clean_lines.append(clean_line)
-                        err_msg = "\n".join(clean_lines).strip()
-                        if len(err_msg) > 1000:
-                            err_msg = err_msg[:1000] + "... [truncated]"
-                        raise VoiceError(
-                            f"VoiceStudio adapter tổng hợp thất bại (mã {proc.returncode}): {err_msg}"
-                        )
-
-                finally:
-                    if req_file and req_file.exists():
-                        try:
-                            req_file.unlink()
-                        except OSError:
-                            pass
-
-                validate_wav_audio(output_path)
-                return output_path
-
-            # 3. Fallback for non-python executable adapter
-            elif adapter_exe:
-                cmd = [
-                    str(adapter_exe),
-                    "--voice", voice_id,
-                    "--text", text,
-                    "--style", style,
-                    "--output", str(output_path),
-                ]
-                if adapter_exe.suffix.lower() == ".py":
-                    cmd = [sys.executable, str(adapter_exe), "--voice", voice_id, "--text", text, "--style", style, "--output", str(output_path)]
-
-                try:
-                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                    if res.returncode != 0:
-                        raise VoiceError(
-                            f"VoiceStudio adapter tổng hợp thất bại (mã {res.returncode}): {res.stderr.strip()}"
-                        )
-                except subprocess.TimeoutExpired as exc:
-                    raise VoiceError("Quá thời gian tổng hợp giọng đọc từ adapter VoiceStudio.") from exc
-                except OSError as exc:
-                    raise VoiceError(f"Không thể khởi chạy adapter VoiceStudio: {exc}") from exc
-
-                validate_wav_audio(output_path)
-                return output_path
+            health = self.health_check(voice_id, style, synthesis_test=False, cancel_event=cancel_event)
+            health.synthesis_test_ok = True
+            health.audio_validation_ok = True
+            health.ready = True
+            health.state = "READY"
+            self._cache_health(voice_id, style, health)
+            return result
 
         elif spec.engine == "piper":
             # Internal compatibility fallback for legacy Piper models
