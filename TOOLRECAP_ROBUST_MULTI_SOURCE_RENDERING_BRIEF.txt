@@ -1,0 +1,358 @@
+TOOLRECAP V2 — ROBUST MULTI-SOURCE RENDERER FIX BRIEF
+
+
+============================================================
+1. GOAL
+============================================================
+
+Fix the ToolRecap renderer so current and future projects can reliably concatenate clips from multiple source videos regardless of differences in:
+
+- audio codec;
+- sample rate;
+- sample format;
+- channel layout;
+- channel count;
+- video codec;
+- resolution;
+- frame rate;
+- time base;
+- whether a clip contains audio.
+
+Do not add logic specific to Yellowstone, the S01 folder, nine episodes, or any particular source filename.
+
+
+============================================================
+2. CURRENT FAILURE
+============================================================
+
+The renderer currently performs:
+
+Cut source clips
+→ concatenate with stream copy
+→ if that fails, use filter_complex concat
+
+The fallback currently connects audio inputs directly:
+
+[0:a:0][1:a:0]...[n:a:0]concat=...
+
+The audio streams are not normalized before concatenation. FFmpeg may be unable to determine the channel layout after clips have been cut and converted to AAC, resulting in:
+
+Cannot select channel layout
+Unknown channel layouts not supported
+Error code -22: Invalid argument
+
+The project-level exception handler also uses OutputStatus without importing it, producing a secondary error:
+
+name 'OutputStatus' is not defined
+
+
+============================================================
+3. FIXING PRINCIPLE
+============================================================
+
+This must be a technical renderer fix. It must not alter editorial decisions in the Final JSON.
+
+The renderer must not:
+
+- replace source clips;
+- modify timestamps;
+- silently drop a failing clip;
+- change clip order;
+- remove outputs;
+- rewrite narration;
+- change titles;
+- rerun Scanner or Finalizer.
+
+The renderer may normalize technical stream properties when required to make the selected clips executable.
+
+
+============================================================
+4. REQUIRED RENDER ARCHITECTURE
+============================================================
+
+VALID FINAL JSON
+→ Resolve source clips
+→ Cut clips
+→ Probe every cut clip
+→ Determine concat compatibility
+→ Use fast concat when compatible
+→ Otherwise normalize every clip
+→ Perform verified concat
+→ Generate voice
+→ Mix audio
+→ Remap subtitles
+→ GPU encode
+→ Validate publication output
+
+
+============================================================
+5. AUDIO NORMALIZATION
+============================================================
+
+Before filter-based concatenation, every audio input must be normalized to one common technical profile.
+
+Default publication profile:
+
+Sample rate: 48000 Hz
+Sample format: fltp
+Channel layout: stereo
+Timestamp start: 0
+
+Equivalent filter chain:
+
+aresample=48000
+aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo
+asetpts=PTS-STARTPTS
+
+Downmixing 5.1 audio to stereo is acceptable because the final audio-mix stage already publishes stereo output. FFmpeg must not be left to infer the channel layout between concatenated clips.
+
+
+CLIPS WITHOUT AUDIO
+
+If a clip has no audio stream:
+
+- do not drop the clip;
+- do not shift the output timeline;
+- generate silent audio using anullsrc;
+- make the silent stream exactly match the clip duration;
+- normalize it to 48 kHz stereo.
+
+
+============================================================
+6. VIDEO NORMALIZATION
+============================================================
+
+Before filter-based concatenation, every video input must have the same:
+
+- width and height;
+- pixel format;
+- frame rate;
+- sample aspect ratio;
+- time base;
+- starting timestamp.
+
+The output profile must be selected through a general technical policy, not from a show name or source filename. The renderer may use the first valid clip's canvas or an explicitly configured render profile.
+
+Required normalization behavior:
+
+- scale while preserving aspect ratio;
+- pad into the common target canvas;
+- set sample aspect ratio to 1;
+- convert to the common target FPS;
+- convert to yuv420p;
+- reset presentation timestamps with setpts=PTS-STARTPTS.
+
+The target width and height must be even numbers for H.264 and hardware-encoder compatibility.
+
+Do not stretch the image or change its aspect ratio.
+
+
+============================================================
+7. FAST PATH AND FALLBACK SELECTION
+============================================================
+
+FAST PATH
+
+The concat demuxer with -c copy may be used only when all intermediate clips have fully compatible stream signatures.
+
+Compatibility must include:
+
+- video codec and profile;
+- resolution;
+- pixel format;
+- frame rate and time base;
+- audio codec;
+- sample rate;
+- sample format;
+- channel layout;
+- channel count;
+- either every clip has audio or every clip has no audio.
+
+Do not attempt stream-copy concatenation blindly.
+
+
+NORMALIZED PATH
+
+If any required property differs or is unknown:
+
+- go directly to normalized concat;
+- normalize video and audio for every input;
+- concatenate only the normalized streams;
+- encode a consistent intermediate MP4.
+
+If FFprobe reports an empty or unknown channel_layout, normalized concat is mandatory.
+
+
+============================================================
+8. INTERMEDIATE OUTPUT VALIDATION
+============================================================
+
+After concatenation, ToolRecap must verify that:
+
+- the file exists and is not empty;
+- a valid video stream exists;
+- an audio stream exists when the output requires audio;
+- duration is valid;
+- duration is reasonably close to the sum of source-clip durations;
+- audio has a known channel layout;
+- timestamps are not negative;
+- FFmpeg produced packets for every required stream.
+
+Voice generation and audio mixing must start only after the intermediate file passes validation.
+
+
+============================================================
+9. ERROR HANDLING
+============================================================
+
+Import OutputStatus correctly in projects.py.
+
+The exception handler must:
+
+- preserve the original FFmpeg error;
+- never throw a secondary exception while handling the first error;
+- identify the exact failed output;
+- set error_scope = OUTPUT;
+- set error_target = output_id;
+- leave Output 2 through Output N in Waiting state;
+- preserve Final JSON and Scanner cache;
+- never mark the project Completed;
+- allow retry from the failed output.
+
+Use clear technical error categories such as:
+
+CUT_CLIP_ERROR
+FAST_CONCAT_ERROR
+NORMALIZED_CONCAT_ERROR
+AUDIO_LAYOUT_ERROR
+INTERMEDIATE_VALIDATION_ERROR
+VOICE_ERROR
+FINAL_ENCODE_ERROR
+
+If fast concat fails and normalized concat also fails, diagnostics must preserve both errors rather than reporting only the final one.
+
+
+============================================================
+10. RESUME BEHAVIOR
+============================================================
+
+When retrying:
+
+Final JSON already valid
+→ do not rerun Scanner
+→ do not rerun Finalizer
+→ verify previously completed outputs
+→ continue from the first failed or incomplete output
+
+If only renderer code or render settings changed:
+
+- preserve Final JSON;
+- rerender only the required outputs;
+- do not invalidate AI caches.
+
+
+============================================================
+11. CANCELLATION
+============================================================
+
+Stop must work during:
+
+- source clipping;
+- intermediate probing;
+- fast concat;
+- normalized concat;
+- voice generation;
+- audio mixing;
+- final encoding.
+
+When cancelled:
+
+- terminate the complete FFmpeg process tree;
+- remove partial output files;
+- preserve reusable caches and Final JSON;
+- do not mark the project Completed.
+
+
+============================================================
+12. REQUIRED TEST MATRIX
+============================================================
+
+AUDIO TESTS
+
+- All sources use 5.1(side).
+- Stereo plus 5.1.
+- Mono plus stereo.
+- 44.1 kHz plus 48 kHz.
+- AAC plus E-AC-3 plus AC-3.
+- Audio stream with an empty channel layout.
+- Some clips contain no audio.
+- All clips contain no audio.
+
+
+VIDEO TESTS
+
+- Same codec and same resolution.
+- H.264 plus HEVC.
+- 720p plus 1080p plus 4K.
+- 23.976 plus 24 plus 25 plus 30 FPS.
+- Different sample aspect ratios.
+- Different pixel formats.
+- Clips from MP4, MKV, MOV, and TS sources.
+
+
+PIPELINE TESTS
+
+- Compatible fast concat.
+- Incompatible fast concat correctly routes to fallback.
+- Successful normalized concat.
+- Failed normalized concat produces a clear technical error.
+- Error handling produces no secondary OutputStatus exception.
+- Stop during concat.
+- Retry from Output 1.
+- Resume when Outputs 1–4 are complete and Output 5 fails.
+- Voice or render changes do not rerun AI.
+- Publication folders still contain exactly the required three files.
+
+
+============================================================
+13. ACCEPTANCE CRITERIA
+============================================================
+
+The fix is accepted only when all of the following are true:
+
+1. No show-specific, season-specific, episode-count-specific, or filename-specific code is added.
+
+2. The currently observed 5.1 source clips concatenate successfully.
+
+3. Stereo, mono, 5.1, and mixed-layout projects all work.
+
+4. A clip without audio does not break an output.
+
+5. Sources with different resolutions and frame rates can be combined without image distortion.
+
+6. The renderer does not alter Finalizer editorial decisions.
+
+7. A render failure does not rerun Scanner or Finalizer.
+
+8. The secondary error "OutputStatus is not defined" is eliminated.
+
+9. FFmpeg concat no longer depends on automatic channel-layout inference.
+
+10. All still-relevant existing tests and all new renderer tests pass.
+
+11. The portable executable passes its self-check.
+
+12. A new patch release is produced with a portable ZIP and SHA256 checksum.
+
+13. The updater detects the new release while preserving settings, caches, voice models, and project state.
+
+
+============================================================
+14. PROPOSED VERSION
+============================================================
+
+ToolRecap V2 v0.5.2
+
+Proposed release title:
+
+ToolRecap V2 v0.5.2 — Robust Multi-Source Rendering
